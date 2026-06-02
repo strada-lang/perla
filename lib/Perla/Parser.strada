@@ -3434,6 +3434,30 @@ func _parse_add(scalar $p) scalar {
     while (_peek_type($p) eq "OP" && (_peek_val($p) eq "+" || _peek_val($p) eq "-" || _peek_val($p) eq ".")) {
         my scalar $op_tok = _advance($p);
         my str $op = $op_tok->{"value"};
+        # `$x . bareword` — a bareword RHS of string-concat, NOT followed by
+        # `(`/`->`/`::`, is a STRING in Perl (`$M.import` is `$M . "import"`,
+        # i.e. "Mo::import"), not a 0-arg sub call. perla otherwise parsed it as
+        # a call and resolved the name via cross-package walking — so `$M.import`
+        # called a random `CGI::import` (whichever package last defined `import`)
+        # with no invocant and died. This is exactly Mo's `*{$M.import}=sub{...}`
+        # / `$P.ISA` metaprogramming idiom. Only treat as a string when the
+        # IDENT isn't a call/method/qualified name.
+        if ($op eq "." && _peek_type($p) eq "IDENT") {
+            my str $nt2 = "";
+            if ($p->{"pos"} + 1 < $p->{"len"}) { $nt2 = $p->{"tokens"}->[$p->{"pos"} + 1]->{"type"}; }
+            if ($nt2 ne "LPAREN" && $nt2 ne "ARROW" && $nt2 ne "PKG_SEP" && $nt2 ne "FAT_ARROW") {
+                my scalar $bw_tok = _advance($p);
+                my scalar $bw_str = Perla::AST::node(Perla::AST::N_STR_LIT());
+                $bw_str->{"value"} = $bw_tok->{"value"};
+                my scalar $bnode = Perla::AST::node(Perla::AST::N_BINOP());
+                $bnode->{"op"} = $op;
+                $bnode->{"left"} = $left;
+                $bnode->{"right"} = $bw_str;
+                if (defined($op_tok->{"line"})) { $bnode->{"line"} = $op_tok->{"line"}; }
+                $left = $bnode;
+                next;
+            }
+        }
         my scalar $right = _parse_mul($p);
         my scalar $node = Perla::AST::node(Perla::AST::N_BINOP());
         $node->{"op"} = $op;
