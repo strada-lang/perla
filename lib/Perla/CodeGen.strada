@@ -17667,6 +17667,23 @@ func _gen_call(scalar $cg, scalar $node) void {
     my scalar $args = $node->{"args"};
     my int $argc = scalar(@{$args});
 
+    # `goto(EXPR)` in EXPRESSION context (e.g. a ternary branch like
+    # `COND ? goto($cref) : ...`). The statement parser turns a top-level goto
+    # into N_GOTO_SUB; in expression position it parses as a call to "goto".
+    # Perl's `goto &CODE` tail-calls CODE with the current @_ — mid-expression
+    # we can't do a true frame swap, so model the observable result: call the
+    # coderef with @_ and yield its return value. Real-world: Type::Tiny /
+    # Types::TypeTiny inline-check subs do
+    # `( $AvoidCallbacks or not $xsubname ) ? goto($inlined) : qq/.../` — without
+    # this the goto branch yielded undef and Type::Tiny croaked "Inlining type
+    # constraint check ... returned undef".
+    if ($name eq "goto" && $argc == 1) {
+        emit($cg, "perla_call_code(");
+        gen_expr($cg, $args->[0]);
+        emit($cg, ", perla_at_)");
+        return;
+    }
+
     # `CORE::name` — Perl's explicit-builtin form. Used by packages that
     # override built-in names (`sub push {...}` then `CORE::push @a, ...`).
     # Strip the prefix and reuse the unqualified handler so it routes

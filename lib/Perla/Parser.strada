@@ -540,8 +540,15 @@ func _parse_stmt(scalar $p) scalar {
         # and the wrapping sub returns undef. Real-world: Types::Standard's
         # `goto \&Type::Library::add_type` (every core type built this way) and
         # Type::Tiny's `goto \&overload::OVERLOAD`.
+        # LPAREN handles the parenthesized statement form `goto($cref)` /
+        # `goto(\&sub)` as a proper tail-call (N_GOTO_SUB: pop frame + return
+        # the call). Without it these fall through to a plain `goto(...)`
+        # N_CALL, which for the tail-recursion idiom (`goto(\&self)`) recurses
+        # instead of replacing the frame → unbounded growth / hang. (Genuine
+        # EXPRESSION-context goto, e.g. a ternary branch, still lands in
+        # _gen_call's goto handler and yields the coderef-call's value.)
         my str $g_pt = _peek_type($p);
-        if ($g_pt eq "BACKSLASH" || $g_pt eq "SCALAR_VAR") {
+        if ($g_pt eq "BACKSLASH" || $g_pt eq "SCALAR_VAR" || $g_pt eq "LPAREN") {
             my scalar $target = _parse_expr($p);
             my scalar $node = Perla::AST::node(Perla::AST::N_GOTO_SUB());
             $node->{"target"} = $target;
