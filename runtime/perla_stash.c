@@ -463,6 +463,9 @@ static StradaValue *perla_mop_set_slot_value(StradaValue *args);
 static StradaValue *perla_mop_get_slot_value(StradaValue *args);
 StradaValue *perla_moose_import(StradaValue *args);
 StradaValue *perla_moose_typeconstraints_import(StradaValue *args);
+StradaValue *perla_constant_import(StradaValue *args);
+void perla_constant_import_pkg(const char *pkg, StradaValue *args);
+static StradaValue *perla_const_thunk(StradaValue ***captures, StradaValue *args);
 StradaValue *perla_moose_role_import(StradaValue *args);
 static StradaValue *perla_moose_object_new(StradaValue *args);
 static StradaValue *perla_moose_native_has(StradaValue *args);
@@ -1387,6 +1390,7 @@ void perla_init(void) {
      * flag or expose refcounts, so these are no-ops. Without SvREADONLY,
      * `use constant`-heavy code (and Type::Tiny) dies "Undefined subroutine
      * &Internals::SvREADONLY". */
+    perla_code_set_protected("constant", "import", strada_cpointer_new((void*)perla_constant_import));
     perla_code_set("Internals", "SvREADONLY", strada_cpointer_new((void*)perla_noop_undef));
     perla_code_set("Internals", "SvREFCNT", strada_cpointer_new((void*)perla_noop_undef));
     perla_code_set("Internals", "hv_clear_placeholders", strada_cpointer_new((void*)perla_noop_undef));
@@ -17230,6 +17234,98 @@ StradaValue *perla_moose_typeconstraints_import(StradaValue *args) {
         perla_code_set(target, tc_words[i],
                        strada_cpointer_new((void*)perla_noop_undef));
     }
+    return STRADA_MAKE_TAGGED_INT(1);
+}
+
+/* Generic constant thunk: a closure whose single capture IS the constant
+ * value; calling it returns that value. Used by perla_constant_import. */
+static StradaValue *perla_const_thunk(StradaValue ***captures, StradaValue *args) {
+    (void)args;
+    StradaValue *v = (captures && captures[0]) ? *captures[0] : NULL;
+    if (!v) return strada_new_undef();
+    strada_incref(v);
+    return v;
+}
+
+/* `constant->import( NAME => VALUE, ... )` / `constant->import({ NAME => VALUE,
+ * ... })` — the `constant` pragma invoked as a METHOD (not `use constant`).
+ * `use constant` is handled at parse time, but modules call constant->import
+ * directly to define constants conditionally at runtime (e.g.
+ * Class::Accessor::Grouped's `package __CAG_ENV__; constant->import(
+ * NO_SUBNAME => eval {...} ? 0 : "$@" )`). Install each NAME in the CALLING
+ * package as a sub returning VALUE. Without this, the later
+ * `__CAG_ENV__::NO_SUBNAME` call dies "Undefined subroutine". */
+/* Install constants from a `constant->import(...)` call into package `pkg`.
+ * The codegen passes the compile-time caller package explicitly (a direct
+ * method call gives no reliable runtime caller package). */
+void perla_constant_import_pkg(const char *pkg, StradaValue *args) {
+    StradaArray *av = args ? strada_deref_array(args) : NULL;
+    if (!av || av->size < 2) return;
+    if (!pkg || !pkg[0]) pkg = "main";
+    /* av[0] is the invocant ("constant"); pairs/hashref start at index 1. */
+
+    StradaValue *first = av->elements[av->head + 1];
+    /* Hashref form: constant->import({ NAME => VAL, ... }) */
+    if (first && !STRADA_IS_TAGGED_INT(first) && first->type == STRADA_REF
+        && first->value.rv && first->value.rv->type == STRADA_HASH
+        && first->value.rv->value.hv) {
+        StradaHash *hv = first->value.rv->value.hv;
+        StradaArray *keys = strada_hash_keys(hv);
+        if (keys) {
+            for (size_t i = 0; i < keys->size; i++) {
+                StradaValue *ksv = keys->elements[keys->head + i];
+                char *k = strada_to_str(ksv);
+                if (!k) continue;
+                StradaValue *val = strada_hash_get(hv, k);
+                StradaValue **cell = strada_cell_alloc();
+                *cell = val ? val : strada_new_undef();
+                strada_incref(*cell);
+                StradaValue ***caps = (StradaValue ***)malloc(sizeof(StradaValue **));
+                caps[0] = cell;
+                StradaValue *clo = strada_closure_new((void *)perla_const_thunk, 0, 1, caps);
+                perla_code_set(pkg, k, clo);
+                free(k);
+            }
+            strada_free_array(keys);
+        }
+        return;
+    }
+
+    /* List form: NAME => VALUE [, NAME => VALUE ...]. A single NAME with
+     * several trailing values defines a list constant; we install the first
+     * value (sufficient for the boolean/string env constants that need this)
+     * — extend to a list-returning thunk if a real multi-value list constant
+     * shows up. */
+    size_t i = 1;
+    while (i + 1 <= av->size - 1) {
+        char *name = strada_to_str(av->elements[av->head + i]);
+        StradaValue *val = av->elements[av->head + i + 1];
+        if (name) {
+            StradaValue **cell = strada_cell_alloc();
+            *cell = val ? val : strada_new_undef();
+            strada_incref(*cell);
+            StradaValue ***caps = (StradaValue ***)malloc(sizeof(StradaValue **));
+            caps[0] = cell;
+            StradaValue *clo = strada_closure_new((void *)perla_const_thunk, 0, 1, caps);
+            perla_code_set(pkg, name, clo);
+            free(name);
+        }
+        i += 2;
+    }
+}
+
+/* Registered as constant::import for any RUNTIME dispatch that bypasses the
+ * codegen special-case (which calls perla_constant_import_pkg with the exact
+ * compile-time package). Falls back to caller-package detection. */
+StradaValue *perla_constant_import(StradaValue *args) {
+    const char *pkg = "main";
+    if (perla_use_caller_pkg && perla_use_caller_pkg[0]) {
+        pkg = perla_use_caller_pkg;
+    } else if (perla_call_depth > 0) {
+        const char *p = perla_call_stack[perla_call_depth - 1].package;
+        if (p && p[0]) pkg = p;
+    }
+    perla_constant_import_pkg(pkg, args);
     return STRADA_MAKE_TAGGED_INT(1);
 }
 

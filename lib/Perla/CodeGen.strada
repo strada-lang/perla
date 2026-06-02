@@ -24480,6 +24480,36 @@ func _gen_method_call(scalar $cg, scalar $node) void {
     my scalar $args = $node->{"args"};
     my int $argc = scalar(@{$args});
 
+    # `constant->import( NAME => VALUE, ... )` — the constant pragma invoked
+    # as a method (not `use constant`). A direct method call gives no reliable
+    # runtime caller package, so resolve it at compile time ($cg->{"pkg"}) and
+    # hand it to perla_constant_import_pkg explicitly. Real-world:
+    # Class::Accessor::Grouped's `package __CAG_ENV__; constant->import(
+    # NO_SUBNAME => ... )`. Without this the constant installed in the wrong
+    # package and `__CAG_ENV__::NO_SUBNAME` died "Undefined subroutine".
+    if (($method eq "import" || $method eq "unimport") && defined($node->{"object"})) {
+        my scalar $ci_obj = $node->{"object"};
+        my int $ci_is_constant = 0;
+        if (($ci_obj->{"type"} == Perla::AST::N_CALL() || $ci_obj->{"type"} == Perla::AST::N_STR_LIT())
+            && defined($ci_obj->{"name"}) && $ci_obj->{"name"} eq "constant") { $ci_is_constant = 1; }
+        if ($ci_obj->{"type"} == Perla::AST::N_STR_LIT() && defined($ci_obj->{"value"}) && $ci_obj->{"value"} eq "constant") { $ci_is_constant = 1; }
+        if ($ci_is_constant == 1 && $method eq "import") {
+            emit($cg, "({ StradaValue *__ci_a = strada_new_array(); StradaArray *__ci_av = strada_deref_array(__ci_a); ");
+            emit($cg, "strada_array_push_take(__ci_av, strada_new_str(\"constant\")); ");
+            my int $ci_i = 0;
+            while ($ci_i < $argc) {
+                emit($cg, "{ int __sav_wl_ci = __perla_want_list; __perla_want_list = 1; StradaValue *__ci_v = ");
+                gen_expr($cg, $args->[$ci_i]);
+                emit($cg, "; __perla_want_list = __sav_wl_ci; ");
+                emit($cg, "if (__ci_v && !STRADA_IS_TAGGED_INT(__ci_v) && __ci_v->type == STRADA_ARRAY) { StradaArray *__ci_fa = __ci_v->value.av; for (size_t __ci_fi = 0; __ci_fi < __ci_fa->size; __ci_fi++) { StradaValue *__ci_e = __ci_fa->elements[__ci_fa->head + __ci_fi]; if (__ci_e) strada_incref(__ci_e); strada_array_push_take(__ci_av, __ci_e); } strada_decref(__ci_v); } ");
+                emit($cg, "else { strada_array_push_take(__ci_av, __ci_v); } } ");
+                $ci_i = $ci_i + 1;
+            }
+            emit($cg, "perla_constant_import_pkg(\"" . $cg->{"pkg"} . "\", __ci_a); strada_decref(__ci_a); STRADA_MAKE_TAGGED_INT(1); })");
+            return;
+        }
+    }
+
     # Built-in methods: isa(), can()
     if ($method eq "isa" && $argc >= 1) {
         # Check if object is a static class name (bare word / N_CALL with no args)
