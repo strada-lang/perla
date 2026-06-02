@@ -14929,6 +14929,19 @@ func _emit_pkg_scalar_compound(scalar $cg, scalar $node, str $op, scalar $value)
     emit($cg, "; perla_scalar_set(\"" . $pkg . "\", \"" . $name . "\", __nv); __nv; })");
 }
 
+# Emit EXPR forced into scalar context (runtime __perla_want_list = 0) and yield
+# its value. The RHS of a scalar compound-assign (`$x ||= …`, `//=`, `&&=`) is
+# scalar context in Perl, but perla otherwise gens the RHS in the ambient
+# context — so a list-returning RHS like `caller()` leaked its 3-element list
+# (package,file,line), and `$x ||= caller()` assigned the list (→ "3" / a joined
+# string) instead of just the package. Real-world: Moose::Exporter's
+# `$args{exporting_package} ||= caller()`.
+func gen_scalar_ctx_expr(scalar $cg, scalar $expr) void {
+    emit($cg, "({ int __sav_wl_sx = __perla_want_list; __perla_want_list = 0; StradaValue *__sxv = ");
+    gen_expr($cg, $expr);
+    emit($cg, "; __perla_want_list = __sav_wl_sx; __sxv; })");
+}
+
 # --- Assignment ---
 func _gen_assign(scalar $cg, scalar $node) void {
     my str $op = $node->{"op"};
@@ -17171,7 +17184,7 @@ func _gen_assign(scalar $cg, scalar $node) void {
                 emit($cg, "({ StradaValue *__ce_tg = ");
                 gen_expr($cg, $node->{"target"});
                 emit($cg, "; StradaValue *__ce_rv = ");
-                gen_expr($cg, $node->{"value"});
+                gen_scalar_ctx_expr($cg, $node->{"value"});
                 emit($cg, "; StradaValue *__ce_new = strada_concat_sv(__ce_tg, __ce_rv); ");
                 # strada_concat_sv only READS its operands (never consumes
                 # them), so an owned RHS temp — `$s .= "x$i"`, `.= func()` —
@@ -17198,7 +17211,7 @@ func _gen_assign(scalar $cg, scalar $node) void {
             emit($cg, "({ if (!perla_eval_error) { perla_eval_error = strada_new_str(\"\"); strada_incref(perla_eval_error); } ");
             emit($cg, "if (!strada_defined_bool(perla_eval_error)) { ");
             emit($cg, "if (perla_eval_error) strada_decref(perla_eval_error); perla_eval_error = ");
-            gen_expr($cg, $node->{"value"});
+            gen_scalar_ctx_expr($cg, $node->{"value"});
             emit($cg, "; } perla_eval_error; })");
             return;
         }
@@ -17222,7 +17235,7 @@ func _gen_assign(scalar $cg, scalar $node) void {
             my str $name = $pn[1];
             emit($cg, "({ StradaValue *__l = perla_scalar_get(\"" . $pkg . "\", \"" . $name . "\"); ");
             emit($cg, "if (!strada_defined_bool(__l)) { perla_scalar_set(\"" . $pkg . "\", \"" . $name . "\", ");
-            gen_expr($cg, $node->{"value"});
+            gen_scalar_ctx_expr($cg, $node->{"value"});
             emit($cg, "); __l = perla_scalar_get(\"" . $pkg . "\", \"" . $name . "\"); } __l; })");
         } elsif (Perla::CodeGen::Predicate::is_simple_lvalue($target_type) == 1) {
             emit($cg, "({ StradaValue *__l = ");
@@ -17230,7 +17243,7 @@ func _gen_assign(scalar $cg, scalar $node) void {
             emit($cg, "; if (!strada_defined_bool(__l)) { ");
             gen_expr($cg, $node->{"target"});
             emit($cg, " = ");
-            gen_expr($cg, $node->{"value"});
+            gen_scalar_ctx_expr($cg, $node->{"value"});
             emit($cg, "; } ");
             gen_expr($cg, $node->{"target"});
             emit($cg, "; })");
@@ -17264,7 +17277,7 @@ func _gen_assign(scalar $cg, scalar $node) void {
             emit($cg, "({ if (!perla_eval_error) { perla_eval_error = strada_new_str(\"\"); strada_incref(perla_eval_error); } ");
             emit($cg, "if (!perla_to_bool(perla_eval_error)) { ");
             emit($cg, "if (perla_eval_error) strada_decref(perla_eval_error); perla_eval_error = ");
-            gen_expr($cg, $node->{"value"});
+            gen_scalar_ctx_expr($cg, $node->{"value"});
             emit($cg, "; } perla_eval_error; })");
             return;
         }
@@ -17285,7 +17298,7 @@ func _gen_assign(scalar $cg, scalar $node) void {
             emit($cg, "); if (__la_idx < 0 && __la_av) __la_idx += strada_array_length(__la_av); ");
             emit($cg, "StradaValue *__la_cur = __la_av ? strada_array_get(__la_av, __la_idx) : strada_new_undef(); ");
             emit($cg, "StradaValue *__la_r; if (perla_to_bool(__la_cur)) { __la_r = __la_cur; } else { __la_r = ");
-            gen_expr($cg, $node->{"value"});
+            gen_scalar_ctx_expr($cg, $node->{"value"});
             emit($cg, "; if (__la_av) strada_array_set(__la_av, __la_idx, __la_r); } __la_r; })");
         } elsif (_is_pkg_qualified_scalar($target) == 1) {
             # `$Pkg::Name ||= V` — same lvalue issue as //= above.
@@ -17294,7 +17307,7 @@ func _gen_assign(scalar $cg, scalar $node) void {
             my str $name = $pn[1];
             emit($cg, "({ StradaValue *__l = perla_scalar_get(\"" . $pkg . "\", \"" . $name . "\"); ");
             emit($cg, "if (!perla_to_bool(__l)) { perla_scalar_set(\"" . $pkg . "\", \"" . $name . "\", ");
-            gen_expr($cg, $node->{"value"});
+            gen_scalar_ctx_expr($cg, $node->{"value"});
             emit($cg, "); __l = perla_scalar_get(\"" . $pkg . "\", \"" . $name . "\"); } __l; })");
         } elsif (Perla::CodeGen::Predicate::is_simple_lvalue($target_type) == 1) {
             emit($cg, "({ StradaValue *__l = ");
@@ -17302,7 +17315,7 @@ func _gen_assign(scalar $cg, scalar $node) void {
             emit($cg, "; if (!perla_to_bool(__l)) { ");
             gen_expr($cg, $target);
             emit($cg, " = ");
-            gen_expr($cg, $node->{"value"});
+            gen_scalar_ctx_expr($cg, $node->{"value"});
             emit($cg, "; } ");
             gen_expr($cg, $target);
             emit($cg, "; })");
@@ -17332,7 +17345,7 @@ func _gen_assign(scalar $cg, scalar $node) void {
             my str $name = $pn[1];
             emit($cg, "({ StradaValue *__l = perla_scalar_get(\"" . $pkg . "\", \"" . $name . "\"); ");
             emit($cg, "if (perla_to_bool(__l)) { perla_scalar_set(\"" . $pkg . "\", \"" . $name . "\", ");
-            gen_expr($cg, $node->{"value"});
+            gen_scalar_ctx_expr($cg, $node->{"value"});
             emit($cg, "); __l = perla_scalar_get(\"" . $pkg . "\", \"" . $name . "\"); } __l; })");
             return;
         }
@@ -17341,7 +17354,7 @@ func _gen_assign(scalar $cg, scalar $node) void {
         emit($cg, "; if (perla_to_bool(__l)) { ");
         gen_expr($cg, $target);
         emit($cg, " = ");
-        gen_expr($cg, $node->{"value"});
+        gen_scalar_ctx_expr($cg, $node->{"value"});
         emit($cg, "; } ");
         gen_expr($cg, $target);
         emit($cg, "; })");
@@ -17441,12 +17454,12 @@ func _gen_array_compound_assign(scalar $cg, scalar $target, str $op, scalar $val
         my str $tcond = "perla_to_bool";
         if ($op eq "//") { $tcond = "strada_defined_bool"; }
         emit($cg, "StradaValue *__ca_new = " . $tcond . "(__ca_cur) ? __ca_cur : ");
-        gen_expr($cg, $value);
+        gen_scalar_ctx_expr($cg, $value);
         emit($cg, "; if (__ca_new != __ca_cur) { strada_array_set(__ca_av, __ca_idx, __ca_new); } __ca_new; })");
         return;
     }
     emit($cg, "StradaValue *__ca_rhs = ");
-    gen_expr($cg, $value);
+    gen_scalar_ctx_expr($cg, $value);
     emit($cg, "; StradaValue *__ca_new = ");
     if ($op eq "+") {
         emit($cg, "strada_new_num(strada_to_num(__ca_cur) + strada_to_num(__ca_rhs))");
@@ -17544,18 +17557,18 @@ func _gen_hash_postfix_inc_dec(scalar $cg, scalar $target, str $op) void {
 func _emit_hash_cmpd_nv(scalar $cg, str $op, scalar $value) void {
     if ($op eq "//") {
         emit($cg, "StradaValue *__nv = strada_defined_bool(__cv) ? __cv : ");
-        gen_expr($cg, $value);
+        gen_scalar_ctx_expr($cg, $value);
         emit($cg, "; ");
         return;
     }
     if ($op eq "||") {
         emit($cg, "StradaValue *__nv = perla_to_bool(__cv) ? __cv : ");
-        gen_expr($cg, $value);
+        gen_scalar_ctx_expr($cg, $value);
         emit($cg, "; ");
         return;
     }
     emit($cg, "StradaValue *__hrhs = ");
-    gen_expr($cg, $value);
+    gen_scalar_ctx_expr($cg, $value);
     emit($cg, "; StradaValue *__nv = ");
     if ($op eq ".") {
         emit($cg, "strada_concat_sv(__cv, __hrhs)");
