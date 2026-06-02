@@ -170,8 +170,8 @@ func generate(scalar $ast) str {
     emit(\%cg, "StradaValue *v__slash_ = NULL; /* $/ - input record separator */\n");
     emit(\%cg, "StradaValue *perla_dollar_zero = NULL; /* $0 */\n");
     emit(\%cg, "extern StradaValue *perla_current_argv;\n");
-    emit(\%cg, "int perla_dollar_question = 0; /* $? — wait status of last system/qx */\n");
-    emit(\%cg, "int perla_dollar_dot = 0; /* $. — current input line number */\n");
+    emit(\%cg, "int perla_dollar_question = 0; /* $? -- wait status of last system/qx */\n");
+    emit(\%cg, "int perla_dollar_dot = 0; /* $. -- current input line number */\n");
     emit(\%cg, "StradaValue **__perla_sort_ctx[16] = {0}; /* sort block captures (write-through slots) */\n");
     emit(\%cg, "StradaValue **__perla_cell[64] = {0}; /* shared closure cells */\n");
     # Named-comparator sort thunk: sets v_a/v_b before calling the named
@@ -799,6 +799,19 @@ func generate(scalar $ast) str {
     }
 
     my str $code = sb_to_string($sb);
+    # The generated C is manipulated below (and in perla.strada's fix passes)
+    # with byte-offset index()/substr() surgery — e.g. the auto-declared-vars
+    # post-pass splices a block at `index($code, "int main(")`. If a non-ASCII
+    # string literal in the source made $code UTF-8-flagged, those offsets are
+    # CODEPOINT offsets, not byte offsets, so the splice lands mid-token and
+    # produces broken C (e.g. `NUL` + comment + `L` instead of `NULL`). The C
+    # text is ASCII-structured (only some string-literal contents are
+    # non-ASCII), so treat $code as bytes throughout the post-processing.
+    __C__ {
+        if (code && !STRADA_IS_TAGGED_INT(code) && code->type == STRADA_STR) {
+            strada_set_utf8_flag(code, 0);
+        }
+    }
 
     # If we have anon subs, prepend their forward declarations.
     # Mark them `static` so each .pm.so keeps its own copy file-local —
@@ -931,6 +944,17 @@ func generate(scalar $ast) str {
     }
     # Only count declarations at file scope (static) or before main, not inside functions
     # A variable declared inside a function body is NOT visible in main()
+    # Re-clear $code's UTF-8 flag here: an earlier concat (e.g. the anon-sub
+    # forward-decl prepend) can re-flag it after the clear at assembly time, and
+    # the index()/substr() splice below MUST use byte offsets — index() returns a
+    # byte offset but substr() treats a flagged string's offset as a CODEPOINT
+    # offset, so on a $code containing a non-ASCII string literal the splice
+    # lands mid-token (`NULL` -> `NUL` + block + `L`), breaking the C.
+    __C__ {
+        if (code && !STRADA_IS_TAGGED_INT(code) && code->type == STRADA_STR) {
+            strada_set_utf8_flag(code, 0);
+        }
+    }
     my hash %file_declared = ();
     my int $main_start = index($code, "int main(");
     if ($main_start < 0) { $main_start = 0; }
@@ -18474,7 +18498,7 @@ func _gen_call(scalar $cg, scalar $node) void {
         } elsif ($argc > 0) {
             emit($cg, "({ StradaValue *__wv = ");
             gen_expr($cg, $args->[0]);
-            emit($cg, "; /* weaken non-lvalue — no-op */ __wv; })");
+            emit($cg, "; /* weaken non-lvalue -- no-op */ __wv; })");
         } else {
             emit($cg, "strada_new_undef()");
         }
