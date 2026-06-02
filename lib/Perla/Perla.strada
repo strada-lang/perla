@@ -1,0 +1,60 @@
+# Perla - Perl 5 Compiler Library
+#
+# Usage from Strada:
+#   use lib "perla/lib";
+#   use Perla;
+#   Perla::compile("input.pl", "output.c");
+#
+# Or as a CLI:
+#   ./perla input.pl -o output
+
+use Perla::AST;
+use Perla::Lexer;
+use Perla::Parser;
+use Perla::CodeGen::Escape;
+use Perla::CodeGen;
+
+package Perla;
+
+func compile_source_with_paths(str $source, str $filename, scalar $lib_paths) str {
+    # Lex
+    my array @tokens = Perla::Lexer::lex($source);
+
+    # Parse (module loading happens during parsing)
+    my scalar $ast = Perla::Parser::parse_with_paths(@tokens, $lib_paths);
+
+    # Generate C
+    my str $code = Perla::CodeGen::generate($ast);
+
+    return $code;
+}
+
+func compile_source(str $source, str $filename) str {
+    my scalar $lib_paths = [];
+    my int $last_slash = -1;
+    my int $fi = 0;
+    while ($fi < length($filename)) {
+        if (substr($filename, $fi, 1) eq "/") { $last_slash = $fi; }
+        $fi++;
+    }
+    if ($last_slash >= 0) {
+        push(@{$lib_paths}, substr($filename, 0, $last_slash));
+    }
+    push(@{$lib_paths}, ".");
+    return compile_source_with_paths($source, $filename, $lib_paths);
+}
+
+func compile(str $input_file, str $output_file) void {
+    my str $source = core::slurp($input_file);
+    my str $code = compile_source($source, $input_file);
+    core::spew($output_file, $code);
+}
+
+# Compile a single .pm module to standalone C code with an init function.
+# The module's subs become global symbols; the init function registers them in the stash.
+func compile_module(str $source, str $mod_name, str $filename, scalar $lib_paths) str {
+    my array @tokens = Perla::Lexer::lex($source);
+    my scalar $ast = Perla::Parser::parse_with_file_context(@tokens, $lib_paths, {}, $filename);
+    my str $code = Perla::CodeGen::generate_module($ast, $mod_name);
+    return $code;
+}

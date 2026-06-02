@@ -1,0 +1,498 @@
+# Perla::CodeGen::Escape - Pure string-encoding helpers used by codegen.
+#
+# Extracted from Perla::CodeGen so the bulk of CodeGen.strada can shrink to
+# something a human can navigate. None of these touch the codegen state
+# ($cg / sb / lexicals) — they're pure str -> str (or str -> int) transforms,
+# which makes them safe to compile as a separate module via `strada -M`.
+#
+# Naming: the `_`-prefixed forms (`_escape_c_str` etc.) used to live inside
+# Perla::CodeGen. The new module-qualified names drop the underscore:
+#   _escape_c_str -> Perla::CodeGen::Escape::escape_c_str
+# In-module cross-calls also use the un-prefixed names since they're no
+# longer "private to CodeGen.strada".
+
+package Perla::CodeGen::Escape;
+
+use Perla::AST;
+
+# Convert a Perl-source double-quoted-string body to a C-source-safe payload
+# suitable to drop into a "..." literal in generated C. Preserves PCRE2 case
+# escapes (\U, \L, \E, \u, \l), back-references (\1..\9), and \$ / \@ so the
+# downstream regex/s/// machinery sees the literal $ or @.
+func escape_perl_dq_for_c(str $s) str {
+    my str $out = "";
+    my int $i = 0;
+    my int $len = length($s);
+    while ($i < $len) {
+        my str $ch = substr($s, $i, 1);
+        if ($ch eq "\\" && $i + 1 < $len) {
+            my str $next = substr($s, $i + 1, 1);
+            if ($next eq "\\") { $out = $out . "\\\\"; $i = $i + 2; next; }
+            if ($next eq "n") { $out = $out . "\\n"; $i = $i + 2; next; }
+            if ($next eq "t") { $out = $out . "\\t"; $i = $i + 2; next; }
+            if ($next eq "r") { $out = $out . "\\r"; $i = $i + 2; next; }
+            if ($next eq "\"") { $out = $out . "\\\""; $i = $i + 2; next; }
+            # Preserve PCRE2 case-change escapes (\U, \L, \E, \u, \l) and
+            # backref escapes (\1-\9) so the replacement string reaching
+            # pcre2_substitute still has them — PCRE2_SUBSTITUTE_EXTENDED
+            # then interprets them. Without preservation, the backslash
+            # was being dropped (Perl-source "unknown escape" semantics),
+            # turning `\U$1` into the literal `U$1`. Emit ONE backslash in
+            # the C string ("\\\\" → "\\") so PCRE2 sees \u not \\u —
+            # the double-backslash form made PCRE2 interpret `\\` as
+            # literal `\` and `u` as literal `u`, producing "\u<capture>"
+            # instead of the uppercased capture.
+            if ($next eq "U" || $next eq "L" || $next eq "E" || $next eq "u" || $next eq "l"
+                || ($next ge "1" && $next le "9")) {
+                $out = $out . "\\" . $next;
+                $i = $i + 2;
+                next;
+            }
+            # Preserve `\$` and `\@` so the runtime preprocessor sees
+            # the backslash and can emit `$$` (PCRE2's literal-$ escape).
+            # Without this, `\$1` was dropped to `$1` which PCRE2 then
+            # interpreted as a backref — Perl source `s/.../\$1: $1/`
+            # should emit `$1: <capture>`.
+            if ($next eq "$" || $next eq "@") {
+                $out = $out . "\\" . $next;
+                $i = $i + 2;
+                next;
+            }
+            # Unknown Perl escape — in Perl, \_ is just _ (unknown escapes drop the backslash)
+            $out = $out . escape_c_char($next);
+            $i = $i + 2;
+            next;
+        }
+        if ($ch eq "\"") { $out = $out . "\\\""; }
+        elsif ($ch eq "\n") { $out = $out . "\\n"; }
+        elsif ($ch eq "\t") { $out = $out . "\\t"; }
+        else { $out = $out . $ch; }
+        $i++;
+    }
+    return $out;
+}
+
+# Escape a single character for embedding in a C string literal.
+func escape_c_char(str $ch) str {
+    if ($ch eq "\\") { return "\\\\"; }
+    if ($ch eq "\"") { return "\\\""; }
+    if ($ch eq "\n") { return "\\n"; }
+    if ($ch eq "\t") { return "\\t"; }
+    return $ch;
+}
+
+# Translate __STRADA__ block code to C.
+# Handles: $var -> v_var, @arr -> v_arr, %hash -> v_hash
+#          core::func() -> strada_func(), math::func() -> strada_math_func()
+#          say(...) -> strada_say(...), etc.
+#          my TYPE $var -> StradaValue *v_var
+func strada_to_c(str $code) str {
+    my str $result = "";
+    my int $i = 0;
+    my int $len = length($code);
+
+    while ($i < $len) {
+        my str $ch = substr($code, $i, 1);
+
+        # String literals — pass through
+        if ($ch eq "\"") {
+            $result = $result . $ch;
+            $i++;
+            while ($i < $len) {
+                my str $sc = substr($code, $i, 1);
+                $result = $result . $sc;
+                $i++;
+                if ($sc eq "\"") { last; }
+                if ($sc eq "\\" && $i < $len) {
+                    $result = $result . substr($code, $i, 1);
+                    $i++;
+                }
+            }
+            next;
+        }
+
+        # $var -> v_var (Perl scalar variable)
+        if ($ch eq "$" && $i + 1 < $len) {
+            my str $nc = substr($code, $i + 1, 1);
+            if (($nc ge "a" && $nc le "z") || ($nc ge "A" && $nc le "Z") || $nc eq "_") {
+                $i++;
+                my str $vname = "";
+                while ($i < $len) {
+                    my str $vc = substr($code, $i, 1);
+                    if (($vc ge "a" && $vc le "z") || ($vc ge "A" && $vc le "Z") ||
+                        ($vc ge "0" && $vc le "9") || $vc eq "_") {
+                        $vname = $vname . $vc;
+                        $i++;
+                    } else { last; }
+                }
+                $result = $result . "v_" . $vname;
+                next;
+            }
+        }
+
+        # @arr -> v_arr
+        if ($ch eq "@" && $i + 1 < $len) {
+            my str $nc = substr($code, $i + 1, 1);
+            if (($nc ge "a" && $nc le "z") || ($nc ge "A" && $nc le "Z") || $nc eq "_") {
+                $i++;
+                my str $vname = "";
+                while ($i < $len) {
+                    my str $vc = substr($code, $i, 1);
+                    if (($vc ge "a" && $vc le "z") || ($vc ge "A" && $vc le "Z") ||
+                        ($vc ge "0" && $vc le "9") || $vc eq "_") {
+                        $vname = $vname . $vc;
+                        $i++;
+                    } else { last; }
+                }
+                $result = $result . "v_" . $vname;
+                next;
+            }
+        }
+
+        # %hash -> v_hash
+        if ($ch eq "%" && $i + 1 < $len) {
+            my str $nc = substr($code, $i + 1, 1);
+            if (($nc ge "a" && $nc le "z") || ($nc ge "A" && $nc le "Z") || $nc eq "_") {
+                $i++;
+                my str $vname = "";
+                while ($i < $len) {
+                    my str $vc = substr($code, $i, 1);
+                    if (($vc ge "a" && $vc le "z") || ($vc ge "A" && $vc le "Z") ||
+                        ($vc ge "0" && $vc le "9") || $vc eq "_") {
+                        $vname = $vname . $vc;
+                        $i++;
+                    } else { last; }
+                }
+                $result = $result . "v_" . $vname;
+                next;
+            }
+        }
+
+        # Identifiers: translate namespace:: prefixes
+        if (($ch ge "a" && $ch le "z") || ($ch ge "A" && $ch le "Z") || $ch eq "_") {
+            my str $word = "";
+            my int $wstart = $i;
+            while ($i < $len) {
+                my str $wc = substr($code, $i, 1);
+                if (($wc ge "a" && $wc le "z") || ($wc ge "A" && $wc le "Z") ||
+                    ($wc ge "0" && $wc le "9") || $wc eq "_") {
+                    $word = $word . $wc;
+                    $i++;
+                } elsif ($wc eq ":" && $i + 1 < $len && substr($code, $i + 1, 1) eq ":") {
+                    $word = $word . "::";
+                    $i = $i + 2;
+                } else { last; }
+            }
+
+            # Translate known namespace:: prefixes
+            if (length($word) > 6 && substr($word, 0, 6) eq "core::") {
+                $result = $result . "strada_" . substr($word, 6, length($word) - 6);
+            } elsif (length($word) > 5 && substr($word, 0, 5) eq "sys::") {
+                $result = $result . "strada_" . substr($word, 5, length($word) - 5);
+            } elsif (length($word) > 6 && substr($word, 0, 6) eq "math::") {
+                $result = $result . "strada_math_" . substr($word, 6, length($word) - 6);
+            } elsif ($word eq "say") {
+                $result = $result . "strada_say";
+            } elsif ($word eq "print") {
+                $result = $result . "strada_print";
+            } elsif ($word eq "push") {
+                $result = $result . "strada_array_push";
+            } elsif ($word eq "undef") {
+                $result = $result . "strada_new_undef()";
+            } elsif (index($word, "::") > 0) {
+                # Package::func -> Package_func (replace :: with _)
+                my str $mangled = "";
+                my int $wi = 0;
+                while ($wi < length($word)) {
+                    if (substr($word, $wi, 2) eq "::") {
+                        $mangled = $mangled . "_";
+                        $wi = $wi + 2;
+                    } else {
+                        $mangled = $mangled . substr($word, $wi, 1);
+                        $wi++;
+                    }
+                }
+                $result = $result . $mangled;
+            } else {
+                $result = $result . $word;
+            }
+            next;
+        }
+
+        # Everything else — pass through
+        $result = $result . $ch;
+        $i++;
+    }
+
+    return $result;
+}
+
+# Escape only the Perl-specific backslashes — leaves \n \t \r \b \f \v \a \0 \x \\ \" \' \?
+# unchanged (C understands those), but doubles every other backslash so the C compiler
+# treats it as literal.
+func escape_perl_only_bslash(str $s) str {
+    my str $out = "";
+    my int $i = 0;
+    my int $len = length($s);
+    while ($i < $len) {
+        my str $ch = substr($s, $i, 1);
+        if ($ch eq "\\" && $i + 1 < $len) {
+            my str $nx = substr($s, $i + 1, 1);
+            # C-standard escapes we leave untouched
+            if ($nx eq "n" || $nx eq "t" || $nx eq "r" || $nx eq "b" || $nx eq "f" ||
+                $nx eq "v" || $nx eq "a" || $nx eq "0" || $nx eq "x" || $nx eq "\\" ||
+                $nx eq "\"" || $nx eq "'" || $nx eq "?") {
+                $out = $out . "\\" . $nx;
+            } else {
+                # Perl-only or unknown: double the backslash so C sees literal
+                $out = $out . "\\\\" . $nx;
+            }
+            $i = $i + 2;
+        } else {
+            $out = $out . $ch;
+            $i++;
+        }
+    }
+    return $out;
+}
+
+# Return a C-source-safe "..." payload for a literal string AST node, properly
+# handling N_STR_LIT (single-quoted — only \\ and \' escapes) vs N_INTERP_STR
+# (double-quoted — \n, \t, \N{U+...}, \x{...}, etc.).
+func str_node_to_c(scalar $node) str {
+    if (!defined($node)) { return ""; }
+    if ($node->{"type"} == Perla::AST::N_INTERP_STR()) {
+        return perl_interp_literal_to_c($node->{"value"});
+    }
+    return escape_c_str($node->{"value"});
+}
+
+# Expand a tr/// charset: process backslash escapes and `a-z` ranges
+# so `a-z \-` becomes the literal 28-char string "abcdef...xyz" + space + "-".
+# perla previously fed the raw source to memchr at runtime, which only
+# matched the 3 literal chars 'a', '-', 'z' (plus space, '\', '-').
+# `tr/a-z \-/A-Z__/` was therefore lower-casing only 'a' and a few
+# punctuation chars — surfaced as HTTP::Status's eval-installed
+# `HTTP_NON_AUTHORITATIVE_INFORMATION` constants coming out as
+# `HTTP_Non-AuthoritAtive_InformAtion`, which then failed to parse
+# as Perl sub names.
+func expand_tr_charset(str $s) str {
+    my str $out = "";
+    my int $i = 0;
+    my int $len = length($s);
+    while ($i < $len) {
+        my str $ch = substr($s, $i, 1);
+        # Backslash escapes: \\, \-, \n, \t, \r, \0, plus passthrough.
+        if ($ch eq "\\" && $i + 1 < $len) {
+            my str $next = substr($s, $i + 1, 1);
+            if ($next eq "n") { $out = $out . "\n"; $i = $i + 2; next; }
+            if ($next eq "t") { $out = $out . "\t"; $i = $i + 2; next; }
+            if ($next eq "r") { $out = $out . "\r"; $i = $i + 2; next; }
+            if ($next eq "0") { $out = $out . "\0"; $i = $i + 2; next; }
+            if ($next eq "\\") { $out = $out . "\\"; $i = $i + 2; next; }
+            if ($next eq "/") { $out = $out . "/"; $i = $i + 2; next; }
+            if ($next eq "-") { $out = $out . "-"; $i = $i + 2; next; }
+            # Other backslashes: treat as literal char (Perl semantics).
+            $out = $out . $next;
+            $i = $i + 2;
+            next;
+        }
+        # Range `X-Y` where neither X nor Y is the first/last char of the
+        # charset and the dash is in the middle. Look ahead for `-` then a char.
+        if ($i + 2 < $len && substr($s, $i + 1, 1) eq "-") {
+            my str $endc = substr($s, $i + 2, 1);
+            # Don't expand if the closing char is itself a backslash escape
+            # at the next position; we already handled that case above by
+            # consuming the leading backslash. Here `$ch` is plain and
+            # `endc` is plain — proceed.
+            my int $start = char_at($s, $i);
+            my int $end_code = char_at($s, $i + 2);
+            if ($start <= $end_code) {
+                my int $cc = $start;
+                while ($cc <= $end_code) {
+                    $out = $out . chr($cc);
+                    $cc = $cc + 1;
+                }
+                $i = $i + 3;
+                next;
+            }
+        }
+        $out = $out . $ch;
+        $i = $i + 1;
+    }
+    return $out;
+}
+
+# Escape a string for embedding inside a C "..." literal. Doubles backslashes,
+# escapes embedded ", \n, \t, \r. The most-called escape in codegen (~35 sites).
+func escape_c_str(str $s) str {
+    my str $out = "";
+    my int $i = 0;
+    my int $len = length($s);
+    while ($i < $len) {
+        my str $ch = substr($s, $i, 1);
+        if ($ch eq "\\") { $out = $out . "\\\\"; }
+        elsif ($ch eq "\"") { $out = $out . "\\\""; }
+        elsif ($ch eq "\n") { $out = $out . "\\n"; }
+        elsif ($ch eq "\t") { $out = $out . "\\t"; }
+        elsif ($ch eq "\r") { $out = $out . "\\r"; }
+        else { $out = $out . $ch; }
+        $i++;
+    }
+    return $out;
+}
+
+# Decode Perl double-quoted-string escape sequences (except $/@ interpolation)
+# and produce a C-source-safe escaped string usable inside a "..." literal.
+# Used by literal-context emissions of N_INTERP_STR when there are no runtime
+# variables to interpolate.
+func perl_interp_literal_to_c(str $s) str {
+    my str $out = "";
+    my int $i = 0;
+    my int $len = length($s);
+    while ($i < $len) {
+        my str $ch = substr($s, $i, 1);
+        if ($ch eq "\\" && $i + 1 < $len) {
+            my str $next = substr($s, $i + 1, 1);
+            if ($next eq "n") { $out = $out . "\\n"; $i = $i + 2; next; }
+            if ($next eq "t") { $out = $out . "\\t"; $i = $i + 2; next; }
+            if ($next eq "r") { $out = $out . "\\r"; $i = $i + 2; next; }
+            if ($next eq "\\") { $out = $out . "\\\\"; $i = $i + 2; next; }
+            if ($next eq "\"") { $out = $out . "\\\""; $i = $i + 2; next; }
+            if ($next eq "'") { $out = $out . "'"; $i = $i + 2; next; }
+            if ($next eq "$") { $out = $out . "$"; $i = $i + 2; next; }
+            if ($next eq "@") { $out = $out . "@"; $i = $i + 2; next; }
+            if ($next eq "0") { $out = $out . "\\0"; $i = $i + 2; next; }
+            if ($next eq "a") { $out = $out . "\\a"; $i = $i + 2; next; }
+            if ($next eq "b") { $out = $out . "\\b"; $i = $i + 2; next; }
+            if ($next eq "e") { $out = $out . "\\033"; $i = $i + 2; next; }
+            if ($next eq "f") { $out = $out . "\\f"; $i = $i + 2; next; }
+            if ($next eq "v") { $out = $out . "\\v"; $i = $i + 2; next; }
+            if ($next eq "N" && $i + 2 < $len && substr($s, $i + 2, 1) eq "{") {
+                my int $be = $i + 3;
+                while ($be < $len && substr($s, $be, 1) ne "}") { $be++; }
+                if ($be < $len) {
+                    my str $inner = substr($s, $i + 3, $be - ($i + 3));
+                    if (length($inner) > 2 && substr($inner, 0, 2) eq "U+") {
+                        my str $hex = substr($inner, 2, length($inner) - 2);
+                        $out = $out . utf8_c_escape(parse_hex($hex));
+                    }
+                    $i = $be + 1;
+                    next;
+                }
+            }
+            if ($next eq "x") {
+                if ($i + 2 < $len && substr($s, $i + 2, 1) eq "{") {
+                    my int $be = $i + 3;
+                    while ($be < $len && substr($s, $be, 1) ne "}") { $be++; }
+                    if ($be < $len) {
+                        my str $hex = substr($s, $i + 3, $be - ($i + 3));
+                        $out = $out . utf8_c_escape(parse_hex($hex));
+                        $i = $be + 1;
+                        next;
+                    }
+                }
+                my int $hx = $i + 2;
+                my int $hend = $hx;
+                while ($hend < $len && $hend - $hx < 2 && is_hex_digit(substr($s, $hend, 1))) { $hend++; }
+                if ($hend > $hx) {
+                    my str $hex = substr($s, $hx, $hend - $hx);
+                    $out = $out . utf8_c_escape(parse_hex($hex));
+                    $i = $hend;
+                    next;
+                }
+            }
+            # Unknown escape — drop the backslash, keep the char
+            $out = $out . $next;
+            $i = $i + 2;
+            next;
+        }
+        if ($ch eq "\"") { $out = $out . "\\\""; }
+        elsif ($ch eq "\n") { $out = $out . "\\n"; }
+        elsif ($ch eq "\t") { $out = $out . "\\t"; }
+        elsif ($ch eq "\r") { $out = $out . "\\r"; }
+        else { $out = $out . $ch; }
+        $i++;
+    }
+    return $out;
+}
+
+func is_hex_digit(str $c) int {
+    if ($c ge "0" && $c le "9") { return 1; }
+    if ($c ge "a" && $c le "f") { return 1; }
+    if ($c ge "A" && $c le "F") { return 1; }
+    return 0;
+}
+
+func parse_hex(str $h) int {
+    my int $v = 0;
+    my int $i = 0;
+    my int $n = length($h);
+    while ($i < $n) {
+        my str $c = substr($h, $i, 1);
+        my int $d = 0;
+        if ($c ge "0" && $c le "9") { $d = ord($c) - ord("0"); }
+        elsif ($c ge "a" && $c le "f") { $d = 10 + ord($c) - ord("a"); }
+        elsif ($c ge "A" && $c le "F") { $d = 10 + ord($c) - ord("A"); }
+        else { last; }
+        $v = $v * 16 + $d;
+        $i++;
+    }
+    return $v;
+}
+
+# Encode a Unicode codepoint as UTF-8 bytes expressed as a C-source escape sequence.
+# Each byte becomes \xHH in the output so the resulting string is valid inside a
+# C double-quoted literal.
+func utf8_c_escape(int $cp) str {
+    my str $out = "";
+    if ($cp < 0) { return ""; }
+    if ($cp < 128) {
+        # ASCII — may need C-escaping
+        if ($cp == 34) { return "\\\""; }
+        if ($cp == 92) { return "\\\\"; }
+        if ($cp == 10) { return "\\n"; }
+        if ($cp == 13) { return "\\r"; }
+        if ($cp == 9) { return "\\t"; }
+        if ($cp == 0) { return "\\0"; }
+        if ($cp < 32 || $cp == 127) {
+            # Append `""` so the next char doesn't extend the greedy `\x` escape
+            # at C-compile time. Two adjacent string literals concatenate, so the
+            # extra empty pair is harmless when wrapped in the outer "...".
+            return "\\x" . byte_hex($cp) . "\"\"";
+        }
+        # Printable ASCII — emit verbatim
+        return chr($cp);
+    }
+    my array @bytes = ();
+    if ($cp < 2048) {
+        push(@bytes, 192 + ($cp / 64));
+        push(@bytes, 128 + ($cp % 64));
+    } elsif ($cp < 65536) {
+        push(@bytes, 224 + ($cp / 4096));
+        push(@bytes, 128 + (($cp / 64) % 64));
+        push(@bytes, 128 + ($cp % 64));
+    } else {
+        push(@bytes, 240 + ($cp / 262144));
+        push(@bytes, 128 + (($cp / 4096) % 64));
+        push(@bytes, 128 + (($cp / 64) % 64));
+        push(@bytes, 128 + ($cp % 64));
+    }
+    # Emit each byte as \xHH""; the trailing "" breaks the greedy C `\x`
+    # escape so the following source text (hex digits or otherwise) starts a
+    # new adjacent string literal that concatenates back into one.
+    my int $bi = 0;
+    my int $nb = scalar(@bytes);
+    while ($bi < $nb) {
+        $out = $out . "\\x" . byte_hex($bytes[$bi]) . "\"\"";
+        $bi++;
+    }
+    return $out;
+}
+
+func byte_hex(int $b) str {
+    my str $d = "0123456789abcdef";
+    my int $hi = ($b / 16) % 16;
+    my int $lo = $b % 16;
+    return substr($d, $hi, 1) . substr($d, $lo, 1);
+}

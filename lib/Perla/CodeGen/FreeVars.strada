@@ -1,0 +1,379 @@
+# Perla::CodeGen::FreeVars - Free-variable / closure-capture analysis.
+#
+# Walks an anonymous sub's AST to determine which lexicals it references but
+# does NOT declare — those are captures from the enclosing scope. Used by
+# CodeGen when emitting closure constructors and per-iteration capture cells.
+#
+# Two flavours:
+#   find_free_vars($cg, $sub_node)  — uses $cg state (my_lexicals, our_vars,
+#                                     file_scope_vars) to filter out vars
+#                                     that should resolve to file-scope/our.
+#   find_sort_free_vars($block)     — pure walk for sort comparator blocks;
+#                                     filters out $a/$b (sort's specials) and
+#                                     digits.
+#
+# Extracted from Perla::CodeGen so the bulk of CodeGen.strada can shrink.
+
+use Perla::AST;
+
+package Perla::CodeGen::FreeVars;
+
+# Find free variables in an anonymous sub (variables used but not declared within)
+# Collect names of `state $X` declarations in this sub's body. Per-closure-
+# instance storage: each closure instance gets its own pad slot for each
+# state var, separate from sibling closures even if created at the same
+# scope. Returned list preserves declaration order so codegen can assign
+# stable cell indices.
+func find_state_vars(scalar $sub_node) array {
+    my array @out = ();
+    my scalar $seen = {};
+    if (defined($sub_node->{"body"})) {
+        _scan_state($sub_node->{"body"}, \@out, $seen);
+    }
+    return @out;
+}
+
+func _scan_state(scalar $node, scalar $out, scalar $seen) void {
+    if (!defined($node)) { return; }
+    # Don't descend into nested sub defs — their state vars belong to
+    # THEIR closure, not ours.
+    if (defined($node->{"type"})
+        && ($node->{"type"} == Perla::AST::N_SUB()
+            || $node->{"type"} == Perla::AST::N_ANON_SUB())) {
+        return;
+    }
+    my scalar $stmts = $node->{"stmts"};
+    if (defined($stmts)) {
+        my int $i = 0;
+        while ($i < scalar(@{$stmts})) {
+            _scan_state($stmts->[$i], $out, $seen);
+            $i = $i + 1;
+        }
+    }
+    if (defined($node->{"type"}) && $node->{"type"} == Perla::AST::N_STATE()) {
+        if (defined($node->{"var"}) && defined($node->{"var"}->{"value"})) {
+            my str $vn = "" . $node->{"var"}->{"value"};
+            if (!defined($seen->{$vn})) {
+                $seen->{$vn} = 1;
+                push(@{$out}, $vn);
+            }
+        }
+    }
+    # Recurse into common nested structures (if/while/for/foreach/eval/begin/end/block).
+    my array @children = ("body", "then", "else", "init", "cond", "step", "block");
+    my int $ci = 0;
+    while ($ci < scalar(@children)) {
+        _scan_state($node->{$children[$ci]}, $out, $seen);
+        $ci = $ci + 1;
+    }
+}
+
+func find_free_vars(scalar $cg, scalar $sub_node) array {
+    my scalar $declared = {};
+    my scalar $used = {};
+    # Signature params (`sub ($x, $y = expr, @rest)`) are sub-local
+    # bindings, not free vars. Mark them declared so the body's
+    # references resolve to the local C decls emitted by Subs.strada
+    # instead of being captured into the closure. Without this, two
+    # anon subs with sigs (e.g. `sub ($n) { ... }`) each try to
+    # capture `$n` via the same shared cell, and cleanup double-frees
+    # the cell — surfaced by probe_pp_proto_sig.pl tests 18+19.
+    if (defined($sub_node->{"sig_params"})) {
+        my scalar $sps = $sub_node->{"sig_params"};
+        my int $spi = 0;
+        while ($spi < scalar(@{$sps})) {
+            my scalar $sp = $sps->[$spi];
+            if (defined($sp) && defined($sp->{"name"})) {
+                $declared->{$sp->{"name"}} = 1;
+            }
+            $spi++;
+        }
+    }
+    # Collect variables declared in the sub body via my()
+    if (defined($sub_node->{"body"})) {
+        scan_declared($sub_node->{"body"}, $declared);
+    }
+    # Collect variables used in the sub body
+    if (defined($sub_node->{"body"})) {
+        scan_used($sub_node->{"body"}, $used);
+    }
+    # Free vars = used - declared - our_vars - file_scope_vars - builtins.
+    # file_scope_vars now includes implicit globals (undeclared
+    # `@f = qw[...]` at the top level) — those resolve to file-scope
+    # statics at call time, so capturing by value would freeze a NULL
+    # if the closure is built before the assignment runs. YAML::Mo's
+    # `@f=qw[builder default import]` is defined AFTER the sub that
+    # references it.
+    # Build a lookup of enclosing-sub lexicals: if a variable is declared
+    # `my` in the enclosing sub, it shadows any file-scope or `our` of the
+    # same name. Without this, `my $n=100; sub make { my $n=0; return sub
+    # { ++$n } }` had the inner closure read/write the FILE-SCOPE `$n`
+    # because file_scope_vars short-circuited the free-var check.
+    my scalar $encl_lex = {};
+    if (defined($cg->{"my_lexicals"})) {
+        my scalar $mxs = $cg->{"my_lexicals"};
+        my int $mli = 0;
+        while ($mli < scalar(@{$mxs})) {
+            my scalar $mx = $mxs->[$mli];
+            if (defined($mx) && defined($mx->{"name"})) {
+                $encl_lex->{$mx->{"name"}} = 1;
+            }
+            $mli++;
+        }
+    }
+    my array @free = ();
+    my array @used_keys = keys($used);
+    my int $i = 0;
+    while ($i < scalar(@used_keys)) {
+        my str $name = $used_keys[$i];
+        # NOTE: only real variable uses (scalar/array/hash vars, interpolated
+        # vars, dynamic-method lexicals) ever reach $used — never bareword
+        # function names. So a lexical named $pass / $fail MUST be captured;
+        # an earlier `$name ne "pass" && $name ne "fail"` guard here wrongly
+        # dropped them (it was aimed at Test::More's pass()/fail() barewords,
+        # which don't enter $used), so `my $pass; my $c = sub { ... $pass };`
+        # saw undef inside the closure — e.g. DBI.pm's connect closure lost
+        # the password. Only `$_` (the dynamic topic global) stays excluded.
+        if (!defined($declared->{$name}) && $name ne "_") {
+            # Enclosing-sub lexical takes precedence over file-scope/our.
+            if (defined($encl_lex->{$name})) {
+                push(@free, $name);
+            } elsif (!defined($cg->{"our_vars"}->{$name})
+                && !defined($cg->{"file_scope_vars"}->{$name})
+                # `$a` / `$b` are sort's package-global comparator slots.
+                # When they're not lexically declared in an enclosing
+                # scope they refer to the package globals v_a/v_b
+                # which the sort thunk writes per-comparison. Capturing
+                # them as closure free vars freezes their (NULL)
+                # value at creation time — `sort \$coderef @data`
+                # then sees v_a/v_b == NULL through the stale cell.
+                # (When \$a/\$b ARE in encl_lex — e.g., the fib closure
+                # `my (\$a,\$b) = (0,1); sub { ...\$a... }` — the
+                # encl_lex branch above still captures them.)
+                && $name ne "a" && $name ne "b") {
+                push(@free, $name);
+            }
+        }
+        $i++;
+    }
+    return @free;
+}
+
+# Scan a double-quoted string (or regex pattern) for $var / @var
+# interpolations and mark each name in $used. Pulled out so N_INTERP_STR
+# and N_REGEX / N_SUBST share the same scanner.
+func scan_dq_string_vars(str $sv, scalar $used) void {
+    my int $si = 0;
+    my int $slen = length($sv);
+    while ($si < $slen) {
+        my str $ch = substr($sv, $si, 1);
+        # Escaped sigil — skip both chars
+        if ($ch eq "\\" && $si + 1 < $slen) {
+            $si = $si + 2;
+            next;
+        }
+        if (($ch eq "$" || $ch eq "@") && $si + 1 < $slen) {
+            $si = $si + 1;
+            if (substr($sv, $si, 1) eq "{") { $si = $si + 1; }
+            my str $vn = "";
+            while ($si < $slen) {
+                my str $c = substr($sv, $si, 1);
+                if (($c ge "a" && $c le "z") || ($c ge "A" && $c le "Z") ||
+                    ($c ge "0" && $c le "9") || $c eq "_") {
+                    $vn = $vn . $c;
+                    $si = $si + 1;
+                } else { last; }
+            }
+            if (length($vn) > 0) { $used->{$vn} = 1; }
+        } else {
+            $si = $si + 1;
+        }
+    }
+}
+
+func scan_declared(scalar $node, scalar $declared) void {
+    if (!defined($node)) { return; }
+    my scalar $stmts = $node->{"stmts"};
+    if (!defined($stmts)) { return; }
+    my int $i = 0;
+    while ($i < scalar(@{$stmts})) {
+        my scalar $s = $stmts->[$i];
+        if (defined($s) && ($s->{"type"} == Perla::AST::N_MY()
+            || $s->{"type"} == Perla::AST::N_STATE())) {
+            # `state` vars are sub-local just like `my`; they must not
+            # be captured as free vars from outer scope. Without this,
+            # `sub { state \$n = 0; \$n++ }` treats \$n as an outer
+            # capture and emits `#define v_n (*__captures[0])` plus a
+            # `static v_n = NULL` for the state init — the two clash.
+            if (defined($s->{"var"})) {
+                $declared->{$s->{"var"}->{"value"}} = 1;
+            }
+            if (defined($s->{"vars"})) {
+                my int $vi = 0;
+                while ($vi < scalar(@{$s->{"vars"}})) {
+                    $declared->{$s->{"vars"}->[$vi]->{"value"}} = 1;
+                    $vi++;
+                }
+            }
+        }
+        $i++;
+    }
+}
+
+func scan_used(scalar $node, scalar $used) void {
+    if (!defined($node)) { return; }
+    my int $t = $node->{"type"};
+    if ($t == Perla::AST::N_SCALAR_VAR() || $t == Perla::AST::N_HASH_VAR() || $t == Perla::AST::N_ARRAY_VAR()) {
+        $used->{$node->{"name"}} = 1;
+        return;
+    }
+    # `$obj->$method_var(args)` — method name is the lexical $method_var,
+    # stored on the node as `method` (a string) with `dynamic_method=1`.
+    # Without listing it here, the closure-capture scan misses the var
+    # entirely and the generated C reads the file-scope static instead
+    # of the per-iteration captured cell — every closure sees the LAST
+    # value of the var. Surfaced via DBIx::Class::Bootstrap::Simple's
+    # `*{"$class\::$rkey"} = sub { shift->$local_col(@_) }` for-loop:
+    # all installed accessors ended up sharing the final iteration's
+    # `$local_col`, so `$obj->method` dispatched to "" (or the wrong
+    # method).
+    if ($t == Perla::AST::N_METHOD()
+        && defined($node->{"dynamic_method"}) && $node->{"dynamic_method"} == 1
+        && defined($node->{"method"}) && length($node->{"method"}) > 0) {
+        $used->{$node->{"method"}} = 1;
+        # fall through to scan args/object below
+    }
+    # Scan interpolated strings for variable references
+    if ($t == Perla::AST::N_INTERP_STR()) {
+        my str $sv = $node->{"value"};
+        if (defined($sv)) {
+            scan_dq_string_vars($sv, $used);
+        }
+        return;
+    }
+    # Regex patterns (and substitution patterns/replacements) interpolate
+    # $vars at compile time too — without this, a closure body like
+    # `sub { \$_[0] =~ /\$p/ }` failed to capture \$p as a free var, so
+    # the regex match read file-scope v_p instead of the closure cell.
+    # Both N_REGEX and N_SUBST carry the raw pattern as a string field.
+    if ($t == Perla::AST::N_REGEX()) {
+        if (defined($node->{"pattern"})) {
+            scan_dq_string_vars($node->{"pattern"}, $used);
+        }
+        return;
+    }
+    if ($t == Perla::AST::N_SUBST()) {
+        if (defined($node->{"pattern"})) {
+            scan_dq_string_vars($node->{"pattern"}, $used);
+        }
+        if (defined($node->{"replacement"})) {
+            scan_dq_string_vars($node->{"replacement"}, $used);
+        }
+        return;
+    }
+    # Recurse into all hash fields that could contain sub-nodes
+    my array @fields = ("left", "right", "cond", "then", "else", "body", "init", "step", "expr", "value", "operand", "object", "list", "block", "var", "target", "coderef", "hash", "key", "array", "index", "ref", "method_expr", "from", "to", "replacement");
+    my int $fi = 0;
+    while ($fi < scalar(@fields)) {
+        my scalar $child = $node->{$fields[$fi]};
+        if (defined($child) && ref($child) eq "HASH") {
+            scan_used($child, $used);
+        }
+        $fi++;
+    }
+    # Recurse into arrays: stmts, args, vars, elems, pairs, indices
+    my array @arr_fields = ("stmts", "args", "vars", "elems", "pairs", "indices", "catches");
+    my int $ai = 0;
+    while ($ai < scalar(@arr_fields)) {
+        my scalar $arr = $node->{$arr_fields[$ai]};
+        if (defined($arr) && ref($arr) eq "ARRAY") {
+            my int $j = 0;
+            while ($j < scalar(@{$arr})) {
+                my scalar $elem = $arr->[$j];
+                if (defined($elem)) { scan_used($elem, $used); }
+                $j++;
+            }
+        }
+        $ai++;
+    }
+}
+
+# Variant for sort comparator blocks: filters out $a/$b (sort specials),
+# $_, $@, $!, and $0..$9 (regex captures + special scalars).
+func find_sort_free_vars(scalar $block) array {
+    my array @vars = ();
+    my hash %seen = ();
+    scan_sort_vars($block, \@vars, \%seen);
+    return @vars;
+}
+
+func scan_sort_vars(scalar $node, scalar $vars, scalar $seen) void {
+    if (!defined($node)) { return; }
+    my int $type = $node->{"type"};
+    if ($type == Perla::AST::N_SCALAR_VAR()) {
+        my str $name = $node->{"name"};
+        if ($name ne "a" && $name ne "b" && $name ne "_" &&
+            $name ne "@" && $name ne "!" && !($name ge "0" && $name le "9") &&
+            !defined($seen->{$name})) {
+            push(@{$vars}, $name);
+            $seen->{$name} = 1;
+        }
+        return;
+    }
+    if ($type == Perla::AST::N_HASH_VAR() || $type == Perla::AST::N_ARRAY_VAR()) {
+        my str $name = $node->{"name"};
+        if ($name ne "_" && !defined($seen->{$name})) {
+            push(@{$vars}, $name);
+            $seen->{$name} = 1;
+        }
+        return;
+    }
+    # Recurse into children
+    if (defined($node->{"stmts"})) {
+        my int $i = 0;
+        while ($i < scalar(@{$node->{"stmts"}})) {
+            scan_sort_vars($node->{"stmts"}->[$i], $vars, $seen);
+            $i++;
+        }
+    }
+    if (defined($node->{"left"})) { scan_sort_vars($node->{"left"}, $vars, $seen); }
+    if (defined($node->{"right"})) { scan_sort_vars($node->{"right"}, $vars, $seen); }
+    if (defined($node->{"value"})) {
+        if (ref($node->{"value"}) eq "HASH") { scan_sort_vars($node->{"value"}, $vars, $seen); }
+    }
+    if (defined($node->{"hash"})) { scan_sort_vars($node->{"hash"}, $vars, $seen); }
+    if (defined($node->{"key"})) { scan_sort_vars($node->{"key"}, $vars, $seen); }
+    if (defined($node->{"object"})) { scan_sort_vars($node->{"object"}, $vars, $seen); }
+    # coderef: `$fn->(args)` parses as N_CALL with `coderef` holding the
+    # callee expression. Without recursing here, sort blocks that call
+    # a captured sub via `$fn->($a, $b)` missed `$fn` in the free-var
+    # scan — the sort comparator emitted `v_fn` as the file-scope
+    # static (always NULL) and the comparison silently returned undef,
+    # leaving the list unsorted.
+    if (defined($node->{"coderef"})) { scan_sort_vars($node->{"coderef"}, $vars, $seen); }
+    # array / index / ref fields are used by N_ARRAY_ELEM,
+    # N_DEREF_ARRAY, N_REF, etc. — recurse so sort blocks can capture
+    # vars used inside subscripts and refs.
+    if (defined($node->{"array"})) { scan_sort_vars($node->{"array"}, $vars, $seen); }
+    if (defined($node->{"index"})) { scan_sort_vars($node->{"index"}, $vars, $seen); }
+    if (defined($node->{"ref"})) { scan_sort_vars($node->{"ref"}, $vars, $seen); }
+    if (defined($node->{"operand"})) { scan_sort_vars($node->{"operand"}, $vars, $seen); }
+    if (defined($node->{"cond"})) { scan_sort_vars($node->{"cond"}, $vars, $seen); }
+    if (defined($node->{"then"})) { scan_sort_vars($node->{"then"}, $vars, $seen); }
+    if (defined($node->{"else"})) { scan_sort_vars($node->{"else"}, $vars, $seen); }
+    if (defined($node->{"expr"})) { scan_sort_vars($node->{"expr"}, $vars, $seen); }
+    if (defined($node->{"args"})) {
+        my int $ai = 0;
+        while ($ai < scalar(@{$node->{"args"}})) {
+            scan_sort_vars($node->{"args"}->[$ai], $vars, $seen);
+            $ai++;
+        }
+    }
+    if (defined($node->{"elems"})) {
+        my int $ei = 0;
+        while ($ei < scalar(@{$node->{"elems"}})) {
+            scan_sort_vars($node->{"elems"}->[$ei], $vars, $seen);
+            $ei++;
+        }
+    }
+}

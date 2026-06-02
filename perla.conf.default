@@ -1,0 +1,22 @@
+# perla.conf — Perla configuration file
+#
+# Searched in order:
+#   1. ./perla.conf (project-local)
+#   2. ~/.perla/perla.conf (user)
+#   3. /etc/perla.conf (system)
+#   4. <install_prefix>/etc/perla.conf (install)
+#
+# Syntax: key = value (one per line, # comments)
+
+# Default library search paths (colon-separated)
+# These are searched when resolving 'use Module'
+lib_path = /usr/local/lib/perla:/usr/local/share/perla/lib
+
+# Strada installation directory (for runtime, interpreter, etc.)
+# strada_dir = /usr/local/lib/strada
+
+# Default compilation optimization level
+# opt_level = -O2
+
+# Enable warnings by default (0 or 1)
+# warnings = 0

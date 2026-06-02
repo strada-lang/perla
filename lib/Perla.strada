@@ -1,0 +1,35 @@
+# Perla - Perl 5 Compiler Library
+#
+# Usage from Strada:
+#   use lib "perla/lib";
+#   use Perla;
+#   Perla::compile("input.pl", "output.c");
+#
+# Or as a CLI:
+#   ./perla input.pl -o output
+
+use Perla::AST;
+use Perla::Lexer;
+use Perla::Parser;
+use Perla::CodeGen;
+
+package Perla;
+
+func compile_source(str $source, str $filename) str {
+    # Lex
+    my array @tokens = Perla::Lexer::lex($source);
+
+    # Parse (pass filename for __FILE__ support)
+    my scalar $ast = Perla::Parser::parse_with_filename(@tokens, $filename);
+
+    # Generate C
+    my str $code = Perla::CodeGen::generate($ast);
+
+    return $code;
+}
+
+func compile(str $input_file, str $output_file) void {
+    my str $source = core::slurp($input_file);
+    my str $code = compile_source($source, $input_file);
+    core::spew($output_file, $code);
+}

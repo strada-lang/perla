@@ -1,0 +1,2457 @@
+# Perla - Perl 5 Compiler Driver
+#
+# Usage:
+#   ./perla input.pl              # Compile and run
+#   ./perla input.pl -o output.c  # Compile to C only
+#   ./perla -c input.pl           # Compile to executable
+
+use lib "lib";
+# `use` each transitive dependency that lives in its own .o so the
+# linker pulls them all in. Auto-detect does not propagate through
+# pre-compiled .o files — it only fires from `use` in source we're
+# parsing now — so the top-level driver has to list every linked .o.
+use Perla::AST;
+use Perla::Lexer;
+use Perla::Parser;
+use Perla::CodeGen::Escape;
+use Perla::CodeGen::FreeVars;
+use Perla::CodeGen::Collect;
+use Perla::CodeGen::Predicate;
+use Perla::CodeGen::Eval;
+use Perla::CodeGen::Subst;
+use Perla::CodeGen::Interp;
+use Perla::CodeGen::Subs;
+use Perla::CodeGen;
+use Perla;
+use Perla::StradaGen;
+use Perla::XS;
+
+# dlopen/dlsym for the persistent JIT REPL (_jit_run_line). Also makes the strada
+# driver link perla with -rdynamic, so each dlopen'd line .so resolves runtime +
+# stash symbols against this process (shared state).
+__C__ {
+#include <dlfcn.h>
+}
+
+# Program-level globals the perla runtime + compiled line .so's expect a compiled
+# program to define (special vars, $a/$b, @ARGV/%ENV, the want-list flag, sort/
+# closure cell tables, …). The perla compiler is a strada program and normally
+# doesn't define these, but as a JIT-REPL host it links perla_stash.o and hosts
+# line .so's, which resolve these against the host (-rdynamic) so all lines share
+# one set. Unused/harmless for ordinary perla compiler operation. Mirrors a
+# compiled program's file-scope global preamble.
+__C__ {
+StradaValue *perla_eval_error = NULL;
+StradaValue *perla_dollar_underscore = NULL;
+StradaValue *perla_irs = NULL;
+StradaValue *perla_ors = NULL;
+StradaValue *perla_ofs = NULL;
+StradaValue *perla_lse = NULL;
+StradaValue *perla_subsep = NULL;
+int __perla_autoflush = 0;
+int __perla_want_list = 0;
+int __perla_caller_want_list = -1;
+StradaValue *v_ARGV = NULL;
+StradaValue *v_ENV = NULL;
+StradaValue *v_ISA = NULL;
+StradaValue *v__ = NULL;
+StradaValue *v_SIG = NULL;
+StradaValue *v_a = NULL;
+StradaValue *v_b = NULL;
+StradaValue *v_INC = NULL;
+StradaValue *v_INC__h = NULL;
+StradaValue *v__caret_W = NULL;
+StradaValue *perla_at_ = NULL;
+StradaValue *v__caret_O = NULL;
+StradaValue *v__rbrack_ = NULL;
+StradaValue *v__caret_V = NULL;
+StradaValue *v__caret_X = NULL;
+StradaValue *v__caret_GLOBAL_PHASE = NULL;
+StradaValue *v__slash_ = NULL;
+StradaValue *perla_dollar_zero = NULL;
+int perla_dollar_question = 0;
+int perla_dollar_dot = 0;
+StradaValue **__perla_sort_ctx[16] = {0};
+StradaValue **__perla_cell[64] = {0};
+}
+
+func _find_xs_file(str $dir) str {
+    my str $cmd = "ls " . $dir . "/*.xs 2>/dev/null";
+    my str $ls_out = core::qx($cmd);
+    if (length($ls_out) == 0) { return ""; }
+    my str $first = $ls_out;
+    # Take first line
+    my int $nl = index($first, "\n");
+    if ($nl >= 0) { $first = substr($first, 0, $nl); }
+    $first =~ s/^\s+//;
+    $first =~ s/\s+$//;
+    return $first;
+}
+
+func _load_xs(str $file) scalar {
+    if (length($file) == 0) { return undef; }
+    if (core::file_exists($file) != 1) { return undef; }
+    my str $src = core::slurp($file);
+    return Perla::XS::parse_xs($src);
+}
+
+func _gen_xs_c(scalar $info) str {
+    if (!defined($info)) { return ""; }
+    return Perla::XS::gen_c_wrappers($info);
+}
+
+func _xs_c_file_arg(int $has_xs, str $c_file) str {
+    if ($has_xs == 1) { return " " . $c_file . ".xs.c"; }
+    return "";
+}
+
+func _get_xs_pkg(scalar $info) str {
+    if (!defined($info)) { return ""; }
+    return "" . $info->{"pkg"};
+}
+
+func _compile_with_xs(str $source, str $input, str $xs_file, str $c_file) str {
+    my str $code = Perla::compile_source($source, $input);
+    if (length($xs_file) == 0) { return $code; }
+    if (core::file_exists($xs_file) != 1) { return $code; }
+    my str $xs_src = core::slurp($xs_file);
+    my scalar $xs_info = Perla::XS::parse_xs($xs_src);
+    return _inject_xs($code, $xs_info, $c_file);
+}
+
+func _compile_with_xs_lib(str $source, str $input, str $xs_file, str $c_file, scalar $lib_paths) str {
+    # Compile with explicit lib paths
+    my array @tokens = Perla::Lexer::lex($source);
+    my scalar $ast = Perla::Parser::parse_with_file_context(@tokens, $lib_paths, {}, $input);
+    my str $code = Perla::CodeGen::generate($ast);
+    if (length($xs_file) == 0) { return $code; }
+    if (core::file_exists($xs_file) != 1) { return $code; }
+    my str $xs_src = core::slurp($xs_file);
+    my scalar $xs_info = Perla::XS::parse_xs($xs_src);
+    return _inject_xs($code, $xs_info, $c_file);
+}
+
+func _inject_xs(str $code, scalar $xs_info, str $c_file) str {
+    if (!defined($xs_info)) { return $code; }
+    my str $xs_c_content = Perla::XS::gen_c_wrappers($xs_info);
+    if (length($xs_c_content) == 0) { return $code; }
+
+    my scalar $xs_funcs = $xs_info->{"functions"};
+    my str $xs_pkg = "" . $xs_info->{"pkg"};
+
+    # Write XS C wrapper file
+    core::spew($c_file . ".xs.c", "#include \"strada_runtime.h\"\n#include <math.h>\n#include <string.h>\n\n" . $xs_c_content);
+
+    # Generate extern declarations and init function
+    my str $xs_header = "\n/* XS function declarations */\n";
+    my str $init_fn = "static void __xs_init(void) {\n";
+    my int $xri = 0;
+    while ($xri < scalar(@{$xs_funcs})) {
+        my str $fn_name = $xs_funcs->[$xri]->{"name"};
+        my str $wrapper = "perla_xs_" . replace_all($xs_pkg, "::", "_") . "_" . $fn_name;
+        $xs_header = $xs_header . "extern StradaValue* " . $wrapper . "(StradaValue*);\n";
+        $init_fn = $init_fn . "    perla_code_set(\"" . $xs_pkg . "\", \"" . $fn_name . "\", strada_new_str(\"" . $wrapper . "\"));\n";
+        $xri++;
+    }
+    $init_fn = $init_fn . "}\n";
+
+    # Inject
+    # Inject XS declarations at file scope and init call in main()
+    my str $inject = $xs_header . $init_fn . "\n";
+    # CodeGen emits either of these markers depending on main-vs-module mode.
+    # Inject the XS header + init function right before whichever one is
+    # present. Without this, `__xs_init()` gets called from main() but
+    # never defined, producing tcc/gcc "undefined symbol '__xs_init'".
+    my str $anchor_main = "/* Perl special variables (global for precompiled module linking) */";
+    my str $anchor_mod = "/* Perl special variables (extern - owned by main) */";
+    if (index($code, $anchor_main) >= 0) {
+        $code = replace_all($code, $anchor_main, $inject . $anchor_main);
+    } elsif (index($code, $anchor_mod) >= 0) {
+        $code = replace_all($code, $anchor_mod, $inject . $anchor_mod);
+    } else {
+        # Legacy / fallback: try the bare marker too.
+        $code = replace_all($code, "/* Perl special variables */", $inject . "/* Perl special variables */");
+    }
+    # Add __xs_init() call right after perla_init() in main
+    $code = replace_all($code, "perla_init();", "perla_init();\n    __xs_init();");
+    return $code;
+}
+
+# Load perla.conf from search paths, return hash of key=value pairs
+func _load_config() scalar {
+    my scalar $config = {};
+    my array @search = ();
+
+    # 1. Project-local
+    push(@search, "./perla.conf");
+
+    # 2. User home
+    my str $home = core::getenv("HOME");
+    if (length($home) > 0) {
+        push(@search, $home . "/.perla/perla.conf");
+    }
+
+    # 3. System
+    push(@search, "/etc/perla.conf");
+
+    # 4. Install prefix (from PERLA_PREFIX env or compile-time default)
+    my str $prefix = core::getenv("PERLA_PREFIX");
+    if (length($prefix) > 0) {
+        push(@search, $prefix . "/etc/perla.conf");
+    }
+
+    my int $i = 0;
+    while ($i < scalar(@search)) {
+        my str $path = $search[$i];
+        if (core::file_exists($path) == 1) {
+            my str $content = core::slurp($path);
+            my array @lines = split("\n", $content);
+            my int $li = 0;
+            while ($li < scalar(@lines)) {
+                my str $line = trim($lines[$li]);
+                # Skip comments and empty lines
+                if (length($line) > 0 && substr($line, 0, 1) ne "#") {
+                    my int $eq = index($line, "=");
+                    if ($eq > 0) {
+                        my str $key = trim(substr($line, 0, $eq));
+                        my str $val = trim(substr($line, $eq + 1, length($line) - $eq - 1));
+                        # Only set if not already set (first found wins)
+                        if (length("" . $config->{$key}) == 0) {
+                            $config->{$key} = $val;
+                        }
+                    }
+                }
+                $li++;
+            }
+        }
+        $i++;
+    }
+    return $config;
+}
+
+# Build default lib paths from config, env, and conventions
+func _build_lib_paths(str $input, scalar $config) scalar {
+    my scalar $paths = [];
+
+    # 1. Directory of the input file
+    my int $slash_pos = -1;
+    my int $si = 0;
+    while ($si < length($input)) {
+        if (substr($input, $si, 1) eq "/") { $slash_pos = $si; }
+        $si++;
+    }
+    if ($slash_pos >= 0) {
+        push(@{$paths}, substr($input, 0, $slash_pos));
+    }
+
+    # 2. Current directory
+    push(@{$paths}, ".");
+
+    # 3. PERLA5LIB environment variable (colon-separated)
+    my str $perla5lib = core::getenv("PERLA5LIB");
+    if (length($perla5lib) > 0) {
+        my array @env_paths = split(":", $perla5lib);
+        my int $ei = 0;
+        while ($ei < scalar(@env_paths)) {
+            my str $ep = trim($env_paths[$ei]);
+            if (length($ep) > 0) { push(@{$paths}, $ep); }
+            $ei++;
+        }
+    }
+
+    # 4. PERL5LIB (Perl compat)
+    my str $perl5lib = core::getenv("PERL5LIB");
+    if (length($perl5lib) > 0) {
+        my array @env_paths = split(":", $perl5lib);
+        my int $ei = 0;
+        while ($ei < scalar(@env_paths)) {
+            my str $ep = trim($env_paths[$ei]);
+            if (length($ep) > 0) { push(@{$paths}, $ep); }
+            $ei++;
+        }
+    }
+
+    # 5. User lib (~/.perla/lib)
+    my str $home = core::getenv("HOME");
+    if (length($home) > 0) {
+        my str $user_lib = $home . "/perla/lib";
+        if (core::is_dir($user_lib) == 1) {
+            push(@{$paths}, $user_lib);
+        }
+    }
+
+    # NOTE: perla.conf's lib_path is NOT added here. It's consumed at
+    # RUNTIME by perla_require_set_paths → perla_require_merge_conf_paths.
+    # Putting /opt/bzperl/lib/site_perl at compile time would trigger
+    # transitive source parsing of the entire /opt/bzperl module tree and
+    # blow compile time up to 10+ minutes for large real-world
+    # programs. Users who need a module at compile time should add
+    # `use lib "..."` explicitly (or set PERL5LIB during compile).
+
+    return $paths;
+}
+
+# Fix closure captures: when #define v_xxx is active inside a closure function,
+# remove StradaValue * prefix from declarations of that variable
+func _fix_closure_captures(str $code) str {
+    my array @lines = split("\n", $code);
+    my int $len = size(@lines);
+    my int $in_closure = 0;
+    my hash %captures = ();
+    my int $i = 0;
+    while ($i < $len) {
+        my str $line = $lines[$i];
+        # Detect closure function start (has __captures parameter)
+        if (index($line, "***__captures") >= 0 && index($line, "{") >= 0) {
+            $in_closure = 1;
+            %captures = ();
+        }
+        # Collect #define v_xxx inside closures
+        if ($in_closure == 1 && index($line, "#define v_") >= 0) {
+            # Extract variable name: #define v_xxx (
+            my int $ds = index($line, "#define ") + 8;
+            my int $de = index($line, " (");
+            if ($de > $ds) {
+                my str $vname = substr($line, $ds, $de - $ds);
+                $captures{$vname} = 1;
+            }
+        }
+        # Fix declarations of captured variables
+        if ($in_closure == 1 && index($line, "StradaValue *v_") >= 0) {
+            my array @cap_names = keys(%captures);
+            my int $ci = 0;
+            while ($ci < size(@cap_names)) {
+                my str $cn = $cap_names[$ci];
+                my str $decl = "StradaValue *" . $cn . " = ";
+                if (index($line, $decl) >= 0) {
+                    $line = replace_all($line, $decl, $cn . " = ");
+                    $lines[$i] = $line;
+                }
+                $ci++;
+            }
+        }
+        # Detect function end
+        if ($in_closure == 1 && index($line, "#undef v_") >= 0) {
+            # Check if next non-undef line is } or another function
+        }
+        if ($in_closure == 1 && $line eq "}") {
+            $in_closure = 0;
+            %captures = ();
+        }
+        $i++;
+    }
+    return join("\n", @lines);
+}
+
+# Fix codegen edge cases: 'continue' outside loops, variable redefinitions
+func _fix_codegen_edge_cases(str $code) str {
+    # say(STDERR, "[FIX] _fix_codegen_edge_cases running on " . length($code) . " chars");
+    my array @lines = split("\n", $code);
+    my int $len = size(@lines);
+    my int $i = 0;
+    while ($i < $len) {
+        my str $line = $lines[$i];
+        # Fix 'continue;' outside loops - replace with comment
+        # Pattern: "{ continue;" or "} continue;" on a single line = not inside a real loop body
+        if (index($line, "continue;") >= 0) {
+            my int $fix_continue = 0;
+            # Check if in grep block — only same-line check. The earlier
+            # ±20-line window incorrectly comment-stripped `continue;` in
+            # legitimate `next if X` cases when a `grep { ... } LIST;`
+            # statement happened to be within 20 lines (perla emits one
+            # huge line per Perl statement, so 20 lines easily spans many
+            # statements). Same-line check suffices because grep's
+            # internal `for ... { ... continue; ... }` keeps `__gav` and
+            # the `continue;` on the same emitted C line. The for body
+            # after a grep statement is a separate line, so the false
+            # positive is avoided.
+            if (index($line, "__ga") >= 0 || index($line, "__gav") >= 0) { $fix_continue = 1; }
+            # Check if continue has "/* next" or "/* last" comment (from our label fallback)
+            if (index($line, "/* next") >= 0 || index($line, "/* last") >= 0) {
+                $fix_continue = 1;
+            }
+            # Check pattern: `} continue;` or `{ continue;` (inlined next
+            # without a real loop — used for the grep/map "fake loop"
+            # codegen path). We can only safely guess this is *not* in a
+            # real loop when the surrounding context shows grep/map
+            # markers — checked above. The previous broad fallback
+            # (`{ continue;` plus no for/while on the same line) ate
+            # legitimate uses like the `({ ...; if (...) { continue; }
+            # __l; })` emitted by `EXPR or next` inside a real loop —
+            # see Perla/CodeGen.strada's || / or N_NEXT branch.
+            if ($fix_continue == 1) {
+                $lines[$i] = replace_all($line, "continue;", "/* continue */;");
+            }
+        }
+        # Fix variable redefinition: if prev line declares same var in foreach
+        # CRITICAL: must use whole-word match, not substring. `v_month` would
+        # otherwise match inside `v_month_and_day` and silently strip the
+        # `StradaValue *` prefix from `my $month = shift @month_and_day`,
+        # leaving an undeclared C variable. Surfaced via Date::Manip::Base
+        # and Abe::DB::AccBook::fiscal_year_end.
+        if (index($line, "StradaValue *v_") >= 0 && $i > 0 && index($lines[$i - 1], "v_") >= 0 && index($lines[$i - 1], "strada_array_get") >= 0) {
+            # Previous line is foreach loop variable, this line re-declares same name
+            my int $eq_pos = index($line, " = ");
+            if ($eq_pos > 0) {
+                my str $var_part = substr($line, 0, $eq_pos);
+                my int $star_pos = index($var_part, "*v_");
+                if ($star_pos >= 0) {
+                    my str $var_name = substr($var_part, $star_pos + 1, length($var_part) - $star_pos - 1);
+                    # Whole-word containment check: v_NAME must be followed by
+                    # a non-identifier character (or be at end of line) in the
+                    # previous line — otherwise v_x matches inside v_xyz.
+                    my str $prev = $lines[$i - 1];
+                    my int $hit = 0;
+                    my int $hp = index($prev, $var_name);
+                    while ($hp >= 0 && $hit == 0) {
+                        my int $he = $hp + length($var_name);
+                        my int $is_word = 0;
+                        if ($he < length($prev)) {
+                            my str $hc = substr($prev, $he, 1);
+                            if (($hc ge "a" && $hc le "z") || ($hc ge "A" && $hc le "Z")
+                                || ($hc ge "0" && $hc le "9") || $hc eq "_") {
+                                $is_word = 1;
+                            }
+                        }
+                        if ($is_word == 0) { $hit = 1; }
+                        else { $hp = index($prev, $var_name, $hp + 1); }
+                    }
+                    if ($hit == 1) {
+                        $lines[$i] = replace_all($line, "StradaValue *" . $var_name, $var_name);
+                    }
+                }
+            }
+        }
+        # Fix empty __ml = ;
+        if (index($line, "StradaValue *__ml = ;") >= 0) {
+            $lines[$i] = replace_all($line, "StradaValue *__ml = ;", "StradaValue *__ml = strada_new_undef();");
+        }
+        # Fix strada_new_array with wrong args
+        if (index($line, "strada_new_array(strada_new_undef())") >= 0) {
+            $lines[$i] = replace_all($line, "strada_new_array(strada_new_undef())", "strada_new_array()");
+        }
+        # Fix $! = 0 generating lvalue assignment to function call
+        # Pattern: strada_new_str(strerror(errno)) = SOMETHING
+        if (index($line, "strada_new_str(strerror(errno)) =") >= 0) {
+            $lines[$i] = replace_all($line, "strada_new_str(strerror(errno)) =", "/* $! = */ (void)");
+        }
+        # Fix invalid \: escape sequence in string literals
+        if (index($line, "\\:") >= 0) {
+            $lines[$i] = replace_all($lines[$i], "\\:", ":");
+        }
+        # Fix $_ not resolved to v__ in s/// patterns
+        # Pattern: strada_new_undef() = __nv → v__ = __nv
+        if (index($line, "strada_new_undef() = __nv") >= 0) {
+            $lines[$i] = replace_all($lines[$i], "strada_decref(strada_new_undef()); strada_new_undef() = __nv", "strada_decref(v__); v__ = __nv");
+        }
+        # Note: _definition_context() returns wrong arg count (list context issue)
+        # Fix empty expressions: "= ;" → "= strada_new_undef();"
+        if (index($line, "= ;") >= 0) {
+            $lines[$i] = replace_all($lines[$i], "= ;", "= strada_new_undef();");
+        }
+        # Fix empty arguments: "strada_array_push(__av, )" → push undef
+        if (index($line, ", )") >= 0) {
+            $lines[$i] = replace_all($lines[$i], ", )", ", strada_new_undef())");
+        }
+        # Fix unsupported lvalue assignment: remove the comment, leave the expression
+        if (index($line, "/* unsupported lvalue assignment */") >= 0) {
+            $lines[$i] = replace_all($lines[$i], "/* unsupported lvalue assignment */", "");
+        }
+        # Fix ternary with assignment in false branch (||= pattern)
+        if (index($line, "v_tuple_status") >= 0 && index($line, "strada_new_array() :") >= 0 && index($line, "strada_new_ref") >= 0) {
+            $lines[$i] = "    if (!perla_to_bool(v_tuple_status)) { v_tuple_status = strada_new_ref(strada_new_array(), '@'); }";
+        }
+        # Fix strada_to_str() with no args
+        if (index($line, "strada_to_str()") >= 0) {
+            $lines[$i] = replace_all($lines[$i], "strada_to_str()", "strada_to_str(strada_new_str(\"\"))");
+        }
+        # Note: strada_to_str(strada_new_str("x")) → strdup("x") optimization
+        # is too complex for post-processing (paren balance issues).
+        # Should be done in CodeGen directly for hash literal key emission.
+        # Note: standalone variable decref-before-assign disabled - causes heap corruption
+        # in large programs. Need proper scope-based cleanup instead of blanket decref.
+        # Note: hv_store → hv_store_take conversion is now handled directly
+        # in CodeGen via `_value_is_borrowed` (both the _gen_anon_hash path
+        # and the `my %h = (...)` path in _gen_my). A post-processor
+        # heuristic here can't distinguish CodeGen's deliberately-emitted
+        # `hv_store` for borrowed refs from `hv_store_take` for fresh
+        # ones, and would clobber the former.
+        $i++;
+    }
+    # After line-level fixes, do string-level fixes on the whole code
+    my str $result = join("\n", @lines);
+
+    # === Memory optimization ===
+
+    # Fix 1: strada_to_str(strada_new_str("...")) → strdup("...")
+    # Only done for __k hash key patterns in the per-line loop (safe and targeted).
+
+    # Fix 2: Use _take variants for array push with newly-created values.
+    # strada_array_push increfs; _take skips the incref, preventing double-ref.
+    $result = replace_all($result, "strada_array_push(__av, strada_new_str(", "strada_array_push_take(__av, strada_new_str(");
+    $result = replace_all($result, "strada_array_push(__av, strada_new_ref(", "strada_array_push_take(__av, strada_new_ref(");
+    $result = replace_all($result, "strada_array_push(__av, strada_new_hash()", "strada_array_push_take(__av, strada_new_hash()");
+    $result = replace_all($result, "strada_array_push(__av, strada_new_array()", "strada_array_push_take(__av, strada_new_array()");
+    $result = replace_all($result, "strada_array_push(__av, STRADA_MAKE_TAGGED_INT(", "strada_array_push_take(__av, STRADA_MAKE_TAGGED_INT(");
+    $result = replace_all($result, "strada_array_push(__av, strada_cpointer_new(", "strada_array_push_take(__av, strada_cpointer_new(");
+    $result = replace_all($result, "strada_array_push(__mav, strada_new_str(", "strada_array_push_take(__mav, strada_new_str(");
+    $result = replace_all($result, "strada_array_push(__gav, strada_new_str(", "strada_array_push_take(__gav, strada_new_str(");
+
+    # Fix 3: Use _take for hash store with inline-created values.
+    # Note: hv_store → hv_store_take conversion is handled by the per-line
+    # loop above (lines 386-388), which guards on the RHS being a freshly
+    # created value (strada_new_str/ref/hash, STRADA_MAKE_TAGGED_INT, etc.).
+    #
+    # The previous unconditional `replace_all(..., "strada_hv_store(__h, ",
+    # "strada_hv_store_take(__h, ")` here dropped a refcount on borrowed
+    # values. Example that silently lost its name:
+    #
+    #   sub new { return bless({ name => $_[1] }, "Counter"); }
+    #   my $c = Counter->new("test");
+    #
+    # `$_[1]` compiled to `strada_array_get(perla_at_, 1)` - a borrowed
+    # ref to the caller's args array. The post-call `strada_decref(__a)`
+    # freed "test" along with the args array, and $c->{name} dereferenced
+    # freed memory (observed as empty string). The per-line guard keeps
+    # hv_store_take only where the RHS literally starts with a _new_*
+    # constructor, which preserves the intended leak-prevention while
+    # fixing the aliasing bug.
+
+    # Fix 4: Use _take for new_ref when wrapping freshly-created hash/array
+    # Pattern: strada_new_ref(__h, '%') or strada_new_ref(__a, '@') - takes ownership
+    $result = replace_all($result, "strada_new_ref(__h, '%')", "strada_new_ref_take(__h, '%')");
+    $result = replace_all($result, "strada_new_ref(__a, '@')", "strada_new_ref_take(__a, '@')");
+
+    # Fix 5: Deduplicate symbols between main .c and precompiled .o files
+    # When a module is precompiled (.o), its functions shouldn't also be defined
+    # in the main C file. Mark them as static to avoid linker conflicts.
+    my int $link_pos2 = index($result, "/* PERLA_LINK_OBJECTS:");
+    if ($link_pos2 >= 0) {
+        my int $link_end2 = index($result, " */", $link_pos2);
+        if ($link_end2 > $link_pos2) {
+            my str $objs_str = trim(substr($result, $link_pos2 + 22, $link_end2 - $link_pos2 - 22));
+            if (length($objs_str) > 0) {
+                # Get exported symbols from .o files
+                my str $nm_out = core::qx("nm -g " . $objs_str . " 2>/dev/null | grep ' T perla_sub_' | awk '{print $3}'");
+                my array @syms = split("\n", trim($nm_out));
+                my int $si2 = 0;
+                while ($si2 < size(@syms)) {
+                    my str $sym = trim($syms[$si2]);
+                    if (length($sym) > 0) {
+                        # Make the function definition static in the main C
+                        # Pattern: "StradaValue* perla_sub_NAME(" → "static StradaValue* perla_sub_NAME("
+                        my str $def = "StradaValue* " . $sym . "(";
+                        my str $static_def = "static StradaValue* " . $sym . "(";
+                        $result = replace_all($result, $def, $static_def);
+                    }
+                    $si2++;
+                }
+                # Collapse any "static static" introduced when the same symbol
+                # appeared in two .o files (or was touched twice by replace_all
+                # due to the replacement containing the search string). Loop
+                # because N>2 duplicates produce N statics in a row, and one
+                # replace_all pass only catches one "static static" per site.
+                while (index($result, "static static StradaValue*") >= 0) {
+                    $result = replace_all($result, "static static StradaValue*", "static StradaValue*");
+                }
+            }
+        }
+    }
+
+    # NOTE: The '|| return' / 'or return' pattern is now handled properly in the
+    # CodeGen (_gen_binop) - it detects N_RETURN on the RHS and generates
+    # actual C return statements instead of ternary expressions.
+
+    # NOTE: Moose post-processor hacks removed - Moose.xs now compiles through
+    # Perla's XS compat layer (perla_perl_compat.h). The native C Moose runtime
+    # in perla_stash.c provides has/extends/with/new/BUILD/meta for user code.
+    # The following hacks are no longer needed:
+    #   - make_immutable body replacement (handled by perla_moose_make_immutable)
+    #   - _also_list_for_package guard injection
+    #   - _build_export_config die suppression
+    #   - get_all_attributes delegation to C
+    #   - install_accessors C replacement
+    #   - _construct_class_instance recursion guard
+
+    return $result;
+}
+
+# Detect available C compiler: default to GCC (reliable, handles XS and
+# relocations correctly). tcc was previously the default for faster
+# compiles, but hit "Unknown relocation type for got: 20" on XS link and
+# generally-produced .o files that couldn't be linked into final binaries.
+# Opt back in to tcc via `--cc tcc` or `PERLA_CC=tcc`.
+func _detect_cc() str {
+    my str $cc = core::getenv("PERLA_CC");
+    if (length($cc) > 0) { return $cc; }
+    return "gcc";
+}
+
+# Convert generated C code for TCC compatibility (swap headers, strip system includes)
+func _prepare_for_tcc(str $code) str {
+    $code = replace_all($code, "#include \"strada_runtime.h\"", "#include \"perla_tcc.h\"");
+    $code = replace_all($code, "#include \"perla_stash.h\"", "/* included via perla_tcc.h */");
+    $code = replace_all($code, "#include \"perla_dbi.h\"", "/* included via perla_tcc.h */");
+    # Strip system includes (perla_tcc.h/strada_runtime_tcc.h provides everything)
+    $code = replace_all($code, "#include <string.h>", "/* via perla_tcc.h */");
+    $code = replace_all($code, "#include <stdio.h>", "/* via perla_tcc.h */");
+    $code = replace_all($code, "#include <errno.h>", "/* via perla_tcc.h */");
+    $code = replace_all($code, "#include <math.h>", "/* via perla_tcc.h */");
+    $code = replace_all($code, "#include <stdlib.h>", "/* via perla_tcc.h */");
+    $code = replace_all($code, "#include <stddef.h>", "/* via perla_tcc.h */");
+    $code = replace_all($code, "#include <sys/wait.h>", "/* via perla_tcc.h */");
+    $code = replace_all($code, "#include <sys/stat.h>", "/* via perla_tcc.h */");
+    $code = replace_all($code, "#include <unistd.h>", "/* via perla_tcc.h */");
+    $code = replace_all($code, "#include <time.h>", "/* via perla_tcc.h */");
+    $code = replace_all($code, "#include <dirent.h>", "/* via perla_tcc.h */");
+    $code = replace_all($code, "#include <dlfcn.h>", "/* via perla_tcc.h */");
+    return $code;
+}
+
+# Build the `-O<level> -w [-flto] [-march=native]` prefix used by every
+# cc invocation. Default is `-O0 -w` (fast compile, no optimization).
+# Mirrors strada's policy: -O2+ enables -flto, -O3/-Ofast also adds
+# -march=native.
+# Return "ccache gcc" if ccache is installed and not explicitly disabled
+# (via CCACHE_DISABLE), else "gcc". Used as the gcc-command prefix for
+# every cc invocation perla makes. ccache hashes input + flags and
+# short-circuits to the cached .o/.so on hits, so repeated builds of
+# the same .pm.c (common for .pm.so / .pm.o rebuilds after a perla
+# rebuild) skip gcc entirely.
+func _cc_bin() str {
+    if (core::getenv("CCACHE_DISABLE") eq "1") { return "gcc"; }
+    if (core::file_exists("/usr/bin/ccache") == 1) { return "ccache gcc"; }
+    if (core::file_exists("/usr/local/bin/ccache") == 1) { return "ccache gcc"; }
+    return "gcc";
+}
+
+func _cc_opt_flags() str {
+    return _cc_opt_flags_for("");
+}
+
+# Link-time linker selection. The dominant cost of an -O0 gcc compile (and of
+# every REPL line) is the LINK step: static-linking the ~4 MB perla_runtime.a
+# with -rdynamic takes ~9.5s under GNU bfd/gold, because -rdynamic forces every
+# runtime symbol into .dynsym. LLVM's lld does the identical link in ~0.7s.
+# Use it at -O0 when ld.lld is present. Skipped at -O2+ (those add -flto, whose
+# gcc plugin path is wired for bfd/gold) and overridable with PERLA_NO_LLD=1.
+func _fast_link_flag() str {
+    if (core::getenv("PERLA_NO_LLD") eq "1") { return ""; }
+    my str $lvl = core::getenv("PERLA_OPT");
+    if (length($lvl) == 0) { $lvl = "-O0"; }
+    if ($lvl ne "-O0") { return ""; }
+    # gcc's -fuse-ld=lld resolves `ld.lld` on PATH, so detect it the same way
+    # (covers /usr/bin, a toolchain dir, etc. — not just fixed locations).
+    my str $found = trim(core::qx("command -v ld.lld 2>/dev/null"));
+    if (length($found) > 0) { return " -fuse-ld=lld"; }
+    return "";
+}
+
+# As _cc_opt_flags(), but inspects $c_file's size so the
+# gc-heap-shrink params (which trade ~60x compile-time slowdown for
+# lower peak RAM) only get added when the source is actually large
+# enough to risk OOM. Tiny single-file compiles (e.g. -e one-liners,
+# small test programs) skip the slowdown entirely.
+func _cc_opt_flags_for(str $c_file) str {
+    my str $lvl = core::getenv("PERLA_OPT");
+    if (length($lvl) == 0) { $lvl = "-O0"; }
+    # -g / --debug: emit DWARF debug info and (below) keep var-tracking + unwind
+    # tables so gdb shows locals and crash backtraces, at some compile-time cost.
+    my int $dbg = 0;
+    if (core::getenv("PERLA_DEBUG_G") eq "1") { $dbg = 1; }
+    my str $flags = $lvl . " -w";
+    if ($dbg == 1) { $flags = $flags . " -g"; }
+    # At -O0 (default for .pm.so/.pm.o builds), skip work gcc spends on
+    # debug info, stack protection, async-unwind tables, and variable
+    # tracking — none useful for a dlopen'd .pm.so, and var-tracking
+    # in particular dominates gcc wall time on huge generated .c files
+    # (Abe::App.pm.c is 24MB / 76K lines / 3300+ subs once all `use base`
+    # plugins inline). -pipe avoids temp files between passes.
+    if ($lvl eq "-O0") {
+        if ($dbg == 1) {
+            # Debug build: keep variable tracking (so gdb shows locals) and
+            # async-unwind tables (so gdb backtraces work on a crash).
+            $flags = $flags . " -pipe -fno-stack-protector";
+        } else {
+            $flags = $flags . " -pipe -fno-var-tracking -fno-var-tracking-assignments -fno-stack-protector -fno-asynchronous-unwind-tables";
+        }
+
+        # `--param ggc-min-expand=0 --param ggc-min-heapsize=4096` shrinks
+        # cc1's gc-heap aggressively: peak RSS on the huge generated .c
+        # otherwise climbs past 6 GB (the safe_run cgroup OOM threshold).
+        # These params trade compile time for lower peak RAM by GC'ing
+        # more often — on tiny sources the GC overhead dominates and
+        # compile time goes from 0.15s to 10s. Only apply when the source
+        # is large enough to actually need OOM protection, or when the
+        # caller explicitly opts in via PERLA_GCC_SHRINK_HEAP=1.
+        my int $big = 0;
+        if (core::getenv("PERLA_GCC_SHRINK_HEAP") eq "1") {
+            $big = 1;
+        } elsif (length($c_file) > 0) {
+            my int $sz = core::file_size($c_file);
+            # The aggressive ggc heap-shrink trades a LOT of compile time for
+            # lower peak RSS (it GC-thrashes cc1). It's only needed to keep the
+            # truly huge generated sources (e.g. Abe::App at ~24MB → 6GB RSS)
+            # under the OOM ceiling. A 1MB trigger was far too low: a moderate
+            # 1.5MB source (a typical `use DBI` program) went from ~2s to ~2min.
+            # Raise to 8MB — well above normal programs, well below the OOM case.
+            if ($sz > 8388608) { $big = 1; }
+        }
+        if ($big == 1) {
+            $flags = $flags . " --param ggc-min-expand=0 --param ggc-min-heapsize=4096";
+        }
+    }
+    if ($lvl eq "-O2" || $lvl eq "-O3" || $lvl eq "-Os" || $lvl eq "-Ofast") {
+        $flags = $flags . " -flto";
+    }
+    if ($lvl eq "-O3" || $lvl eq "-Ofast") {
+        $flags = $flags . " -march=native";
+    }
+    return $flags;
+}
+
+# Run a cc command, optionally tracing it under --debug.
+# Logs the exact command to stderr with a `[cc]` prefix (distinct from
+# the `[perla]` prefix used for module-resolution events so cc calls
+# are easy to spot in the noise), times it via CLOCK_MONOTONIC, and
+# prints a summary line on completion.
+func _run_cc(str $cmd) str {
+    my int $dbg = 0;
+    if (core::getenv("PERLA_DEBUG") eq "1") { $dbg = 1; }
+    if ($dbg == 0) {
+        return core::qx($cmd);
+    }
+    my num $t0 = 0.0;
+    __C__ {
+        { struct timespec __ts_a;
+          clock_gettime(CLOCK_MONOTONIC, &__ts_a);
+          strada_decref(t0);
+          t0 = strada_new_num((double)__ts_a.tv_sec + (double)__ts_a.tv_nsec / 1e9); }
+    }
+    say(STDERR, "[cc] " . $cmd);
+    my str $out = core::qx($cmd);
+    my num $t1 = 0.0;
+    __C__ {
+        { struct timespec __ts_b;
+          clock_gettime(CLOCK_MONOTONIC, &__ts_b);
+          strada_decref(t1);
+          t1 = strada_new_num((double)__ts_b.tv_sec + (double)__ts_b.tv_nsec / 1e9); }
+    }
+    my num $elapsed = $t1 - $t0;
+    my str $status = "ok";
+    if (length($out) > 0) { $status = "output " . length($out) . "b"; }
+    __C__ {
+        char __buf[64];
+        snprintf(__buf, sizeof(__buf), "%.2fs", strada_to_num(elapsed));
+        char *__s = strada_to_str(status);
+        fprintf(stderr, "[cc] done in %s (%s)\n", __buf, __s);
+        free(__s);
+    }
+    return $out;
+}
+
+# Compile C code to executable using the best available compiler
+func _compile_c(str $c_file, str $exe, str $strada_dir, str $cc, str $extra_objs) str {
+    my str $runtime_dir = _strada_rt_dir();
+    my str $perla_rt_dir = _perla_rt_dir();
+    my str $strada_base = _strada_base_dir();
+    my int $dbg = 0;
+    if (core::getenv("PERLA_DEBUG") eq "1") { $dbg = 1; }
+
+    # Pre-link step: localize transitively-inlined `perla_sub_*` symbols
+    # in .pm.o files so they don't shadow the canonical .pm.o's exports.
+    #
+    # Algorithm:
+    #   1. For each .pm.o, derive its OWNED-symbol set from the
+    #      .pm.export sidecar (written by perla -M; lists the subs
+    #      registered via perla_code_set in the init function).
+    #   2. Build owner map (sym → .pm.o that owns it).
+    #   3. For each .pm.o, objcopy --localize-symbols any global
+    #      `perla_sub_*` owned by ANOTHER .pm.o. Orphan symbols (owned
+    #      by no .pm.o, or owned by this one) stay global so main e.c's
+    #      dlsym calls still resolve.
+    #
+    # Without this, when perla -M Module_A inlines Module_B (because
+    # B.pm.o didn't exist at parse), A.pm.o exports B's compiled
+    # functions globally with potentially-poisoned name mangling
+    # (`v_params__h` instead of local `v_params`). At link time
+    # `-Wl,--allow-multiple-definition` picks one — typically the WRONG
+    # one — so a parent module's stale inline shadows the canonical
+    # .pm.o's correct sub bodies, returning undef for hash params or
+    # silently calling the wrong code.
+    my str $localized_objs = $extra_objs;
+    if (length($extra_objs) > 0 && $cc ne "tcc") {
+        my array @obj_list = split(" ", trim($extra_objs));
+        my int $oi = 0;
+        my hash %owners = ();
+        while ($oi < scalar(@obj_list)) {
+            my str $opath = trim($obj_list[$oi]);
+            if (length($opath) > 5 && substr($opath, length($opath) - 5, 5) eq ".pm.o") {
+                my str $export_path = substr($opath, 0, length($opath) - 5) . ".pm.export";
+                if (core::file_exists($export_path) == 1) {
+                    my str $exports = core::slurp($export_path);
+                    my array @elines = split("\n", $exports);
+                    my int $ei = 0;
+                    while ($ei < scalar(@elines)) {
+                        my str $sn = trim($elines[$ei]);
+                        if (length($sn) > 0 && !exists($owners{$sn})) {
+                            $owners{$sn} = $opath;
+                        }
+                        $ei++;
+                    }
+                }
+            }
+            $oi++;
+        }
+        my int $oi2 = 0;
+        my str $new_extra = "";
+        while ($oi2 < scalar(@obj_list)) {
+            my str $opath2 = trim($obj_list[$oi2]);
+            if (length($opath2) > 0) {
+                my int $is_pmo2 = (length($opath2) > 5 && substr($opath2, length($opath2) - 5, 5) eq ".pm.o");
+                if ($is_pmo2 == 1) {
+                    my str $globals2 = core::qx("nm -g " . $opath2 . " 2>/dev/null | grep ' T perla_sub_' | awk '{print $3}'");
+                    my array @gl2 = split("\n", $globals2);
+                    my int $gi2 = 0;
+                    my str $loc_list = "";
+                    while ($gi2 < scalar(@gl2)) {
+                        my str $sym2 = trim($gl2[$gi2]);
+                        if (length($sym2) > 0 && exists($owners{$sym2}) && $owners{$sym2} ne $opath2) {
+                            $loc_list = $loc_list . $sym2 . "\n";
+                        }
+                        $gi2++;
+                    }
+                    if (length($loc_list) > 0) {
+                        my str $loc_file = "/tmp/perla_loc_" . core::getpid() . "_" . $oi2 . ".syms";
+                        my str $tmp_o = "/tmp/perla_loc_" . core::getpid() . "_" . $oi2 . ".pm.o";
+                        core::spew($loc_file, $loc_list);
+                        core::qx("objcopy --localize-symbols=" . $loc_file . " " . $opath2 . " " . $tmp_o . " 2>&1");
+                        if (core::file_exists($tmp_o) == 1) {
+                            $opath2 = $tmp_o;
+                        }
+                        core::unlink($loc_file);
+                    }
+                }
+                if (length($new_extra) > 0) { $new_extra = $new_extra . " "; }
+                $new_extra = $new_extra . $opath2;
+            }
+            $oi2++;
+        }
+        $localized_objs = " " . $new_extra;
+    }
+
+    # Common link flags.
+    # `-Wl,--allow-multiple-definition` is gcc/GNU-ld only - tcc's linker
+    # rejects it. gcc needs it so duplicate weakly-defined perla_sub_X
+    # symbols across sibling .pm.o files (common when Sub::Install or
+    # other helper modules get inlined into several siblings) don't
+    # collide: GNU ld keeps the first, discards the rest. tcc doesn't
+    # have this issue in the first place - its duplicate-symbol
+    # handling is more permissive by default.
+    my str $multi_def = "";
+    if ($cc ne "tcc") { $multi_def = " -Wl,--allow-multiple-definition"; }
+    my str $link_flags = $multi_def . " -ldl -lm -lpthread -lmysqlclient -lssl -lcrypto -lz -lsqlite3 -rdynamic";
+    my str $pcre2_flags = "";
+    my str $pcre2_lib = $strada_base . "/vendor/pcre2/libpcre2-8.a";
+    if (core::file_exists($pcre2_lib) == 1) {
+        $pcre2_flags = " -DHAVE_PCRE2 -DPCRE2_STATIC -I" . $strada_base . "/vendor/pcre2/src " . $pcre2_lib;
+    }
+
+    if ($cc eq "tcc") {
+        my str $tcc_runtime = $perla_rt_dir . "/perla_runtime_tcc.a";
+        if (core::file_exists($tcc_runtime) != 1) {
+            $cc = "gcc";  # Fall back
+        } else {
+            # When pcre2 is available, define HAVE_PCRE2 so runtime headers
+            # route to pcre2 instead of falling back to <regex.h>. tcc can't
+            # parse glibc's regex.h (it has a VLA-style `regmatch_t pmatch[
+            # _REGEX_NELTS(__nmatch)]` declaration that tcc rejects with
+            # `'__nmatch' undeclared`). Without this, every test/app that
+            # transitively includes strada_runtime.h via a .c.xs.c hook fails
+            # to compile under the tcc path.
+            my str $tcc_pcre2 = "";
+            my str $tcc_pcre2_def = "";
+            if (core::file_exists($pcre2_lib) == 1) {
+                $tcc_pcre2 = " " . $pcre2_lib;
+                $tcc_pcre2_def = " -DHAVE_PCRE2 -DPCRE2_STATIC -I" . $strada_base . "/vendor/pcre2/src";
+            }
+            # perla_runtime_tcc.a is compiled with -DSTRADA_NO_TLS (see
+            # perla/Makefile) because tcc doesn't support __thread. The
+            # consumer's compile also has to see the NO_TLS branch in the
+            # runtime headers, otherwise `extern __thread int
+            # strada_call_context;` in strada_runtime.h breaks tcc's parse.
+            my str $tcc_defs = " -DSTRADA_NO_TLS" . $tcc_pcre2_def;
+            my str $cmd = "tcc -o " . $exe . " " . $c_file . $extra_objs . " " . $tcc_runtime . $tcc_pcre2 . " -I" . $runtime_dir . " -I" . $perla_rt_dir . $tcc_defs . $link_flags . " 2>&1";
+            return _run_cc($cmd);
+        }
+    }
+
+    # GCC: use prebuilt .a if available, otherwise compile from source
+    my str $gcc_runtime = $perla_rt_dir . "/perla_runtime.a";
+    if (core::file_exists($gcc_runtime) == 1) {
+        my str $cmd = _cc_bin() . " " . _cc_opt_flags_for($c_file) . _fast_link_flag() . " -o " . $exe . " " . $c_file . $localized_objs . " " . $gcc_runtime . " -I" . $runtime_dir . " -I" . $perla_rt_dir . $link_flags . $pcre2_flags . " 2>&1";
+        return _run_cc($cmd);
+    }
+
+    # Fallback: compile from source
+    my str $perla_runtime = $perla_rt_dir . "/perla_stash.c";
+    my str $runtime_src = $runtime_dir . "/strada_runtime.c";
+    my str $dbi_src = $perla_rt_dir . "/perla_dbi.c";
+    my str $dbi_flags = "";
+    if (core::file_exists($dbi_src) == 1) {
+        $dbi_flags = " " . $dbi_src . " -lmysqlclient";
+    }
+    my str $cmd = _cc_bin() . " " . _cc_opt_flags_for($c_file) . _fast_link_flag() . " -o " . $exe . " " . $c_file . $localized_objs . " " . $perla_runtime . " " . $runtime_src . $dbi_flags . " -I" . $runtime_dir . " -I" . $perla_rt_dir . " -rdynamic -ldl -lm -lpthread -lssl -lcrypto" . $pcre2_flags . " 2>&1";
+    return _run_cc($cmd);
+}
+
+func _detect_strada_dir() str {
+    my str $sd = core::getenv("STRADA_DIR");
+    if (length($sd) > 0) { return $sd; }
+    # Auto-detect from /proc/self/exe: perla binary is at $STRADA_DIR/perla/perla
+    my str $exe_path = "";
+    __C__ {
+        char buf[1024];
+        ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+        if (len > 0) {
+            buf[len] = '\0';
+            strada_decref(exe_path);
+            exe_path = strada_new_str(buf);
+        }
+    }
+    if (length($exe_path) > 0) {
+        # Strip /perla/perla from the end
+        my int $pp = index($exe_path, "/perla/perla");
+        if ($pp >= 0) {
+            return substr($exe_path, 0, $pp);
+        }
+        # Maybe it's installed elsewhere - strip last two path components
+        my int $last = -1;
+        my int $pi = 0;
+        while ($pi < length($exe_path)) {
+            if (substr($exe_path, $pi, 1) eq "/") { $last = $pi; }
+            $pi++;
+        }
+        if ($last > 0) {
+            my str $parent = substr($exe_path, 0, $last);
+            my int $last2 = -1;
+            my int $pi2 = 0;
+            while ($pi2 < length($parent)) {
+                if (substr($parent, $pi2, 1) eq "/") { $last2 = $pi2; }
+                $pi2++;
+            }
+            if ($last2 > 0) { return substr($parent, 0, $last2); }
+        }
+    }
+    return ".";
+}
+
+# Directory portion of a path (everything before the last '/'), no trailing slash.
+func _dirname(str $p) str {
+    my int $last = -1;
+    my int $i = 0;
+    while ($i < length($p)) {
+        if (substr($p, $i, 1) eq "/") { $last = $i; }
+        $i++;
+    }
+    if ($last < 0) { return "."; }
+    if ($last == 0) { return "/"; }
+    return substr($p, 0, $last);
+}
+
+# Absolute path to the running perla binary (via /proc/self/exe), or "".
+func _self_exe() str {
+    my str $exe = "";
+    __C__ {
+        char buf[1024];
+        ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+        if (len > 0) { buf[len] = '\0'; strada_decref(exe); exe = strada_new_str(buf); }
+    }
+    return $exe;
+}
+
+# Directory holding Strada's runtime (strada_runtime.c / .h). This is the
+# only piece perla needs from Strada at compile time. Resolution order:
+#   1. $STRADA_DIR/runtime                  (explicit dev tree)
+#   2. <prefix>/lib/strada/runtime          (derived from `strada` on PATH)
+#   3. /usr/local/lib/strada/runtime        (common system default)
+#   4. legacy <detected>/runtime            (perla-as-strada-subdir fallback)
+func _strada_rt_dir() str {
+    my str $env = core::getenv("STRADA_DIR");
+    if (length($env) > 0 && core::file_exists($env . "/runtime/strada_runtime.h") == 1) {
+        return $env . "/runtime";
+    }
+    my str $w = trim(core::qx("command -v strada 2>/dev/null"));
+    if (length($w) > 0) {
+        # <prefix>/bin/strada -> <prefix>/lib/strada/runtime
+        my str $cand = _dirname(_dirname($w)) . "/lib/strada/runtime";
+        if (core::file_exists($cand . "/strada_runtime.h") == 1) { return $cand; }
+    }
+    if (core::file_exists("/usr/local/lib/strada/runtime/strada_runtime.h") == 1) {
+        return "/usr/local/lib/strada/runtime";
+    }
+    return _detect_strada_dir() . "/runtime";
+}
+
+# Root of the Strada tree/install (parent of the runtime dir); `vendor/pcre2`
+# lives directly beneath it in both the dev tree and the install layout.
+func _strada_base_dir() str {
+    return _dirname(_strada_rt_dir());
+}
+
+# Directory holding Perla's OWN runtime (perla_stash.c, perla_dbi.c,
+# perla_runtime.a, headers). Resolution order:
+#   1. $PERLA_RUNTIME_DIR
+#   2. <dir-of-perla-binary>/runtime        (build/dev tree: perla + runtime/ siblings)
+#   3. <prefix>/lib/perla/runtime           (installed: <prefix>/bin/perla)
+#   4. legacy <detected>/perla/runtime      (perla-as-strada-subdir fallback)
+func _perla_rt_dir() str {
+    my str $env = core::getenv("PERLA_RUNTIME_DIR");
+    if (length($env) > 0) { return $env; }
+    my str $exe = _self_exe();
+    if (length($exe) > 0) {
+        my str $bindir = _dirname($exe);
+        if (core::file_exists($bindir . "/runtime/perla_stash.c") == 1) {
+            return $bindir . "/runtime";
+        }
+        # <prefix>/bin/perla -> <prefix>/lib/perla/runtime
+        my str $cand = _dirname($bindir) . "/lib/perla/runtime";
+        if (core::file_exists($cand . "/perla_stash.c") == 1) { return $cand; }
+    }
+    return _detect_strada_dir() . "/perla/runtime";
+}
+
+func _readline_prompt(str $prompt) str {
+    my str $result = "";
+    my int $got_line = 0;
+    __C__ {
+#ifdef HAVE_READLINE
+#include <readline/readline.h>
+#include <readline/history.h>
+        char *pr = strada_to_str(prompt);
+        char *line = readline(pr);
+        free(pr);
+        if (line) {
+            if (line[0]) add_history(line);
+            strada_decref(result);
+            result = strada_new_str(line);
+            free(line);
+            got_line = STRADA_MAKE_TAGGED_INT(1);
+        }
+#else
+        /* Fallback: simple prompt + fgets */
+        char *pr = strada_to_str(prompt);
+        fprintf(stdout, "%s", pr);
+        fflush(stdout);
+        free(pr);
+        char buf[4096];
+        if (fgets(buf, sizeof(buf), stdin)) {
+            /* Strip trailing newline */
+            size_t len = strlen(buf);
+            if (len > 0 && buf[len-1] == '\n') buf[len-1] = '\0';
+            strada_decref(result);
+            result = strada_new_str(buf);
+            got_line = STRADA_MAKE_TAGGED_INT(1);
+        }
+#endif
+    }
+    if ($got_line == 0) { return undef; }
+    return $result;
+}
+
+func _repl_compile_and_run(str $source, str $preamble, scalar $lib_paths, str $strada_dir, int $show_c, int $show_debug, int $memprof, str $cc) int {
+    my str $tmp = "/tmp/perla_repl_" . core::getpid() . ".pl";
+    my str $script = $preamble . $source;
+    core::spew($tmp, $script);
+
+    my str $exe = "/tmp/perla_repl_" . core::getpid();
+    my str $c_file = $exe . ".c";
+
+    my str $code = _compile_with_xs_lib($script, $tmp, "", $c_file, $lib_paths);
+    $code = _fix_closure_captures($code);
+    $code = _fix_codegen_edge_cases($code);
+
+    # TCC used to require header rewrites to avoid <regex.h> and __thread,
+    # which the Makefile-built perla_runtime_tcc.a already sidesteps via
+    # -DSTRADA_NO_TLS. After the -DSTRADA_NO_TLS / -DHAVE_PCRE2 defines were
+    # added to the tcc compile command, strada_runtime.h compiles with tcc
+    # directly. The _prepare_for_tcc swap to perla_tcc.h turned out to
+    # introduce subtle breakage (e.g. OOP method dispatch returning empty
+    # strings, seen on perl5_oop/perl5_cpan/extended/eval_die tests), so
+    # the rewrite is intentionally skipped.
+
+    if ($show_c == 1) {
+        say("--- Generated C ---");
+        my int $main_pos = index($code, "int main(");
+        if ($main_pos > 0) {
+            my int $end_pos = index($code, "return 0;", $main_pos);
+            if ($end_pos > $main_pos) {
+                say(substr($code, $main_pos, $end_pos - $main_pos + 12));
+            }
+        }
+        say("---");
+    }
+
+    core::spew($c_file, $code);
+
+    my str $compile_out = _compile_c($c_file, $exe, $strada_dir, $cc, "");
+
+    core::unlink($c_file);
+    core::unlink($tmp);
+
+    if (core::file_exists($exe) == 1) {
+        if ($memprof == 1) {
+            core::system("valgrind --leak-check=summary --error-exitcode=0 " . $exe . " 2>&1");
+        } else {
+            core::system($exe);
+        }
+        core::unlink($exe);
+        return 1;
+    } else {
+        my array @err_lines = split("\n", $compile_out);
+        my int $ei = 0;
+        while ($ei < size(@err_lines) && $ei < 5) {
+            say(STDERR, $err_lines[$ei]);
+            $ei++;
+        }
+        return 0;
+    }
+}
+
+# True if the statement opens a filehandle in a read mode (`open`/`opendir` with
+# no '>' redirection). Such statements are persisted in the REPL preamble so a
+# later line can read through the handle (e.g. `open(F,$p)` then `my @x = <F>`).
+# Write/append opens are excluded — re-running them on every later line would
+# re-truncate the target file.
+func _repl_is_read_open(str $stmt) int {
+    my int $is_open = 0;
+    if (length($stmt) >= 5 && (substr($stmt, 0, 5) eq "open(" || substr($stmt, 0, 5) eq "open ")) { $is_open = 1; }
+    elsif (length($stmt) >= 8 && (substr($stmt, 0, 8) eq "opendir(" || substr($stmt, 0, 8) eq "opendir ")) { $is_open = 1; }
+    if ($is_open == 0) { return 0; }
+    if (index($stmt, ">") >= 0) { return 0; }
+    return 1;
+}
+
+# --- Persistent-process JIT REPL ------------------------------------------
+# Each line is compiled to a tiny module .pm.so and its mod_init is run IN THIS
+# live process via dlopen. State persists naturally: package/our vars through the
+# shared stash pad (PERLA_REPL_PAD), containers, open filehandles, and subs all
+# live in-process. Unlike eval STRING, the line is NOT wrapped in a value-capture
+# do-block, so whole-container reassignment (`@a=...`, `%h=...`) works too.
+#
+# The dlopen below also makes the perla binary link with -rdynamic (the strada
+# driver detects `dlopen` in the generated C), so each line .so resolves the
+# runtime + stash symbols against this process.
+func _jit_is_word_char(str $c) int {
+    if (index("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_", $c) >= 0) { return 1; }
+    return 0;
+}
+
+# Scan a line for `<kw> <sigil><name>` declarations (kw = "my " or "our ") and
+# record each as a token ("$g" / "@a" / "%h") in $declared. Used so the REPL can
+# prepend `our` re-declarations on later lines (which adopt the persisted stash
+# value) — each line is its own module, so a var must be declared in it to be
+# visible.
+func _jit_scan_kw(str $line, str $kw, scalar $declared) void {
+    my int $pos = 0;
+    my int $kwlen = length($kw);
+    while (1) {
+        my int $i = index($line, $kw, $pos);
+        if ($i < 0) { return; }
+        $pos = $i + $kwlen;
+        if ($i > 0 && _jit_is_word_char(substr($line, $i - 1, 1)) == 1) { next; }
+        my int $j = $i + $kwlen;
+        while ($j < length($line) && substr($line, $j, 1) eq " ") { $j++; }
+        my str $sig = substr($line, $j, 1);
+        if ($sig ne "\$" && $sig ne "@" && $sig ne "%") { next; }
+        my str $name = $sig;
+        my int $k = $j + 1;
+        while ($k < length($line) && _jit_is_word_char(substr($line, $k, 1)) == 1) {
+            $name = $name . substr($line, $k, 1);
+            $k++;
+        }
+        if (length($name) > 1) { $declared->{$name} = 1; }
+    }
+}
+
+func _jit_collect_decls(str $line, scalar $declared) void {
+    _jit_scan_kw($line, "our ", $declared);
+    _jit_scan_kw($line, "my ", $declared);
+}
+
+func _jit_run_line(str $source, int $n, str $prepend, str $libenv, str $strada_dir, str $perla_bin) int {
+    my int $pid = core::getpid();
+    my str $mod = "plr_" . $pid . "_" . $n;
+    my str $pm = "/tmp/" . $mod . ".pm";
+    my str $so = "/tmp/" . $mod . ".pm.so";
+    # $prepend re-declares prior-line vars as `our` so they adopt their persisted
+    # stash values in this line's module; the line's own assignments sync back.
+    core::spew($pm, "package main;\n" . $prepend . $source . "\n1;\n");
+    my str $cmd = $libenv . "STRADA_DIR='" . $strada_dir
+        . "' PERLA_BUILD_PM_SO_ONLY=1 '" . $perla_bin . "' -M '" . $pm . "' 2>&1";
+    my str $out = core::qx($cmd);
+    if (core::file_exists($so) != 1) {
+        if (length($out) > 0) { say(STDERR, trim($out)); }
+        core::unlink($pm);
+        return 0;
+    }
+    my str $initsym = "perla_mod_init_" . $mod;
+    my int $ok = 0;
+    __C__ {
+        char *__so = strada_to_str(so);
+        char *__sym = strada_to_str(initsym);
+        void *__h = dlopen(__so, RTLD_NOW | RTLD_GLOBAL);
+        if (__h) {
+            void (*__init)(void) = (void (*)(void)) dlsym(__h, __sym);
+            if (__init) { __init(); ok = STRADA_MAKE_TAGGED_INT(1); }
+            else fprintf(stderr, "[jit-repl] dlsym %s failed: %s\n", __sym, dlerror());
+            /* intentionally keep __h open so subs/state stay resolvable */
+        } else {
+            fprintf(stderr, "[jit-repl] dlopen failed: %s\n", dlerror());
+        }
+        free(__so); free(__sym);
+    }
+    core::unlink($so);
+    core::unlink($pm);
+    return $ok;
+}
+
+func _run_jit_repl() int {
+    # Initialize the perla runtime in THIS process — the perla compiler binary
+    # doesn't normally do this (it's a strada program), but as a JIT-REPL host it
+    # must, so dlopen'd line .so's run against an initialized stash/special-vars.
+    __C__ {
+        extern void perla_init(void);
+        extern void perla_dbi_init(void);
+        perla_init();
+        perla_dbi_init();
+        /* Special-var preamble (mirrors a compiled program's main()), so line
+         * .so's that print / interpolate / read @ARGV behave normally. */
+        perla_irs = strada_new_str("\n");
+        v__slash_ = perla_irs; if (v__slash_) strada_incref(v__slash_);
+        perla_lse = strada_new_str(" ");
+        perla_subsep = strada_new_str("\034");
+        if (!v_ARGV) v_ARGV = strada_new_array();
+        if (!v_ENV)  v_ENV  = strada_new_hash();
+        if (!v_SIG)  v_SIG  = strada_new_hash();
+        if (!v_INC)  v_INC  = strada_new_array();
+        if (!v_ISA)  v_ISA  = strada_new_array();
+        { extern char **environ; char **__ep = environ; while (__ep && *__ep) { char *__eq = strchr(*__ep, '='); if (__eq) { char *__k = strndup(*__ep, __eq - *__ep); strada_hv_store(v_ENV, __k, strada_new_str(__eq + 1)); free(__k); } __ep++; } }
+        v__caret_O = strada_new_str("linux");
+    }
+    say("Perla JIT REPL — lines run in one live process; state persists.");
+    say("Type Perl code, or .quit to exit.\n");
+    my str $strada_dir = _detect_strada_dir();
+    my str $perla_bin = _self_exe();
+    if (length($perla_bin) == 0) { $perla_bin = "perla"; }
+    my scalar $lib_paths = _build_lib_paths(".", _load_config());
+    my str $libpath = "";
+    my int $lpi = 0;
+    while ($lpi < scalar(@{$lib_paths})) {
+        if (length($libpath) > 0) { $libpath = $libpath . ":"; }
+        $libpath = $libpath . $lib_paths->[$lpi];
+        $lpi++;
+    }
+    my str $libenv = "";
+    if (length($libpath) > 0) { $libenv = "PERLA_LIB='" . $libpath . "' "; }
+    my str $buffer = "";
+    my int $n = 0;
+    my int $running = 1;
+    my hash %declared = ();
+    while ($running == 1) {
+        my str $prompt = "perla> ";
+        if (length($buffer) > 0) { $prompt = "    .. "; }
+        my str $line = _readline_prompt($prompt);
+        if (!defined($line)) { if (length($buffer) > 0) { print("\n"); } $running = 0; next; }
+        my str $t = trim($line);
+        if (length($buffer) == 0 && ($t eq ".quit" || $t eq ".q" || $t eq "exit" || $t eq "quit")) {
+            $running = 0; next;
+        }
+        if (length($buffer) == 0 && $t eq ".help") {
+            say("  .quit / exit   leave the REPL");
+            say("  State (vars, subs, filehandles) persists across lines.");
+            next;
+        }
+        $buffer = $buffer . $line . "\n";
+        my str $tb = trim($buffer);
+        if (length($tb) == 0) { $buffer = ""; next; }
+        my str $lc = substr($tb, length($tb) - 1, 1);
+        if ($lc ne ";" && $lc ne "}") { next; }
+        # Promote a leading `my ` to `our ` so top-level lexicals are package vars
+        # (stash-backed) and thus persist across lines.
+        my str $run = $buffer;
+        my str $rt = trim($run);
+        if (length($rt) >= 3 && substr($rt, 0, 3) eq "my ") {
+            my int $mp = index($run, "my ");
+            $run = substr($run, 0, $mp) . "our " . substr($run, $mp + 3, length($run) - $mp - 3);
+        }
+        # Prepend `our` re-declarations of every var seen so far, so this line's
+        # module adopts their persisted stash values.
+        my str $prepend = "";
+        my array @dk = keys(%declared);
+        my int $di = 0;
+        while ($di < scalar(@dk)) {
+            $prepend = $prepend . "our " . $dk[$di] . ";\n";
+            $di++;
+        }
+        $n++;
+        _jit_run_line($run, $n, $prepend, $libenv, $strada_dir, $perla_bin);
+        _jit_collect_decls($run, \%declared);
+        $buffer = "";
+    }
+    return 0;
+}
+
+func _run_repl() int {
+    say("Perla 0.2.0 - Perl 5 Compiler (REPL)");
+    say("Type Perl code, or .help for commands.\n");
+
+    my str $buffer = "";
+    my int $running = 1;
+    my str $strada_dir = _detect_strada_dir();
+    my scalar $lib_paths = _build_lib_paths(".", _load_config());
+    my str $preamble = "";
+    my int $show_c = 0;
+    my int $show_debug = 0;
+    my int $memprof = 0;
+    my int $stmt_count = 0;
+    my str $cc = _detect_cc();
+
+    while ($running == 1) {
+        my str $prompt = "perla> ";
+        if (length($buffer) > 0) {
+            $prompt = "    .. ";
+        }
+        my str $line = _readline_prompt($prompt);
+        if (!defined($line)) {
+            if (length($buffer) > 0) { print("\n"); }
+            $running = 0;
+            next;
+        }
+
+        my str $__exit_check = trim($line);
+        if ($__exit_check eq "exit" || $__exit_check eq "quit"
+            || $__exit_check eq "exit;" || $__exit_check eq "quit;"
+            || $__exit_check eq "exit()" || $__exit_check eq "exit();") {
+            $running = 0;
+            next;
+        }
+
+        # Dot-commands
+        if (length($line) > 0 && substr($line, 0, 1) eq ".") {
+            if ($line eq ".help") {
+                say("Commands:");
+                say("  .help             - Show this help");
+                say("  .imports          - List imports and library paths");
+                say("  .load FILE        - Load and execute code from file");
+                say("  .soinfo FILE      - Show exported functions from .so/.o/.a file");
+                say("  .clear            - Clear all state (preamble, use statements)");
+                say("  .debug            - Toggle debug mode (show generated C)");
+                say("  .cdebug           - Toggle C debug mode (compile with -g)");
+                say("  .compiler         - Show compiler backend info");
+                say("  .memprof          - Toggle memory profiling (valgrind)");
+                say("  .memstats         - Show memory statistics");
+                say("  .use MODULE       - Add a persistent use statement");
+                say("  .lib PATH         - Add library search path");
+                say("  exit / quit       - Exit the REPL");
+            } elsif ($line eq ".imports") {
+                say("Library paths:");
+                my int $lpi = 0;
+                while ($lpi < scalar(@{$lib_paths})) {
+                    say("  " . $lib_paths->[$lpi]);
+                    $lpi++;
+                }
+                if (length($preamble) > 0) {
+                    say("\nPreamble:");
+                    say($preamble);
+                }
+            } elsif (index($line, ".load ") == 0) {
+                my str $file = trim(substr($line, 6, length($line) - 6));
+                if (core::file_exists($file) == 1) {
+                    my str $source = core::slurp($file);
+                    say("Loading " . $file . " (" . length($source) . " bytes)...");
+                    _repl_compile_and_run($source, $preamble, $lib_paths, $strada_dir, $show_c, $show_debug, $memprof, $cc);
+                } else {
+                    say("Error: file not found: " . $file);
+                }
+            } elsif (index($line, ".soinfo ") == 0) {
+                my str $file = trim(substr($line, 8, length($line) - 8));
+                if (core::file_exists($file) == 1) {
+                    say("Symbols in " . $file . ":");
+                    my str $nm_out = core::qx("nm -D " . $file . " 2>/dev/null || nm " . $file . " 2>/dev/null");
+                    if (length($nm_out) == 0) {
+                        $nm_out = core::qx("nm " . $file . " 2>&1");
+                    }
+                    # Filter to show perla_ and relevant symbols
+                    my array @nm_lines = split("\n", $nm_out);
+                    my int $ni = 0;
+                    while ($ni < size(@nm_lines)) {
+                        my str $nl = $nm_lines[$ni];
+                        if (index($nl, " T ") >= 0 || index($nl, " t ") >= 0) {
+                            say("  " . $nl);
+                        }
+                        $ni++;
+                    }
+                } else {
+                    say("Error: file not found: " . $file);
+                }
+            } elsif ($line eq ".clear") {
+                $preamble = "";
+                $stmt_count = 0;
+                say("State cleared.");
+            } elsif ($line eq ".debug") {
+                $show_c = 1 - $show_c;
+                if ($show_c == 1) { say("Debug mode ON (showing generated C)"); }
+                else { say("Debug mode OFF"); }
+            } elsif ($line eq ".cdebug") {
+                $show_debug = 1 - $show_debug;
+                if ($show_debug == 1) { say("C debug mode ON (compiling with -g)"); }
+                else { say("C debug mode OFF"); }
+            } elsif ($line eq ".compiler") {
+                say("Compiler: Perla 0.2.0");
+                say("Backend:  " . $cc . " (compile to C, then native)");
+                say("Runtime:  strada_runtime.c + perla_stash.c");
+                say("STRADA_DIR: " . $strada_dir);
+                my str $cc_ver = core::qx($cc . " --version 2>&1 | head -1");
+                say(uc($cc) . ": " . trim($cc_ver));
+            } elsif ($line eq ".memprof") {
+                $memprof = 1 - $memprof;
+                if ($memprof == 1) { say("Memory profiling ON (using valgrind)"); }
+                else { say("Memory profiling OFF"); }
+            } elsif ($line eq ".memstats") {
+                # Show process memory from /proc/self/status
+                my str $status = core::slurp("/proc/self/status");
+                my array @slines = split("\n", $status);
+                my int $si2 = 0;
+                say("Process memory:");
+                while ($si2 < size(@slines)) {
+                    my str $sl = $slines[$si2];
+                    if (index($sl, "VmRSS") == 0 || index($sl, "VmSize") == 0 ||
+                        index($sl, "VmPeak") == 0 || index($sl, "VmData") == 0) {
+                        say("  " . $sl);
+                    }
+                    $si2++;
+                }
+                say("Statements executed: " . $stmt_count);
+            } elsif (index($line, ".use ") == 0) {
+                my str $mod = trim(substr($line, 5, length($line) - 5));
+                $preamble = $preamble . "use " . $mod . ";\n";
+                say("Added: use " . $mod . ";");
+            } elsif (index($line, ".lib ") == 0) {
+                my str $path = trim(substr($line, 5, length($line) - 5));
+                push(@{$lib_paths}, $path);
+                say("Added lib path: " . $path);
+            } else {
+                say("Unknown command: " . $line . " (try .help)");
+            }
+            next;
+        }
+
+        $buffer = $buffer . $line . "\n";
+
+        # Check for complete statements (heuristic: ends with ; or })
+        my str $trimmed = trim($buffer);
+        if (length($trimmed) == 0) {
+            $buffer = "";
+            next;
+        }
+        my str $last_char = substr($trimmed, length($trimmed) - 1, 1);
+        if ($last_char ne ";" && $last_char ne "}") {
+            next;
+        }
+
+        my int $__rr_ok = _repl_compile_and_run($buffer, $preamble, $lib_paths, $strada_dir, $show_c, $show_debug, $memprof, $cc);
+        # Persist declarations (my/our/sub/use/package) in the preamble
+        # so subsequent lines see prior bindings. Output statements
+        # (print/say/etc) don't get persisted to avoid re-running their
+        # side effects on every later compile. Heuristic only — anything
+        # whose first token is one of those keywords is persisted in full.
+        if ($__rr_ok == 1) {
+            my str $__rr_trim = trim($buffer);
+            my int $__rr_keep = 0;
+            if (length($__rr_trim) >= 3 && substr($__rr_trim, 0, 3) eq "my ") { $__rr_keep = 1; }
+            elsif (length($__rr_trim) >= 4 && substr($__rr_trim, 0, 4) eq "our ") { $__rr_keep = 1; }
+            elsif (length($__rr_trim) >= 4 && substr($__rr_trim, 0, 4) eq "sub ") { $__rr_keep = 1; }
+            elsif (length($__rr_trim) >= 4 && substr($__rr_trim, 0, 4) eq "use ") { $__rr_keep = 1; }
+            elsif (length($__rr_trim) >= 8 && substr($__rr_trim, 0, 8) eq "package ") { $__rr_keep = 1; }
+            elsif (length($__rr_trim) >= 8 && substr($__rr_trim, 0, 8) eq "require ") { $__rr_keep = 1; }
+            elsif (length($__rr_trim) >= 6 && substr($__rr_trim, 0, 6) eq "state ") { $__rr_keep = 1; }
+            # open(...)/opendir(...) establish a filehandle that later lines
+            # read through (e.g. `open(F,$path)` then `my @x = <F>`). Persist
+            # it so the handle exists in the re-run preamble. Only READ-mode
+            # opens (no '>' in the spec) — re-running a write/append open on
+            # every later line would re-truncate the target file.
+            elsif (_repl_is_read_open($__rr_trim) == 1) { $__rr_keep = 1; }
+            if ($__rr_keep == 1) {
+                $preamble = $preamble . $buffer;
+            }
+        }
+        $stmt_count++;
+        $buffer = "";
+    }
+    return 0;
+}
+
+func main() int {
+    my int $argc = size(@ARGV);
+
+    if ($argc == 0) {
+        # Default REPL is the persistent-process JIT REPL (true cross-line state).
+        return _run_jit_repl();
+    }
+    if ($ARGV[0] eq "--jit-repl") {
+        return _run_jit_repl();
+    }
+    if ($ARGV[0] eq "--classic-repl" || $ARGV[0] eq "--legacy-repl") {
+        # The old re-run-the-preamble REPL, kept as a fallback.
+        return _run_repl();
+    }
+
+    my str $input = "";
+    my str $output = "";
+    my int $c_only = 0;
+    my int $vm_mode = 0;
+    my int $strada_only = 0;
+    my int $module_mode = 0;
+    my str $eval_code = "";
+    my str $cc_override = "";
+    my int $debug_mode = 0;
+    my int $debug_g = 0;
+    my int $precompile_deps = 0;
+    my int $shared_mode = 0;
+    my int $force_rebuild = 0;
+    my int $keep_c = 0;
+    my str $opt_level = "";
+    my array @extra_lib_paths = ();
+
+    my int $i = 0;
+    while ($i < $argc) {
+        my str $arg = $ARGV[$i];
+        if ($arg eq "-o" && $i + 1 < $argc) {
+            $i++;
+            $output = $ARGV[$i];
+        } elsif ($arg eq "-c") {
+            $c_only = 1;
+        } elsif ($arg eq "-e" && $i + 1 < $argc) {
+            $i++;
+            $eval_code = $ARGV[$i];
+        } elsif ($arg eq "--compile-module" || $arg eq "-M") {
+            $module_mode = 1;
+        } elsif ($arg eq "--vm" || $arg eq "--interp") {
+            $vm_mode = 1;
+        } elsif ($arg eq "--strada" || $arg eq "-s") {
+            $strada_only = 1;
+        } elsif ($arg eq "-I" && $i + 1 < $argc) {
+            $i++;
+            push(@extra_lib_paths, $ARGV[$i]);
+        } elsif (length($arg) > 2 && substr($arg, 0, 2) eq "-I") {
+            push(@extra_lib_paths, substr($arg, 2, length($arg) - 2));
+        } elsif ($arg eq "--cc" && $i + 1 < $argc) {
+            $i++;
+            $cc_override = $ARGV[$i];
+        } elsif ($arg eq "--debug") {
+            $debug_mode = 1;
+        } elsif ($arg eq "--precompile-deps" || $arg eq "--precompile") {
+            $precompile_deps = 1;
+        } elsif ($arg eq "--shared") {
+            $shared_mode = 1;
+        } elsif ($arg eq "--force-rebuild") {
+            $force_rebuild = 1;
+        } elsif ($arg eq "--keep" || $arg eq "--keep-c") {
+            $keep_c = 1;
+        } elsif ($arg eq "-g" || $arg eq "--debug-symbols") {
+            # Build a gdb-debuggable binary: DWARF (-g), keep var-tracking +
+            # unwind tables (see _cc_opt_flags_for), and keep the generated .c
+            # alongside the binary so gdb has source to step through.
+            $debug_g = 1;
+            $keep_c = 1;
+        } elsif ($arg eq "-O0" || $arg eq "-O1" || $arg eq "-O2"
+              || $arg eq "-O3" || $arg eq "-Os" || $arg eq "-Ofast") {
+            $opt_level = $arg;
+        } elsif ($arg eq "--version" || $arg eq "-v") {
+            say("perla 0.2.0");
+            return 0;
+        } elsif ($arg eq "--help" || $arg eq "-h") {
+            say("Usage: perla                         # Interactive REPL");
+            say("       perla <input.pl>              # Compile and run");
+            say("       perla -e 'code'               # Run one-liner");
+            say("       perla -o output <input.pl>    # Compile to executable");
+            say("       perla -c <input.pl>           # Generate C code only");
+            say("       perla -M <module.pm>          # Precompile one module to .o/.so");
+            say("       perla -M <dir/>               # Recursively precompile every .pm in dir");
+            say("       perla --vm <input.pl>         # Run via Strada codegen");
+            say("       perla --strada <input.pl>     # Output Strada source");
+            say("");
+            say("Options:");
+            say("       -o FILE       Output executable (or C file with -c)");
+            say("       -c            Generate C code only (don't compile)");
+            say("       -e 'code'     Execute one-liner");
+            say("       -M module.pm  Precompile module to .o/.so");
+            say("       -I path       Add library search path");
+            say("       --cc compiler Use specific C compiler (default: tcc)");
+            say("       --debug       Show debug info (modules, gcc commands, etc.)");
+            say("       --precompile-deps");
+            say("                     Auto-build .pm.o AND .pm.so for every .pm used by the");
+            say("                     main program (idempotent - skips modules with both");
+            say("                     artifacts already present). Avoids in-line source");
+            say("                     parsing and speeds up subsequent compiles.");
+            say("       --shared      Prefer .pm.so (dlopen at runtime) over .pm.o for");
+            say("                     precompiled modules. Produces smaller executables");
+            say("                     that load modules dynamically at startup. Falls back");
+            say("                     to .pm.o if the shared library is missing.");
+            say("       --force-rebuild");
+            say("                     Force `perla -M` to rebuild .pm.o/.pm.so for every");
+            say("                     module encountered, even if artifacts already exist.");
+            say("                     Useful after compiler changes or module edits.");
+            say("       --keep, --keep-c");
+            say("                     Keep the generated .c file after compile (it's next");
+            say("                     to the input, named <base>.c). Handy for inspecting");
+            say("                     the emitted C or debugging codegen.");
+            say("       -g, --debug-symbols");
+            say("                     Build a gdb-debuggable binary: emit DWARF (-g), keep");
+            say("                     var-tracking + unwind tables (so locals/backtraces");
+            say("                     work), and keep the generated <base>.c next to it for");
+            say("                     source-level stepping. See docs/DEBUGGING.md.");
+            say("       -O0..-O3, -Os, -Ofast");
+            say("                     Optimization level passed to gcc (default: -O0).");
+            say("                     -O2 and above enable -flto; -O3/-Ofast also add");
+            say("                     -march=native.");
+            say("       --vm          Run via Strada codegen path");
+            say("       --strada      Output Strada source code");
+            say("       -v, --version Show version");
+            say("       -h, --help    Show this help");
+            return 0;
+        } else {
+            $input = $arg;
+            $i++;
+            last;  # Everything after the input file goes to script's @ARGV
+        }
+        $i++;
+    }
+    # Collect remaining args for the script's @ARGV
+    my array @script_args = ();
+    while ($i < $argc) {
+        push(@script_args, $ARGV[$i]);
+        $i++;
+    }
+
+    # --debug: set PERLA_DEBUG env var for runtime debug output
+    if ($debug_mode == 1) {
+        __C__ {
+            setenv("PERLA_DEBUG", "1", 1);
+        }
+        say(STDERR, "[perla] debug mode enabled");
+        say(STDERR, "[perla] cc: " . _detect_cc());
+        say(STDERR, "[perla] strada_dir: " . _detect_strada_dir());
+    }
+
+    # --precompile-deps: set PERLA_PRECOMPILE_DEPS=1 so the parser
+    # auto-compiles .pm.o/.pm.so on demand as modules are encountered.
+    if ($precompile_deps == 1) {
+        core::setenv("PERLA_PRECOMPILE_DEPS", "1");
+        if ($debug_mode == 1) { say(STDERR, "[perla] --precompile-deps enabled"); }
+    }
+
+    # --shared: prefer .pm.so (dlopen) over .pm.o (static link) for
+    # precompiled modules. The parser picks up PERLA_SHARED to decide
+    # which artifact to prefer; CodeGen emits dlopen+dlsym for shared
+    # modules instead of a direct call + static link.
+    if ($shared_mode == 1) {
+        core::setenv("PERLA_SHARED", "1");
+        if ($debug_mode == 1) { say(STDERR, "[perla] --shared enabled (prefer .pm.so)"); }
+    }
+
+    # --force-rebuild: invoke `perla -M` on every .pm found in a
+    # library tree, regardless of whether .pm.o/.pm.so already exist.
+    # The parser picks up PERLA_FORCE_REBUILD and treats it like a
+    # strict precompile-deps that ignores cached artifacts.
+    if ($force_rebuild == 1) {
+        core::setenv("PERLA_FORCE_REBUILD", "1");
+        if ($debug_mode == 1) { say(STDERR, "[perla] --force-rebuild enabled (ignore cached artifacts)"); }
+    }
+    # -g / --debug-symbols: propagate to the cc-flag builder (PERLA_DEBUG_G) so
+    # every compile emits DWARF + keeps var-tracking/unwind tables.
+    if ($debug_g == 1) {
+        core::setenv("PERLA_DEBUG_G", "1");
+        if ($debug_mode == 1) { say(STDERR, "[perla] -g: debug symbols on; keeping generated .c"); }
+    }
+
+    # -O<level> flag (same naming as strada): -O0..-O3, -Os, -Ofast.
+    # Propagated via PERLA_OPT env var so all five cc invocation sites
+    # (main link, perla -M .pm.o, perla -M .pm.so, eval compile, tcc)
+    # pick it up from the single _cc_opt_flags() helper.
+    if (length($opt_level) > 0) {
+        core::setenv("PERLA_OPT", $opt_level);
+        if ($debug_mode == 1) { say(STDERR, "[perla] optimization: " . $opt_level); }
+    }
+
+    # -e 'code' - one-liner mode
+    if (length($eval_code) > 0) {
+        my str $tmp = "/tmp/perla_e_" . core::getpid() . ".pl";
+        core::spew($tmp, $eval_code . "\n");
+        $input = $tmp;
+        # Fall through to normal compilation path
+    }
+
+    if ($input eq "" && length($eval_code) == 0) {
+        return _run_jit_repl();
+    }
+
+    # Load configuration
+    my scalar $config = _load_config();
+
+    # --- Module compilation mode ---
+    if ($module_mode == 1) {
+        # Directory mode: `perla -M <dir>` walks the tree and precompiles
+        # every .pm found, delegating each to a `perla -M <file>` subprocess.
+        # Idempotent - files with an existing .pm.o are skipped unless
+        # --force-rebuild is set. Reports progress per file.
+        if (core::is_dir($input) == 1) {
+            my str $perla_bin = "";
+            __C__ {
+                char buf[2048];
+                ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+                if (len > 0) {
+                    buf[len] = '\0';
+                    strada_decref(perla_bin);
+                    perla_bin = strada_new_str(buf);
+                }
+            }
+            if (length($perla_bin) == 0) {
+                say(STDERR, "perla -M <dir>: could not determine own path");
+                return 1;
+            }
+            # Enumerate .pm files via `find`. Much simpler than threading
+            # a recursive Strada walker; `find` is universally available.
+            my str $find_cmd = "find " . $input . " -type f -name '*.pm' 2>/dev/null";
+            my str $find_out = core::qx($find_cmd);
+            my array @pm_files = split("\n", $find_out);
+            my int $total = 0;
+            my int $ti = 0;
+            while ($ti < scalar(@pm_files)) {
+                if (length(trim($pm_files[$ti])) > 0) { $total++; }
+                $ti++;
+            }
+            if ($total == 0) {
+                say(STDERR, "perla -M " . $input . ": no .pm files found");
+                return 0;
+            }
+            say(STDERR, "[perla] precompiling " . $total . " .pm files under " . $input);
+            my int $done = 0;
+            my int $skipped = 0;
+            my int $failed = 0;
+            my int $force = 0;
+            if (core::getenv("PERLA_FORCE_REBUILD") eq "1") { $force = 1; }
+            my int $fi = 0;
+            while ($fi < scalar(@pm_files)) {
+                my str $pm = trim($pm_files[$fi]);
+                if (length($pm) > 0) {
+                    my str $o_path = $pm . ".o";
+                    my int $need_build = 1;
+                    if ($force == 0 && core::file_exists($o_path) == 1) {
+                        $need_build = 0;
+                        $skipped++;
+                    }
+                    if ($need_build == 1) {
+                        my str $cmd = $perla_bin . " -M " . $pm . " 2>&1";
+                        my str $out = core::qx($cmd);
+                        if (core::file_exists($o_path) == 1) {
+                            $done++;
+                            say(STDERR, "[perla] [" . ($done + $skipped + $failed) . "/" . $total . "] ok " . $pm);
+                        } else {
+                            $failed++;
+                            say(STDERR, "[perla] [" . ($done + $skipped + $failed) . "/" . $total . "] FAIL " . $pm);
+                            if (length(trim($out)) > 0) {
+                                say(STDERR, "  " . trim($out));
+                            }
+                        }
+                    }
+                }
+                $fi++;
+            }
+            say(STDERR, "[perla] precompile done: " . $done . " built, " . $skipped . " skipped, " . $failed . " failed (" . $total . " total)");
+            if ($failed > 0) { return 1; }
+            return 0;
+        }
+        my str $source = core::slurp($input);
+        if (length($source) == 0) {
+            say("Error: cannot read " . $input);
+            return 1;
+        }
+
+        # Check for explicit module name from PERLA_MODULE_NAME env var (set by runtime require)
+        my str $mod_name = core::getenv("PERLA_MODULE_NAME");
+        if (length($mod_name) == 0) {
+            # Derive module name from file path: lib/Foo/Bar.pm -> Foo::Bar
+            $mod_name = $input;
+            # Strip directory prefix up to lib/ if present. Check both
+            # absolute (`/path/lib/Foo/Bar.pm`) and relative
+            # (`lib/Foo/Bar.pm`) forms. Without the relative case, the
+            # `perla -M lib/` dir walker's find output (relative paths)
+            # falls through to basename stripping and `Abe::DatabaseRecord`
+            # becomes `DatabaseRecord`, producing the wrong init-fn name.
+            my int $lib_pos = index($mod_name, "/lib/");
+            if ($lib_pos >= 0) {
+                $mod_name = substr($mod_name, $lib_pos + 5, length($mod_name) - $lib_pos - 5);
+            } elsif (length($mod_name) >= 4 && substr($mod_name, 0, 4) eq "lib/") {
+                $mod_name = substr($mod_name, 4, length($mod_name) - 4);
+            } else {
+                # No lib/ in path. Two cases:
+                #
+                #   (a) Relative path like `Shipment/FedEx.pm` - this is a
+                #       multi-segment module path that happens to be passed
+                #       without a `lib/` prefix. Use the WHOLE path as the
+                #       module; slashes convert to :: downstream.
+                #       → `Shipment::FedEx`, not `FedEx`.
+                #
+                #   (b) Absolute path that doesn't contain `/lib/` (rare -
+                #       someone dropped a `.pm` somewhere arbitrary). Fall
+                #       back to basename. This is the only case we can't
+                #       confidently derive a full module name from.
+                #
+                # The previous code always fell back to basename, which
+                # corrupted init-fn names for (a). Concrete symptom: narrow
+                # auto-build invoking `perla -M Shipment/FedEx.pm` produced
+                # `perla_mod_init_FedEx`, breaking the link for callers
+                # expecting `perla_mod_init_Shipment_FedEx`. Fix 1 in
+                # Parser.strada (pass PERLA_MODULE_NAME explicitly) makes
+                # the auto-build path immune to this; this fix hardens the
+                # fallback for anyone who still hits `perla -M` with a
+                # relative path.
+                my int $is_absolute = 0;
+                if (length($mod_name) > 0 && substr($mod_name, 0, 1) eq "/") {
+                    $is_absolute = 1;
+                }
+                if ($is_absolute == 1) {
+                    my int $last_slash = -1;
+                    my int $mi = 0;
+                    while ($mi < length($mod_name)) {
+                        if (substr($mod_name, $mi, 1) eq "/") { $last_slash = $mi; }
+                        $mi++;
+                    }
+                    if ($last_slash >= 0) {
+                        $mod_name = substr($mod_name, $last_slash + 1, length($mod_name) - $last_slash - 1);
+                    }
+                }
+                # Relative path: leave $mod_name unchanged - the slash→::
+                # conversion below handles it correctly.
+            }
+            # Further strip Perl-install path components like `site_perl/5.42.0/`
+            # or `x86_64-linux/` that appear between `lib/` and the actual module
+            # path. A component is considered non-module if it contains `.` (e.g.
+            # version numbers), starts with a digit, or matches known prefixes.
+            my int $guard = 0;
+            while ($guard < 5) {
+                my int $first_slash = index($mod_name, "/");
+                if ($first_slash < 0) { last; }
+                my str $head = substr($mod_name, 0, $first_slash);
+                my int $strip = 0;
+                if ($head eq "site_perl" || $head eq "vendor_perl" || $head eq "auto") { $strip = 1; }
+                elsif (length($head) > 0) {
+                    my str $hc = substr($head, 0, 1);
+                    if ($hc ge "0" && $hc le "9") { $strip = 1; }
+                    elsif (index($head, ".") > 0) { $strip = 1; }
+                    elsif (index($head, "-") > 0 && index($head, "linux") > 0) { $strip = 1; }
+                }
+                if ($strip == 0) { last; }
+                $mod_name = substr($mod_name, $first_slash + 1, length($mod_name) - $first_slash - 1);
+                $guard++;
+            }
+        }
+        # Strip .pm extension
+        if (index($mod_name, ".pm") >= 0) {
+            $mod_name = substr($mod_name, 0, length($mod_name) - 3);
+        }
+        # Convert / to ::
+        $mod_name = replace_all($mod_name, "/", "::");
+
+        # Build lib paths
+        my scalar $lib_paths = _build_lib_paths($input, $config);
+        my int $eli = scalar(@extra_lib_paths) - 1;
+        while ($eli >= 0) {
+            unshift(@{$lib_paths}, $extra_lib_paths[$eli]);
+            $eli--;
+        }
+        # When compiling `Foo/Bar/Baz.pm` as module `Foo::Bar::Baz`, the
+        # parent directory of the module's own subtree is effectively the
+        # @INC root: strip the module's rel_path off the end of $input.
+        # Without this, `perla -M` on YAML/Loader.pm couldn't find
+        # YAML/Mo.pm (the natural sibling) because _build_lib_paths only
+        # adds Loader.pm's directory (`.../YAML`), not the `.../` above.
+        {
+            my str $rel_from_mod = replace_all($mod_name, "::", "/") . ".pm";
+            my int $tail_len = length($rel_from_mod);
+            my int $inp_len = length($input);
+            if ($inp_len > $tail_len + 1) {
+                my str $tail = substr($input, $inp_len - $tail_len, $tail_len);
+                if ($tail eq $rel_from_mod) {
+                    my str $inc_root = substr($input, 0, $inp_len - $tail_len - 1);
+                    if (length($inc_root) > 0) {
+                        unshift(@{$lib_paths}, $inc_root);
+                    }
+                }
+            }
+        }
+
+        # Pre-mark the target module as loaded so a dep cycle
+        # (Abe::Template -> Abe::App -> ... -> Abe::Template) doesn't
+        # re-inline the target's subs, which produced duplicate
+        # definitions and failed gcc with "redefinition of X". The
+        # loaded_modules hash is keyed by module name, so pass a seeded
+        # copy rather than {}.
+        my scalar $preloaded = {};
+        $preloaded->{$mod_name} = 1;
+        # Compile module to C (inline the pipeline since Strada's use doesn't pick up new funcs)
+        my array @mod_tokens = Perla::Lexer::lex($source);
+        my scalar $mod_ast = Perla::Parser::parse_with_file_context(@mod_tokens, $lib_paths, $preloaded, $input);
+        my str $code = Perla::CodeGen::generate_module($mod_ast, $mod_name);
+
+        # Localization of transitively-inlined symbols happens at link
+        # time via `objcopy --localize-symbol` (see _compile_c). When
+        # perla -M Module_A inlines Module_B (because B.pm.o didn't
+        # exist at parse), A.pm.o exports `perla_sub_Module_B_*` as
+        # global. If both A.pm.o and B.pm.o link into the same binary,
+        # `--allow-multiple-definition` picks one — typically wrong.
+        # Pre-process owned set into a `.pm.export` sidecar file so the
+        # final link can localize anything not in any module's export
+        # set (= came from a transitive inline).
+        # Filter to OWN-package subs only. perla_code_set("Pkg",
+        # "name", strada_new_str("perla_sub_X")) is emitted both for
+        # this module's own packages AND every transitively-inlined
+        # package's subs. We need only the former — anything else is
+        # an inline of someone else's body, and the dep's own .pm.o
+        # is the canonical owner. Filter on the first arg (Pkg name):
+        # accept iff Pkg matches $mod_name or Pkg starts with
+        # "$mod_name::".
+        my hash %owned_syms = ();
+        my int $cs_pos = index($code, "perla_code_set(\"");
+        while ($cs_pos >= 0) {
+            # First arg: package name (between quotes after perla_code_set(").
+            my int $pkg_start = $cs_pos + 16;
+            my int $pkg_end = index($code, "\"", $pkg_start);
+            my int $third_pos = index($code, "strada_new_str(\"perla_sub_", $cs_pos);
+            my int $semi_pos = index($code, ";", $cs_pos);
+            if ($pkg_end < 0 || $third_pos < 0 || $third_pos > $semi_pos) {
+                $cs_pos = index($code, "perla_code_set(\"", $cs_pos + 16);
+                next;
+            }
+            my str $cs_pkg = substr($code, $pkg_start, $pkg_end - $pkg_start);
+            my int $is_own_pkg = 0;
+            if ($cs_pkg eq $mod_name) { $is_own_pkg = 1; }
+            elsif (length($cs_pkg) > length($mod_name) + 2 &&
+                   substr($cs_pkg, 0, length($mod_name) + 2) eq ($mod_name . "::")) {
+                $is_own_pkg = 1;
+            }
+            if ($is_own_pkg == 1) {
+                my int $name_start_cs = $third_pos + 16;
+                my int $name_end_cs = index($code, "\"", $name_start_cs);
+                if ($name_end_cs > $name_start_cs) {
+                    my str $sym = substr($code, $name_start_cs, $name_end_cs - $name_start_cs);
+                    $owned_syms{$sym} = 1;
+                }
+            }
+            $cs_pos = index($code, "perla_code_set(\"", $semi_pos);
+        }
+        # Add the __direct variants as owned too.
+        my array @owned_keys = keys(%owned_syms);
+        my int $ok_i = 0;
+        while ($ok_i < scalar(@owned_keys)) {
+            $owned_syms{$owned_keys[$ok_i] . "__direct"} = 1;
+            $ok_i++;
+        }
+
+        # Determine output paths
+        my str $base = $input;
+        if (index($base, ".pm") >= 0) {
+            $base = substr($base, 0, length($base) - 3);
+        }
+        my str $c_file = $base . ".pm.c";
+        my str $o_file = $base . ".pm.o";
+        my str $deps_file = $base . ".pm.deps";
+        my str $export_file = $base . ".pm.export";
+
+        # Write the owned-symbols sidecar. Each line is one symbol name
+        # this .pm.o exports as part of its OWN package (registered via
+        # perla_code_set in the init function). The final link uses the
+        # difference (.pm.o globals \ all .pm.export entries) to find
+        # transitively-inlined symbols and localize them with objcopy.
+        my str $export_content = "";
+        my array @ek = keys(%owned_syms);
+        my int $eki = 0;
+        while ($eki < scalar(@ek)) {
+            $export_content = $export_content . $ek[$eki] . "\n";
+            $eki++;
+        }
+        core::spew($export_file, $export_content);
+
+        # Extract dependency .o paths from generated C and write .deps file.
+        # Canonicalize each path to absolute — we may have been invoked from
+        # any cwd, but the consuming compile reads .pm.deps from a different
+        # cwd and `ld` then can't find ./X.pm.o.
+        my str $deps_content = "";
+        my int $dep_pos = index($code, "/* PERLA_LINK_OBJECTS:");
+        if ($dep_pos >= 0) {
+            my int $dep_end = index($code, " */", $dep_pos);
+            if ($dep_end > $dep_pos) {
+                $deps_content = substr($code, $dep_pos + 22, $dep_end - $dep_pos - 22);
+            }
+        }
+        my str $deps_abs = "";
+        my array @deps_parts = split(" ", trim($deps_content));
+        my int $dpi = 0;
+        while ($dpi < scalar(@deps_parts)) {
+            my str $dep_p = trim($deps_parts[$dpi]);
+            if (length($dep_p) > 0) {
+                my str $abs_p = "" . core::realpath($dep_p);
+                if (length($abs_p) == 0) { $abs_p = $dep_p; }
+                if (length($deps_abs) > 0) { $deps_abs = $deps_abs . " "; }
+                $deps_abs = $deps_abs . $abs_p;
+            }
+            $dpi++;
+        }
+        core::spew($deps_file, $deps_abs);
+
+        if ($c_only == 1) {
+            if (length($output) > 0) { $c_file = $output; }
+            core::spew($c_file, $code);
+            say("Generated " . $c_file . " (module: " . $mod_name . ")");
+            return 0;
+        }
+
+        # Write C file and compile to .o
+        core::spew($c_file, $code);
+
+        my str $strada_dir = _detect_strada_dir();
+        my str $runtime_dir = _strada_rt_dir();
+        my str $perla_runtime_dir = _perla_rt_dir();
+        my str $strada_base = _strada_base_dir();
+
+        my str $pcre2_flags = "";
+        my str $pcre2_lib = $strada_base . "/vendor/pcre2/libpcre2-8.a";
+        if (core::file_exists($pcre2_lib) == 1) {
+            $pcre2_flags = " -DHAVE_PCRE2 -DPCRE2_STATIC -I" . $strada_base . "/vendor/pcre2/src";
+        }
+
+        my str $so_file = $base . ".pm.so";
+        my str $inc_flags = " -I" . $runtime_dir . " -I" . $perla_runtime_dir . $pcre2_flags;
+
+        # Eval STRING / runtime require only need the .pm.so (dlopened
+        # at runtime). Skipping the .pm.o cuts a full gcc invocation per
+        # eval — and `eval STRING` from real code (Moose accessor
+        # builders, `aliased`, JSON::PP property generators) calls into
+        # this path *hundreds* of times during init, so the cost is
+        # very visible.
+        my int $so_only = 0;
+        if (core::getenv("PERLA_BUILD_PM_SO_ONLY") eq "1") { $so_only = 1; }
+
+        my str $eval_cc = core::getenv("PERLA_EVAL_CC");
+
+        # Build .o (for static linking in compiled mode) — skipped in
+        # so-only mode.
+        if ($so_only == 0) {
+            my str $cmd_o = _cc_bin() . " " . _cc_opt_flags_for($c_file) . " -c -o " . $o_file . " " . $c_file . $inc_flags . " 2>&1";
+            my str $gcc_out = _run_cc($cmd_o);
+            if (length($gcc_out) > 0) {
+                say(STDERR, $gcc_out);
+            }
+        }
+
+        # Build .so (for dynamic loading in VM/--shared modes) - skipped
+        # in the common compiled-mode precompile path because nothing
+        # there needs the .pm.so, and building it doubles gcc cost per
+        # module. Opt in via PERLA_SHARED (set by --shared) or
+        # PERLA_BUILD_PM_SO=1 (explicit override). PERLA_EVAL_CC=tcc
+        # uses tcc for the .so step — about 10x faster than gcc and
+        # plenty for short eval-STRING bodies that get dlopen'd once
+        # and never optimised.
+        my int $build_so = 0;
+        if (core::getenv("PERLA_SHARED") eq "1") { $build_so = 1; }
+        if (core::getenv("PERLA_BUILD_PM_SO") eq "1") { $build_so = 1; }
+        if ($so_only == 1) { $build_so = 1; }
+        if ($build_so == 1) {
+            my str $so_cc = _cc_bin();
+            my str $so_flags = _cc_opt_flags_for($c_file);
+            my str $so_extra = "";
+            if (length($eval_cc) > 0) {
+                $so_cc = $eval_cc;
+                # tcc doesn't grok all of gcc's -O/-march flags; keep
+                # the warning suppression but drop optimisation. Also
+                # define STRADA_NO_TLS — strada_runtime.h uses
+                # __thread by default and tcc rejects it.
+                $so_flags = "-w";
+                $so_extra = " -DSTRADA_NO_TLS";
+            }
+            my str $cmd_so = $so_cc . " " . $so_flags . " -shared -fPIC -o " . $so_file . " " . $c_file . $inc_flags . $so_extra . " 2>&1";
+            my str $gcc_out_so = _run_cc($cmd_so);
+            if (length($gcc_out_so) > 0) {
+                say(STDERR, $gcc_out_so);
+            }
+        }
+
+        # Clean up C file (kept under --keep or PERLA_DEBUG for post-
+        # mortem inspection when gcc fails).
+        if ($keep_c == 1 || core::getenv("PERLA_DEBUG") eq "1") {
+            say(STDERR, "[perla] kept C file: " . $c_file);
+        } else {
+            core::unlink($c_file);
+        }
+
+        my str $init_name = "perla_mod_init_" . replace_all($mod_name, "::", "_");
+        my int $ok = 0;
+        if (core::file_exists($o_file) == 1) {
+            say("Compiled " . $o_file . " (module: " . $mod_name . ", init: " . $init_name . ")");
+            $ok = 1;
+        }
+        if (core::file_exists($so_file) == 1) {
+            say("Compiled " . $so_file . " (module: " . $mod_name . ", init: " . $init_name . ")");
+            $ok = 1;
+        }
+        if ($ok == 0) {
+            say("Error: compilation failed for " . $mod_name);
+            return 1;
+        }
+
+        return 0;
+    }
+
+    # --- Strada/VM mode ---
+    if ($vm_mode == 1 || $strada_only == 1) {
+        my str $source = core::slurp($input);
+
+        # Build lib paths from config, env, and CLI -I flags
+        my scalar $lib_paths = _build_lib_paths($input, $config);
+        # Prepend CLI -I paths (highest priority)
+        my int $eli = scalar(@extra_lib_paths) - 1;
+        while ($eli >= 0) {
+            unshift(@{$lib_paths}, $extra_lib_paths[$eli]);
+            $eli--;
+        }
+
+        # Lex, parse, generate Strada
+        my array @tokens = Perla::Lexer::lex($source);
+        my scalar $ast = Perla::Parser::parse_with_file_context(@tokens, $lib_paths, {}, $input);
+        my str $strada_code = Perla::StradaGen::generate($ast);
+
+        if ($strada_only == 1) {
+            # Just output the Strada source
+            if ($output ne "") {
+                core::spew($output, $strada_code);
+                say("Generated " . $output);
+            } else {
+                print($strada_code);
+            }
+            return 0;
+        }
+
+        # VM mode: compile Strada code to native and run
+        my str $strada_dir = _detect_strada_dir();
+
+        my str $tmp_base = "/tmp/perla_vm_" . core::getpid();
+        my str $tmp_strada = $tmp_base . ".strada";
+        my str $tmp_c = $tmp_base . ".c";
+        my str $tmp_exe = $tmp_base;
+
+        core::spew($tmp_strada, $strada_code);
+
+        # Check if any precompiled modules are used (need perla runtime linked)
+        my int $has_precompiled = 0;
+        if (index($strada_code, "# precompiled module:") >= 0) {
+            $has_precompiled = 1;
+        }
+
+        if ($has_precompiled == 1) {
+            # Compile Strada to C via stradac, then link with perla runtime
+            my str $stradac = $strada_dir . "/stradac";
+            my str $compile_cmd = $stradac . " " . $tmp_strada . " " . $tmp_c . " 2>&1";
+            my str $stradac_out = core::qx($compile_cmd);
+            if (length($stradac_out) > 0) {
+                say(STDERR, $stradac_out);
+            }
+
+            if (core::file_exists($tmp_c) != 1) {
+                say(STDERR, "Error: Strada compilation failed");
+                core::unlink($tmp_strada);
+                return 1;
+            }
+
+            # Link with perla runtime so .so modules can resolve stash symbols
+            my str $runtime_dir = _strada_rt_dir();
+            my str $perla_rt_dir = _perla_rt_dir();
+            my str $strada_base = _strada_base_dir();
+            my str $perla_runtime = $perla_rt_dir . "/perla_stash.c";
+            my str $runtime_src = $runtime_dir . "/strada_runtime.c";
+            my str $dbi_src = $perla_rt_dir . "/perla_dbi.c";
+            my str $dbi_flags = "";
+            if (core::file_exists($dbi_src) == 1) {
+                $dbi_flags = " " . $dbi_src . " -lmysqlclient";
+            }
+            my str $pcre2_flags = "";
+            my str $pcre2_lib = $strada_base . "/vendor/pcre2/libpcre2-8.a";
+            if (core::file_exists($pcre2_lib) == 1) {
+                $pcre2_flags = " -DHAVE_PCRE2 -DPCRE2_STATIC -I" . $strada_base . "/vendor/pcre2/src " . $pcre2_lib;
+            }
+
+            my str $gcc_cmd = _cc_bin() . " " . _cc_opt_flags_for($tmp_c) . " -o " . $tmp_exe . " " . $tmp_c . " " . $perla_runtime . " " . $runtime_src . $dbi_flags . " -I" . $runtime_dir . " -I" . $perla_rt_dir . " -rdynamic -ldl -lm -lpthread -lssl -lcrypto" . $pcre2_flags . " 2>&1";
+            my str $gcc_out = _run_cc($gcc_cmd);
+            if (length($gcc_out) > 0) {
+                say(STDERR, $gcc_out);
+            }
+
+            core::unlink($tmp_c);
+            core::unlink($tmp_strada);
+
+            if (core::file_exists($tmp_exe) != 1) {
+                say(STDERR, "Error: gcc compilation failed");
+                return 1;
+            }
+
+            my int $ret = core::system($tmp_exe);
+            core::unlink($tmp_exe);
+            return $ret;
+        } else {
+            # No precompiled modules - use standard strada interpreter
+            my str $interp = $strada_dir . "/interpreter/strada-interp";
+            my str $compiled = $strada_dir . "/strada";
+
+            my int $ret = 0;
+            if (core::file_exists($interp) == 1) {
+                $ret = core::system($interp . " " . $tmp_strada);
+            } else {
+                $ret = core::system($compiled . " -r " . $tmp_strada);
+            }
+            core::unlink($tmp_strada);
+            return $ret;
+        }
+    }
+
+    # --- C compilation mode (default) ---
+
+    # Determine base name (strip .pl/.pm)
+    my str $base = $input;
+    if (index($base, ".pl") >= 0) {
+        $base = replace($base, "\\.pl$", "");
+    } elsif (index($base, ".pm") >= 0) {
+        $base = replace($base, "\\.pm$", "");
+    }
+
+    # Generate C output path
+    my str $c_file = $base . ".c";
+    if ($c_only == 1 && length($output) > 0) {
+        $c_file = $output;
+    }
+
+    # Scan for XS files before compilation
+    my str $input_dir2 = ".";
+    my int $sp2 = -1;
+    my int $si3 = 0;
+    while ($si3 < length($input)) {
+        if (substr($input, $si3, 1) eq "/") { $sp2 = $si3; }
+        $si3++;
+    }
+    if ($sp2 >= 0) { $input_dir2 = substr($input, 0, $sp2); }
+
+    my str $xs_first_file = _find_xs_file($input_dir2);
+
+    # Build lib paths with CLI -I flags
+    my scalar $lib_paths = _build_lib_paths($input, $config);
+    my int $eli = scalar(@extra_lib_paths) - 1;
+    while ($eli >= 0) {
+        unshift(@{$lib_paths}, $extra_lib_paths[$eli]);
+        $eli--;
+    }
+
+    # --debug: dump the compile-time library search path at startup so
+    # users can see exactly where Perla will look for `use` / `require`
+    # sources before per-module trace lines start firing.
+    if (core::getenv("PERLA_DEBUG") eq "1") {
+        say(STDERR, "[perla] compile-time lib paths (" . scalar(@{$lib_paths}) . "):");
+        my int $__lpi = 0;
+        while ($__lpi < scalar(@{$lib_paths})) {
+            say(STDERR, "[perla]   [" . $__lpi . "] " . $lib_paths->[$__lpi]);
+            $__lpi++;
+        }
+    }
+
+    # Compile Perl to C
+    my str $source = core::slurp($input);
+    my str $code = _compile_with_xs_lib($source, $input, $xs_first_file, $c_file, $lib_paths);
+
+    # Post-process: fix captured variable declarations in closures
+    $code = _fix_closure_captures($code);
+
+    # Post-process: fix 'continue' outside loops (from grep blocks)
+    # and variable redefinitions in foreach loops
+    $code = _fix_codegen_edge_cases($code);
+
+    core::spew($c_file, $code);
+
+    if ($c_only == 1) {
+        say("Generated " . $c_file);
+        return 0;
+    }
+
+    # Determine executable name
+    my str $exe = $base;
+    if (length($output) > 0) { $exe = $output; }
+
+    # Find strada root (where runtime/ lives)
+    # The perla binary is at perla/perla, so go up one level
+    my str $strada_dir = _detect_strada_dir();
+
+    # XS C files to link
+    my str $xs_c_files = _xs_c_file_arg(length($xs_first_file) > 0, $c_file);
+    my str $xs_extra_libs = "";
+    my str $input_dir = ".";
+    my int $slash_pos2 = -1;
+    my int $si2 = 0;
+    while ($si2 < length($input)) {
+        if (substr($input, $si2, 1) eq "/") { $slash_pos2 = $si2; }
+        $si2++;
+    }
+    if ($slash_pos2 >= 0) { $input_dir = substr($input, 0, $slash_pos2); }
+
+    # Extract precompiled .o files from the generated C, then resolve transitive deps
+    my str $precompiled_objs = "";
+    my int $link_pos = index($code, "/* PERLA_LINK_OBJECTS:");
+    if ($link_pos >= 0) {
+        my int $link_end = index($code, " */", $link_pos);
+        if ($link_end > $link_pos) {
+            $precompiled_objs = substr($code, $link_pos + 22, $link_end - $link_pos - 22);
+        }
+    }
+    # Transitively resolve .deps files for each .o
+    if (length(trim($precompiled_objs)) > 0) {
+        my hash %seen_objs = ();
+        my array @obj_list = split(" ", trim($precompiled_objs));
+        my int $qi = 0;
+        while ($qi < scalar(@obj_list)) {
+            my str $obj = trim($obj_list[$qi]);
+            if (length($obj) > 0 && !exists($seen_objs{$obj})) {
+                $seen_objs{$obj} = 1;
+                # Check for .deps file (e.g., Foo.pm.o -> Foo.pm.deps)
+                my str $deps_path = replace_all($obj, ".pm.o", ".pm.deps");
+                if (core::file_exists($deps_path) == 1) {
+                    my str $deps_content = trim(core::slurp($deps_path));
+                    if (length($deps_content) > 0) {
+                        my array @dep_objs = split(" ", $deps_content);
+                        my int $di = 0;
+                        while ($di < scalar(@dep_objs)) {
+                            my str $dep = trim($dep_objs[$di]);
+                            if (length($dep) > 0) {
+                                # Older .pm.deps may contain paths relative
+                                # to the cwd at .pm compile time, which often
+                                # doesn't match the cwd of the consuming
+                                # link. Try realpath as-is first; if that
+                                # fails, drop the entry — a stale or
+                                # cross-tree reference (e.g. compiled in
+                                # ./lib/ but the .pm.o was never built in
+                                # this tree) would otherwise wedge ld with
+                                # "cannot find ./X.pm.o". Runtime require
+                                # will pick up the module on demand if it's
+                                # actually needed.
+                                my str $dep_abs = "" . core::realpath($dep);
+                                if (length($dep_abs) == 0) {
+                                    if (core::getenv("PERLA_DEBUG") eq "1") {
+                                        say(STDERR, "[perla] .pm.deps entry skipped (unresolvable): " . $dep . " (from " . $deps_path . ")");
+                                    }
+                                    $di++;
+                                    next;
+                                }
+                                $dep = $dep_abs;
+                                if (!exists($seen_objs{$dep})) {
+                                    push(@obj_list, $dep);
+                                }
+                            }
+                            $di++;
+                        }
+                    }
+                }
+            }
+            $qi++;
+        }
+        # Rebuild the full .o list
+        $precompiled_objs = "";
+        my array @final_objs = keys(%seen_objs);
+        my int $fi2 = 0;
+        while ($fi2 < scalar(@final_objs)) {
+            $precompiled_objs = $precompiled_objs . " " . $final_objs[$fi2];
+            $fi2++;
+        }
+    }
+    # Choose compiler: GCC for -o (production), TCC for run mode (fast)
+    my str $cc = "";
+    if (length($cc_override) > 0) {
+        $cc = $cc_override;
+    } elsif (length($output) > 0) {
+        $cc = "gcc";  # Production builds (-o) always use GCC
+    } else {
+        $cc = _detect_cc();  # Run mode: prefer TCC
+    }
+
+    # TCC header swap is no longer needed - strada_runtime.h compiles with
+    # tcc given -DSTRADA_NO_TLS / -DHAVE_PCRE2 (see _compile_c). Using
+    # perla_tcc.h instead breaks OOP under tcc, so we leave strada_runtime.h
+    # in place.
+
+    my str $compile_out = _compile_c($c_file, $exe, $strada_dir, $cc, $xs_c_files . $precompiled_objs);
+    if (length($compile_out) > 0) {
+        say(STDERR, $compile_out);
+    }
+
+    # Clean up generated C file - unless --keep was passed (or we're in -c
+    # mode, where the C file IS the output).
+    if ($keep_c == 1) {
+        say(STDERR, "[perla] kept C file: " . $c_file);
+    } else {
+        core::unlink($c_file);
+    }
+
+    if (length($output) > 0) {
+        # -o mode: keep the executable
+        say("Compiled " . $exe);
+        return 0;
+    }
+
+    # Run mode: execute and clean up, passing script args
+    # Set PERLA_PATH and STRADA_DIR for runtime eval/require.
+    #
+    # `core::system($run_cmd)` shells out via /bin/sh -c. A bare exe
+    # name like "perlam" (no slash) would be PATH-searched and fail with
+    # "perlam: not found" because `.` isn't on PATH by default. Prefix
+    # with `./` so the shell resolves it relative to cwd.
+    my str $exe_path = $exe;
+    if (index($exe_path, "/") < 0) {
+        $exe_path = "./" . $exe_path;
+    }
+    my str $perla_exe_path = "";
+    __C__ {
+        char buf[1024];
+        ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+        if (len > 0) { buf[len] = '\0'; strada_decref(perla_exe_path); perla_exe_path = strada_new_str(buf); }
+    }
+    if (length($perla_exe_path) > 0) {
+        my str $run_cmd = "PERLA_PATH=" . $perla_exe_path . " STRADA_DIR=" . $strada_dir . " " . $exe_path;
+        my int $ai = 0;
+        while ($ai < scalar(@script_args)) {
+            $run_cmd = $run_cmd . " " . $script_args[$ai];
+            $ai++;
+        }
+        my int $ret = core::system($run_cmd);
+        core::unlink($exe);
+        if (length($eval_code) > 0) { core::unlink($input); }
+        return $ret;
+    }
+    my str $run_cmd = $exe_path;
+    my int $ai = 0;
+    while ($ai < scalar(@script_args)) {
+        $run_cmd = $run_cmd . " " . $script_args[$ai];
+        $ai++;
+    }
+    my int $ret = core::system($run_cmd);
+    core::unlink($exe);
+    # Clean up -e temp file if used
+    if (length($eval_code) > 0) {
+        core::unlink($input);
+    }
+    return $ret;
+}

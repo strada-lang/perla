@@ -1,0 +1,2393 @@
+# Perla Lexer - Tokenizes Perl 5 source code
+#
+# Produces an array of token hashes, each with:
+#   type  - Token type string (e.g., "SCALAR_VAR", "STRING", "LBRACE")
+#   value - Token text
+#   line  - Source line number
+
+package Perla::Lexer;
+
+func lex(str $source) array {
+    my array @tokens = ();
+    my int $len = length($source);
+    my hash %lx = ();
+    $lx{"src"} = $source;
+    $lx{"pos"} = 0;
+    $lx{"len"} = $len;
+    $lx{"line"} = 1;
+
+    while ($lx{"pos"} < $len) {
+        my int $pos = $lx{"pos"};
+        my str $ch = substr($source, $pos, 1);
+
+        # Newlines
+        if ($ch eq "\n") {
+            $lx{"line"} = $lx{"line"} + 1;
+            $lx{"pos"} = $pos + 1;
+            next;
+        }
+
+        # Whitespace
+        if ($ch eq " " || $ch eq "\t" || $ch eq "\r") {
+            $lx{"pos"} = $pos + 1;
+            next;
+        }
+
+        # Comments
+        if ($ch eq "#") {
+            while ($lx{"pos"} < $len && substr($source, $lx{"pos"}, 1) ne "\n") {
+                $lx{"pos"} = $lx{"pos"} + 1;
+            }
+            next;
+        }
+
+        # POD - skip =command ... =cut blocks. A line starting with `=`
+        # immediately followed by an ASCII letter begins a POD block — this is
+        # Perl's actual rule (=pod, =head1-4, =over, =item, =back, =begin,
+        # =end, =for, =encoding, =cut all qualify). The previous code matched a
+        # fixed set of 5-char prefixes where `=pod `/`=for ` required a TRAILING
+        # SPACE, so a bare `=pod\n` (very common — e.g. File::Temp's trailing
+        # POD) was lexed as code (`= pod ...`), desyncing the parser and
+        # cascading into a bogus "Global symbol $X requires explicit package
+        # name". `=` at statement-start followed by a letter is never valid
+        # Perl code (`==`/`=>`/`=~`/`= expr` all have a non-letter next char),
+        # so this is unambiguous.
+        if ($ch eq "=" && ($pos == 0 || ($pos > 0 && substr($source, $pos - 1, 1) eq "\n"))) {
+            if ($pos + 1 < $len) {
+                my str $pod_c1 = substr($source, $pos + 1, 1);
+                if (($pod_c1 ge "a" && $pod_c1 le "z") || ($pod_c1 ge "A" && $pod_c1 le "Z")) {
+                    # Skip until =cut
+                    while ($lx{"pos"} < $len) {
+                        if (substr($source, $lx{"pos"}, 1) eq "\n") {
+                            $lx{"line"} = $lx{"line"} + 1;
+                            if ($lx{"pos"} + 5 < $len && substr($source, $lx{"pos"} + 1, 4) eq "=cut") {
+                                $lx{"pos"} = $lx{"pos"} + 1;
+                                while ($lx{"pos"} < $len && substr($source, $lx{"pos"}, 1) ne "\n") {
+                                    $lx{"pos"} = $lx{"pos"} + 1;
+                                }
+                                last;
+                            }
+                        }
+                        $lx{"pos"} = $lx{"pos"} + 1;
+                    }
+                    next;
+                }
+            }
+        }
+
+        # A leading-dot float (`.5`) only starts a number when the previous
+        # token is NOT itself a number — after a number, `.` is the concat
+        # operator (`5 . 3` -> "53"). This matters for hex/oct/bin ints,
+        # which are emitted as a separate INT token: `0x10.8` is `16 . 8`
+        # ("168"), not the float 16.8 (hex ints have no fractional form).
+        my int $dot_is_num_start = 1;
+        if ($ch eq "." && scalar(@tokens) > 0) {
+            my str $ptt = $tokens[scalar(@tokens) - 1]->{"type"};
+            if ($ptt eq "INT" || $ptt eq "NUM") { $dot_is_num_start = 0; }
+        }
+        # Numbers
+        if (($ch ge "0" && $ch le "9") || ($ch eq "." && $dot_is_num_start == 1 && $pos + 1 < $len && substr($source, $pos + 1, 1) ge "0" && substr($source, $pos + 1, 1) le "9")) {
+            my int $start = $pos;
+            my int $is_float = 0;
+            # Hex
+            if ($ch eq "0" && $pos + 1 < $len && (substr($source, $pos + 1, 1) eq "x" || substr($source, $pos + 1, 1) eq "X")) {
+                # Convert hex digits to a decimal/float token. For values
+                # that fit i64, emit INT with the decimal form so the
+                # codegen's overflow detection works (it compares
+                # decimal digit count vs i64 bounds). For values that
+                # exceed i64 (e.g. 0x8000000000000000 == 2^63), accumulate
+                # as double and emit NUM. Mirrors Perl's "huge hex →
+                # float" promotion.
+                my int $hpos = $pos + 2;
+                my int $hfit = 1;
+                my int $hval = 0;
+                my num $hdbl = 0.0;
+                while ($hpos < $len) {
+                    my str $hc = substr($source, $hpos, 1);
+                    my int $hd = -1;
+                    if ($hc ge "0" && $hc le "9") { $hd = char_at($hc, 0) - 48; }
+                    elsif ($hc ge "a" && $hc le "f") { $hd = char_at($hc, 0) - 97 + 10; }
+                    elsif ($hc ge "A" && $hc le "F") { $hd = char_at($hc, 0) - 65 + 10; }
+                    elsif ($hc eq "_") { $hpos = $hpos + 1; next; }
+                    else { last; }
+                    if ($hfit == 1) {
+                        # Check if hval * 16 + hd would overflow i64 max (assume
+                        # tagged-int domain is safe up to 4611686018427387903).
+                        if ($hval > 576460752303423487) {
+                            # Would exceed 2^62 - 1 after shift; fall back to double.
+                            $hfit = 0;
+                            $hdbl = 0.0 + $hval;
+                        }
+                    }
+                    if ($hfit == 1) {
+                        $hval = $hval * 16 + $hd;
+                    } else {
+                        $hdbl = $hdbl * 16.0 + (0.0 + $hd);
+                    }
+                    $hpos = $hpos + 1;
+                }
+                # Hexadecimal floating-point literal (Perl/C99 0x1.8p3 form).
+                # A hex-float REQUIRES a 'p'/'P' binary exponent; `0x10.8`
+                # WITHOUT a 'p' is a hex-int followed by `.` (concat), so we
+                # only treat it as a float when a valid `p[+-]digits` follows.
+                my int $is_hexfloat = 0;
+                my int $frac_start = -1;
+                my int $exp_at = -1;
+                {
+                    my int $sc = $hpos;
+                    if ($sc < $len && substr($source, $sc, 1) eq ".") {
+                        $frac_start = $sc + 1;
+                        my int $s2 = $sc + 1;
+                        while ($s2 < $len) {
+                            my str $fc = substr($source, $s2, 1);
+                            if (($fc ge "0" && $fc le "9") || ($fc ge "a" && $fc le "f") || ($fc ge "A" && $fc le "F") || $fc eq "_") { $s2 = $s2 + 1; }
+                            else { last; }
+                        }
+                        if ($s2 < $len && (substr($source, $s2, 1) eq "p" || substr($source, $s2, 1) eq "P")) {
+                            $exp_at = $s2; $is_hexfloat = 1;
+                        }
+                    } elsif ($sc < $len && (substr($source, $sc, 1) eq "p" || substr($source, $sc, 1) eq "P")) {
+                        $exp_at = $sc; $is_hexfloat = 1;
+                    }
+                    if ($is_hexfloat == 1) {
+                        my int $ep = $exp_at + 1;
+                        if ($ep < $len && (substr($source, $ep, 1) eq "+" || substr($source, $ep, 1) eq "-")) { $ep = $ep + 1; }
+                        if (!($ep < $len && substr($source, $ep, 1) ge "0" && substr($source, $ep, 1) le "9")) { $is_hexfloat = 0; }
+                    }
+                }
+                if ($is_hexfloat == 1) {
+                    my num $mant = 0.0;
+                    if ($hfit == 1) { $mant = 0.0 + $hval; } else { $mant = $hdbl; }
+                    if ($frac_start >= 0) {
+                        my num $scale = 1.0 / 16.0;
+                        my int $fp = $frac_start;
+                        while ($fp < $len) {
+                            my str $fc = substr($source, $fp, 1);
+                            my int $fd = -1;
+                            if ($fc ge "0" && $fc le "9") { $fd = char_at($fc, 0) - 48; }
+                            elsif ($fc ge "a" && $fc le "f") { $fd = char_at($fc, 0) - 97 + 10; }
+                            elsif ($fc ge "A" && $fc le "F") { $fd = char_at($fc, 0) - 65 + 10; }
+                            elsif ($fc eq "_") { $fp = $fp + 1; next; }
+                            else { last; }
+                            $mant = $mant + (0.0 + $fd) * $scale;
+                            $scale = $scale / 16.0;
+                            $fp = $fp + 1;
+                        }
+                    }
+                    my int $ep = $exp_at + 1;
+                    my int $eneg = 0;
+                    if ($ep < $len && (substr($source, $ep, 1) eq "+" || substr($source, $ep, 1) eq "-")) {
+                        if (substr($source, $ep, 1) eq "-") { $eneg = 1; }
+                        $ep = $ep + 1;
+                    }
+                    my int $eval = 0;
+                    while ($ep < $len && substr($source, $ep, 1) ge "0" && substr($source, $ep, 1) le "9") {
+                        $eval = $eval * 10 + (char_at(substr($source, $ep, 1), 0) - 48);
+                        $ep = $ep + 1;
+                    }
+                    my num $factor = 1.0;
+                    my int $ei = 0;
+                    while ($ei < $eval) { $factor = $factor * 2.0; $ei = $ei + 1; }
+                    my num $val = 0.0;
+                    if ($eneg == 1) { $val = $mant / $factor; } else { $val = $mant * $factor; }
+                    $lx{"pos"} = $ep;
+                    push(@tokens, _tok("NUM", "" . $val, $lx{"line"}));
+                    next;
+                }
+                $lx{"pos"} = $hpos;
+                if ($hfit == 1) {
+                    push(@tokens, _tok("INT", "" . $hval, $lx{"line"}));
+                } else {
+                    push(@tokens, _tok("NUM", "" . $hdbl, $lx{"line"}));
+                }
+                next;
+            } elsif ($ch eq "0" && $pos + 1 < $len && (substr($source, $pos + 1, 1) eq "b" || substr($source, $pos + 1, 1) eq "B")) {
+                # Binary: 0b... — convert to decimal so the C codegen
+                # doesn't have to handle binary literals.
+                my int $bpos = $pos + 2;
+                my int $bval = 0;
+                while ($bpos < $len) {
+                    my str $bc = substr($source, $bpos, 1);
+                    if ($bc eq "0") { $bval = $bval * 2; $bpos = $bpos + 1; }
+                    elsif ($bc eq "1") { $bval = $bval * 2 + 1; $bpos = $bpos + 1; }
+                    elsif ($bc eq "_") { $bpos = $bpos + 1; }
+                    else { last; }
+                }
+                $lx{"pos"} = $bpos;
+                push(@tokens, _tok("INT", "" . $bval, $lx{"line"}));
+                next;
+            } elsif ($ch eq "0" && $pos + 1 < $len && (substr($source, $pos + 1, 1) eq "o" || substr($source, $pos + 1, 1) eq "O")) {
+                # Octal with explicit `0o` prefix (Perl 5.34+). Without this
+                # `0o77` parsed as the literal `0` followed by an identifier
+                # `o77`, so `print 0o77` printed 0.
+                my int $opos = $pos + 2;
+                my int $oval = 0;
+                while ($opos < $len) {
+                    my str $oc = substr($source, $opos, 1);
+                    if ($oc ge "0" && $oc le "7") { $oval = $oval * 8 + (char_at($oc, 0) - 48); $opos = $opos + 1; }
+                    elsif ($oc eq "_") { $opos = $opos + 1; }
+                    else { last; }
+                }
+                $lx{"pos"} = $opos;
+                push(@tokens, _tok("INT", "" . $oval, $lx{"line"}));
+                next;
+            } else {
+                $lx{"pos"} = $pos;
+                while ($lx{"pos"} < $len) {
+                    my str $nc = substr($source, $lx{"pos"}, 1);
+                    if ($nc ge "0" && $nc le "9" || $nc eq "_") {
+                        $lx{"pos"} = $lx{"pos"} + 1;
+                    } elsif ($nc eq "." && $is_float == 0) {
+                        # Don't consume . if next char is also . (range operator ..)
+                        if ($lx{"pos"} + 1 < $len && substr($source, $lx{"pos"} + 1, 1) eq ".") {
+                            last;
+                        }
+                        $is_float = 1;
+                        $lx{"pos"} = $lx{"pos"} + 1;
+                    } elsif (($nc eq "e" || $nc eq "E") && $lx{"pos"} + 1 < $len) {
+                        # Only consume `e`/`E` if a digit-or-sign follows.
+                        # Otherwise it's the start of an identifier (e.g.
+                        # `1 == 1 ? "even" : "odd"` would have lexed `1e` if
+                        # not careful). Set $is_float so the downstream emit
+                        # uses NUM (strtod-parsable) rather than INT (strtoll
+                        # truncates 1e-10 to "1" and emits int 1).
+                        my int $check_pos = $lx{"pos"} + 1;
+                        my int $valid_exp = 0;
+                        if ($check_pos < $len) {
+                            my str $cc1 = substr($source, $check_pos, 1);
+                            if ($cc1 ge "0" && $cc1 le "9") { $valid_exp = 1; }
+                            elsif (($cc1 eq "+" || $cc1 eq "-") && $check_pos + 1 < $len) {
+                                my str $cc2 = substr($source, $check_pos + 1, 1);
+                                if ($cc2 ge "0" && $cc2 le "9") { $valid_exp = 1; }
+                            }
+                        }
+                        if ($valid_exp == 0) { last; }
+                        $is_float = 1;
+                        $lx{"pos"} = $lx{"pos"} + 1;
+                        if ($lx{"pos"} < $len && (substr($source, $lx{"pos"}, 1) eq "+" || substr($source, $lx{"pos"}, 1) eq "-")) {
+                            $lx{"pos"} = $lx{"pos"} + 1;
+                        }
+                    } else { last; }
+                }
+            }
+            my str $numstr = substr($source, $start, $lx{"pos"} - $start);
+            # Strip Perl-style underscores from number literals (1_000_000 → 1000000)
+            my str $clean_num = replace_all($numstr, "_", "");
+            my int $line = $lx{"line"};
+            # V-string literal: if the next char is another `.` followed by a
+            # digit, this is `N.N.N[...]` — a Perl version literal. Consume
+            # the rest and emit as a STRING token. Real Perl encodes these as
+            # raw-byte strings (chr(5).chr(42).chr(0) for 5.42.0); here we
+            # emit the dotted text form so `$^V eq 5.42.0` lines up with
+            # `$^V = "5.42.0"`. Perl's `%vd` sprintf format would need
+            # separate handling but that code path is rare.
+            if ($is_float == 1 && $lx{"pos"} + 1 < $len &&
+                substr($source, $lx{"pos"}, 1) eq "." &&
+                substr($source, $lx{"pos"} + 1, 1) ge "0" &&
+                substr($source, $lx{"pos"} + 1, 1) le "9") {
+                while ($lx{"pos"} < $len) {
+                    my str $vc = substr($source, $lx{"pos"}, 1);
+                    if (($vc ge "0" && $vc le "9") || $vc eq "." || $vc eq "_") {
+                        $lx{"pos"} = $lx{"pos"} + 1;
+                    } else { last; }
+                }
+                my str $vstr = replace_all(substr($source, $start, $lx{"pos"} - $start), "_", "");
+                push(@tokens, _tok("STRING", $vstr, $line));
+                next;
+            }
+            if ($is_float == 1) {
+                push(@tokens, _tok("NUM", $clean_num, $line));
+            } else {
+                push(@tokens, _tok("INT", $clean_num, $line));
+            }
+            next;
+        }
+
+        # Strings: single-quoted
+        if ($ch eq "'") {
+            my str $s = _read_sq(\%lx);
+            push(@tokens, _tok("STRING", $s, $lx{"line"}));
+            next;
+        }
+
+        # Backtick command: `command`
+        if ($ch eq "`") {
+            $lx{"pos"} = $pos + 1;
+            my str $cmd = "";
+            while ($lx{"pos"} < $len && substr($source, $lx{"pos"}, 1) ne "`") {
+                $cmd = $cmd . substr($source, $lx{"pos"}, 1);
+                $lx{"pos"} = $lx{"pos"} + 1;
+            }
+            if ($lx{"pos"} < $len) { $lx{"pos"} = $lx{"pos"} + 1; }
+            push(@tokens, _tok("BACKTICK", $cmd, $lx{"line"}));
+            next;
+        }
+
+        # Strings: double-quoted
+        if ($ch eq "\"") {
+            my str $s = _read_dq(\%lx);
+            push(@tokens, _tok("DQSTRING", $s, $lx{"line"}));
+            next;
+        }
+
+        # Sigiled variables
+        if ($ch eq "$") {
+            # Postfix deref `->$*` (5.24+). Only emit after ARROW.
+            # Bare `$*` would otherwise lex as SCALAR_VAR (legacy "$*"
+            # multi-line-regex variable) — fine in non-arrow positions.
+            if ($pos + 1 < $len && scalar(@tokens) > 0
+                && $tokens[scalar(@tokens) - 1]->{"type"} eq "ARROW") {
+                my str $nc = substr($source, $pos + 1, 1);
+                if ($nc eq "*") {
+                    push(@tokens, _tok("POSTFIX_DEREF_SCALAR", "\$*", $lx{"line"}));
+                    $lx{"pos"} = $pos + 2;
+                    next;
+                }
+                # Postfix deref `->$#*` (5.24+): last index of the deref'd
+                # array, i.e. `$#{$ref}`. Must be checked before the general
+                # `$#array` handling below.
+                if ($nc eq "#" && $pos + 2 < $len && substr($source, $pos + 2, 1) eq "*") {
+                    push(@tokens, _tok("POSTFIX_DEREF_LASTIDX", "\$#*", $lx{"line"}));
+                    $lx{"pos"} = $pos + 3;
+                    next;
+                }
+            }
+            # $#array — last index of array
+            if ($pos + 1 < $len && substr($source, $pos + 1, 1) eq "#") {
+                my int $name_start = $pos + 2;
+                my int $name_end = $name_start;
+                # $#{ EXPR } — braced last-index-of expression
+                if ($name_start < $len && substr($source, $name_start, 1) eq "{") {
+                    push(@tokens, _tok("ARRAY_LAST_IDX_EXPR", "", $lx{"line"}));
+                    $lx{"pos"} = $name_start;  # leave { for parser to handle
+                    next;
+                }
+                # $#$ref — last index via scalar deref
+                if ($name_start < $len && substr($source, $name_start, 1) eq "$") {
+                    push(@tokens, _tok("ARRAY_LAST_IDX_DEREF", "", $lx{"line"}));
+                    $lx{"pos"} = $name_start;  # leave $ref for parser to handle
+                    next;
+                }
+                while ($name_end < $len && _is_ident_char(substr($source, $name_end, 1))) {
+                    $name_end++;
+                }
+                # `$#Pkg::name` — accept `::` segments so the last-index
+                # token covers the package-qualified array name. Without
+                # this we stopped at the first `:` and left `::arr` as
+                # trailing junk that broke parsing.
+                while ($name_end + 1 < $len && substr($source, $name_end, 2) eq "::") {
+                    $name_end = $name_end + 2;
+                    while ($name_end < $len && _is_ident_char(substr($source, $name_end, 1))) {
+                        $name_end = $name_end + 1;
+                    }
+                }
+                if ($name_end > $name_start) {
+                    my str $arr_name = substr($source, $name_start, $name_end - $name_start);
+                    push(@tokens, _tok("ARRAY_LAST_IDX", $arr_name, $lx{"line"}));
+                    $lx{"pos"} = $name_end;
+                    next;
+                }
+            }
+            # $^O, $^W, etc. — caret special variables
+            if ($pos + 2 < $len && substr($source, $pos + 1, 1) eq "^") {
+                my str $caret_ch = substr($source, $pos + 2, 1);
+                if ($caret_ch ge "A" && $caret_ch le "Z") {
+                    push(@tokens, _tok("SCALAR_VAR", "^" . $caret_ch, $lx{"line"}));
+                    $lx{"pos"} = $pos + 3;
+                    next;
+                }
+            }
+            # $] — Perl version variable
+            if ($pos + 1 < $len && substr($source, $pos + 1, 1) eq "]") {
+                push(@tokens, _tok("SCALAR_VAR", "]", $lx{"line"}));
+                $lx{"pos"} = $pos + 2;
+                next;
+            }
+            # ${expr} — scalar dereference of a ref expression.
+            # Distinct from ${ident} (same as $ident) — detect by checking
+            # whether the brace wraps just an identifier followed by `}`.
+            if ($pos + 1 < $len && substr($source, $pos + 1, 1) eq "{") {
+                # Peek inside the brace: if it looks like `${ident}` we still
+                # want SCALAR_VAR "ident"; if it's more complex we emit the
+                # deref-start token so the parser builds N_DEREF_SCALAR.
+                my int $scan = $pos + 2;
+                # Skip whitespace
+                while ($scan < $len && (substr($source, $scan, 1) eq " " || substr($source, $scan, 1) eq "\t")) { $scan++; }
+                my int $is_simple = 0;
+                if ($scan < $len && _is_ident_start(substr($source, $scan, 1))) {
+                    my int $idend = $scan + 1;
+                    while ($idend < $len && _is_ident_char(substr($source, $idend, 1))) { $idend++; }
+                    # Skip trailing whitespace before }
+                    my int $after = $idend;
+                    while ($after < $len && (substr($source, $after, 1) eq " " || substr($source, $after, 1) eq "\t")) { $after++; }
+                    if ($after < $len && substr($source, $after, 1) eq "}") {
+                        $is_simple = 1;
+                        push(@tokens, _tok("SCALAR_VAR", substr($source, $scan, $idend - $scan), $lx{"line"}));
+                        $lx{"pos"} = $after + 1;
+                    }
+                }
+                # ${^NAME} — magical control-character special variables
+                # (${^TAINT}, ${^GLOBAL_PHASE}, ${^UTF8CACHE}, ...). Emit as a
+                # SCALAR_VAR with a "^NAME" name so downstream code treats it
+                # as a normal (typically undef) scalar rather than failing to
+                # parse the braced form.
+                if ($is_simple == 0 && $scan < $len && substr($source, $scan, 1) eq "^") {
+                    my int $cstart = $scan + 1;
+                    my int $cend = $cstart;
+                    while ($cend < $len && _is_ident_char(substr($source, $cend, 1))) { $cend++; }
+                    if ($cend > $cstart) {
+                        my int $after_c = $cend;
+                        while ($after_c < $len && (substr($source, $after_c, 1) eq " " || substr($source, $after_c, 1) eq "\t")) { $after_c++; }
+                        if ($after_c < $len && substr($source, $after_c, 1) eq "}") {
+                            $is_simple = 1;
+                            push(@tokens, _tok("SCALAR_VAR", "^" . substr($source, $cstart, $cend - $cstart), $lx{"line"}));
+                            $lx{"pos"} = $after_c + 1;
+                        }
+                    }
+                }
+                if ($is_simple == 0) {
+                    my str $dmark = "$" . "{";
+                    push(@tokens, _tok("DEREF_SCALAR_START", $dmark, $lx{"line"}));
+                    $lx{"pos"} = $pos + 2;
+                }
+                next;
+            }
+            my str $tok = _read_sigil_var(\%lx, "$");
+            if (length($tok) > 0) {
+                push(@tokens, _tok("SCALAR_VAR", $tok, $lx{"line"}));
+                next;
+            }
+        }
+        if ($ch eq "@") {
+            # Postfix deref `->@*`, `->@[...]`, `->@{...}` (5.24+).
+            # Emit a single POSTFIX_DEREF token only when the previous
+            # token is ARROW so we don't accidentally interpret `@*` /
+            # `@[` / `@{` in other positions.
+            if ($pos + 1 < $len && scalar(@tokens) > 0
+                && $tokens[scalar(@tokens) - 1]->{"type"} eq "ARROW") {
+                my str $nc = substr($source, $pos + 1, 1);
+                if ($nc eq "*") {
+                    push(@tokens, _tok("POSTFIX_DEREF_ARRAY", "@*", $lx{"line"}));
+                    $lx{"pos"} = $pos + 2;
+                    next;
+                }
+                if ($nc eq "[") {
+                    push(@tokens, _tok("POSTFIX_ASLICE_LB", "@[", $lx{"line"}));
+                    $lx{"pos"} = $pos + 2;
+                    next;
+                }
+                if ($nc eq "{") {
+                    push(@tokens, _tok("POSTFIX_HSLICE_LB", "@{", $lx{"line"}));
+                    $lx{"pos"} = $pos + 2;
+                    next;
+                }
+            }
+            # @{expr} — array dereference
+            if ($pos + 1 < $len && substr($source, $pos + 1, 1) eq "{") {
+                push(@tokens, _tok("DEREF_ARRAY_START", "@{", $lx{"line"}));
+                $lx{"pos"} = $pos + 2;
+                next;
+            }
+            # @$ref — array deref of scalar
+            if ($pos + 1 < $len && substr($source, $pos + 1, 1) eq "$") {
+                $lx{"pos"} = $pos + 1;  # skip @, let $ be read next
+                push(@tokens, _tok("DEREF_ARRAY_SIGIL", "@", $lx{"line"}));
+                next;
+            }
+            my str $tok = _read_sigil_var(\%lx, "@");
+            if (length($tok) > 0) {
+                push(@tokens, _tok("ARRAY_VAR", $tok, $lx{"line"}));
+                next;
+            }
+            # Bare `@` with no var-name follower — emit OP("@") so the
+            # token is preserved in the stream. Used for sub-prototype
+            # parsing (`sub f (\@) {}` reads BACKSLASH + OP("@") and the
+            # proto collector stores `\@`). Without this, the bare `@`
+            # was silently dropped from the token stream and the
+            # collected proto string lost its `@` chars.
+            push(@tokens, _tok("OP", "@", $lx{"line"}));
+            $lx{"pos"} = $pos + 1;
+            next;
+        }
+        if ($ch eq "%") {
+            # Postfix deref `->%*`, `->%{...}` (5.24+). Same rationale
+            # as the `@*` case above — only after ARROW. Without this
+            # block `->%*` parsed as the modulus operator and crashed at
+            # runtime with "Illegal modulus zero".
+            if ($pos + 1 < $len && scalar(@tokens) > 0
+                && $tokens[scalar(@tokens) - 1]->{"type"} eq "ARROW") {
+                my str $nc = substr($source, $pos + 1, 1);
+                if ($nc eq "*") {
+                    push(@tokens, _tok("POSTFIX_DEREF_HASH", "%*", $lx{"line"}));
+                    $lx{"pos"} = $pos + 2;
+                    next;
+                }
+            }
+            # %{expr} — hash dereference (no whitespace between % and {).
+            if ($pos + 1 < $len && substr($source, $pos + 1, 1) eq "{") {
+                push(@tokens, _tok("DEREF_HASH_START", "%{", $lx{"line"}));
+                $lx{"pos"} = $pos + 2;
+                next;
+            }
+            # `% { EXPR }` (with whitespace) is also a hash deref in
+            # value position. CPAN DBIx::Class::Storage::DBI uses this
+            # as `( % { $args[3] || {} }, ... )`. Heuristic: only treat
+            # the whitespace-tolerant form as a deref if the previous
+            # token is one that opens an expression (LPAREN, LBRACE,
+            # LBRACKET, COMMA, FAT_ARROW, or an assignment operator).
+            # Otherwise leave it as modulo to keep `5 % {expr}` working.
+            my int $next_pos = $pos + 1;
+            while ($next_pos < $len) {
+                my str $sc = substr($source, $next_pos, 1);
+                if ($sc eq " " || $sc eq "\t") { $next_pos = $next_pos + 1; }
+                else { last; }
+            }
+            if ($next_pos > $pos + 1 && $next_pos < $len && substr($source, $next_pos, 1) eq "{") {
+                my int $is_value_pos = 0;
+                if (scalar(@tokens) == 0) { $is_value_pos = 1; }
+                else {
+                    my scalar $prev = $tokens[scalar(@tokens) - 1];
+                    my str $pt = $prev->{"type"};
+                    if ($pt eq "LPAREN" || $pt eq "LBRACE" || $pt eq "LBRACKET"
+                        || $pt eq "COMMA" || $pt eq "FAT_ARROW" || $pt eq "SEMI") {
+                        $is_value_pos = 1;
+                    }
+                    elsif ($pt eq "OP") {
+                        my str $pv = "" . $prev->{"value"};
+                        if ($pv eq "=" || $pv eq "==" || $pv eq "!=" || $pv eq "+="
+                            || $pv eq "-=" || $pv eq "*=" || $pv eq "/=" || $pv eq ".="
+                            || $pv eq "&&" || $pv eq "||" || $pv eq "//" || $pv eq "!"
+                            || $pv eq "..") {
+                            $is_value_pos = 1;
+                        }
+                    }
+                }
+                if ($is_value_pos == 1) {
+                    push(@tokens, _tok("DEREF_HASH_START", "%{", $lx{"line"}));
+                    $lx{"pos"} = $next_pos + 1;
+                    next;
+                }
+            }
+            # %$ref — hash deref of scalar.
+            # Only treat as the modulo operator when the previous token
+            # produces a value (RPAREN/RBRACE/RBRACKET/IDENT/var/literal).
+            # In every other position (including after KEYS/VALUES/EACH/
+            # SORT/MAP/GREP/RETURN/etc., or at start of expression),
+            # `%$ref` is a hash dereference.
+            # Without the modulo check, `($N-1)-(-($$val+1)%$N)`
+            # (Date::Manip::Base.pm) misparses; without the deref check,
+            # `keys %$val` breaks.
+            if ($pos + 1 < $len && substr($source, $pos + 1, 1) eq "$") {
+                my int $sigil_is_modulo = 0;
+                if (scalar(@tokens) > 0) {
+                    my scalar $sprev = $tokens[scalar(@tokens) - 1];
+                    my str $spt = $sprev->{"type"};
+                    my str $spv = $sprev->{"value"};
+                    if ($spt eq "RPAREN" || $spt eq "RBRACE" || $spt eq "RBRACKET"
+                        || $spt eq "IDENT" || $spt eq "SCALAR_VAR" || $spt eq "ARRAY_VAR"
+                        || $spt eq "HASH_VAR" || $spt eq "NUMBER" || $spt eq "STRING"
+                        || $spt eq "INTERP_STR" || $spt eq "ARRAY_ELEM"
+                        || $spt eq "HASH_ELEM") {
+                        $sigil_is_modulo = 1;
+                    }
+                    # IDENT keywords that take a list/hash and don't
+                    # behave as values themselves: `reverse %$h`,
+                    # `keys %$h`, `values %$h`, `each %$h`, `sort %$h`,
+                    # `map %$h`, `grep %$h`, `return %$h`, `print %$h`,
+                    # `say %$h`, `wantarray`, `delete`, `exists`, etc.
+                    # Without this, `reverse %$cond` in
+                    # DBIx::Class::ResultSource::_pk_depends_on parsed as
+                    # `reverse() % $cond`, emitting bogus
+                    # `strada_to_int() % strada_to_int(v_cond)` C and
+                    # killing the whole DBIC stash registration.
+                    if ($spt eq "IDENT" && ($spv eq "reverse" || $spv eq "keys"
+                            || $spv eq "values" || $spv eq "each" || $spv eq "sort"
+                            || $spv eq "map" || $spv eq "grep" || $spv eq "return"
+                            || $spv eq "print" || $spv eq "say" || $spv eq "warn"
+                            || $spv eq "die" || $spv eq "wantarray" || $spv eq "delete"
+                            || $spv eq "exists" || $spv eq "defined" || $spv eq "ref"
+                            || $spv eq "scalar" || $spv eq "join" || $spv eq "push"
+                            || $spv eq "unshift" || $spv eq "pop" || $spv eq "shift"
+                            || $spv eq "tied" || $spv eq "untie")) {
+                        $sigil_is_modulo = 0;
+                    }
+                }
+                if ($sigil_is_modulo == 1) {
+                    push(@tokens, _tok("OP", "%", $lx{"line"}));
+                    $lx{"pos"} = $pos + 1;
+                    next;
+                }
+                $lx{"pos"} = $pos + 1;
+                push(@tokens, _tok("DEREF_HASH_SIGIL", "%", $lx{"line"}));
+                next;
+            }
+            # `%-` and `%+` after a value-producing token are the
+            # modulo operator on a negative/positive number (or hash
+            # `%-` / `%+` named-capture in non-modulo positions).
+            # Without this disambiguation, `7%-3` lexed as
+            # `7 (HASH_VAR "-") 3` and the parser got confused —
+            # `7 %- 3` was reported as 7 (not -2) because the
+            # HASH_VAR "-" was treated as a no-op and `% 3` was lost.
+            if ($pos + 1 < $len) {
+                my str $next_ch = substr($source, $pos + 1, 1);
+                if ($next_ch eq "+" || $next_ch eq "-") {
+                    my int $sigil_is_mod = 0;
+                    if (scalar(@tokens) > 0) {
+                        my scalar $sprev2 = $tokens[scalar(@tokens) - 1];
+                        my str $spt2 = $sprev2->{"type"};
+                        if ($spt2 eq "RPAREN" || $spt2 eq "RBRACE" || $spt2 eq "RBRACKET"
+                            || $spt2 eq "IDENT" || $spt2 eq "SCALAR_VAR" || $spt2 eq "ARRAY_VAR"
+                            || $spt2 eq "HASH_VAR" || $spt2 eq "INT" || $spt2 eq "FLOAT"
+                            || $spt2 eq "STRING" || $spt2 eq "INTERP_STR"
+                            || $spt2 eq "ARRAY_ELEM" || $spt2 eq "HASH_ELEM") {
+                            $sigil_is_mod = 1;
+                        }
+                    }
+                    if ($sigil_is_mod == 1) {
+                        push(@tokens, _tok("OP", "%", $lx{"line"}));
+                        $lx{"pos"} = $pos + 1;
+                        next;
+                    }
+                }
+            }
+            my str $tok = _read_sigil_var(\%lx, "%");
+            if (length($tok) > 0) {
+                push(@tokens, _tok("HASH_VAR", $tok, $lx{"line"}));
+                next;
+            }
+        }
+
+        # v-string: `v1.2.3` → chr(1).chr(2).chr(3) literal.
+        # Detect `v` followed immediately by `\d+(\.\d+)*` (no ident
+        # chars between). Lex as STRING with the codepoint sequence.
+        # `vX` where X is not a digit falls through to normal ident.
+        # Skip when preceded by `->` or arrow context (could be a
+        # method name).
+        if ($ch eq "v" && $pos + 1 < $len) {
+            my str $__vnc = substr($source, $pos + 1, 1);
+            if ($__vnc ge "0" && $__vnc le "9") {
+                # Check we're not in arrow context (e.g. `->v1`)
+                my int $__vok = 1;
+                if (scalar(@tokens) > 0) {
+                    my str $__vpt = $tokens[scalar(@tokens) - 1]->{"type"};
+                    if ($__vpt eq "ARROW" || $__vpt eq "FAT_ARROW") { $__vok = 0; }
+                }
+                if ($__vok == 1) {
+                    my int $__vp = $pos + 1;
+                    my str $__vstr = "";
+                    my int $__vsaw_dot = 0;
+                    while ($__vp < $len) {
+                        # Read integer
+                        my int $__vnum = 0;
+                        my int $__vread = 0;
+                        while ($__vp < $len) {
+                            my str $__vc = substr($source, $__vp, 1);
+                            if ($__vc ge "0" && $__vc le "9") {
+                                $__vnum = $__vnum * 10 + ord($__vc) - ord("0");
+                                $__vp = $__vp + 1;
+                                $__vread = 1;
+                            } else { last; }
+                        }
+                        if ($__vread == 0) { last; }
+                        $__vstr = $__vstr . chr($__vnum);
+                        # Check for next `.digit`
+                        if ($__vp + 1 < $len && substr($source, $__vp, 1) eq "."
+                            && substr($source, $__vp + 1, 1) ge "0"
+                            && substr($source, $__vp + 1, 1) le "9") {
+                            $__vp = $__vp + 1;  # consume dot
+                            $__vsaw_dot = 1;
+                        } else { last; }
+                    }
+                    # Require at least one dot (so `v1` alone isn't claimed
+                    # — keeps regular identifier path open for `v1` as a var
+                    # name. Perl's bare `v1` form is rarely used.)
+                    if ($__vsaw_dot == 1) {
+                        $lx{"pos"} = $__vp;
+                        push(@tokens, _tok("STRING", $__vstr, $lx{"line"}));
+                        next;
+                    }
+                }
+            }
+        }
+
+        # Identifiers and keywords
+        if (($ch ge "a" && $ch le "z") || ($ch ge "A" && $ch le "Z") || $ch eq "_") {
+            my int $start = $pos;
+            $lx{"pos"} = $pos;
+            while ($lx{"pos"} < $len) {
+                my str $ic = substr($source, $lx{"pos"}, 1);
+                if (($ic ge "a" && $ic le "z") || ($ic ge "A" && $ic le "Z") || ($ic ge "0" && $ic le "9") || $ic eq "_") {
+                    $lx{"pos"} = $lx{"pos"} + 1;
+                } else { last; }
+            }
+            my str $word = substr($source, $start, $lx{"pos"} - $start);
+
+            # s/pattern/replacement/flags — regex substitution.
+            # After `->`, `s` is a method name, not the substitution
+            # operator. Without this guard `$obj->s(...)` parses as
+            # `$obj->(s/ ... /)` and the rest of the expression desyncs.
+            # Also after `{` — `$h->{s}` means the bareword key "s",
+            # not start of an `s{}{}flags` substitution. Without this
+            # second guard, perla's writeback wrappers `$caps->{s} = $s`
+            # tokenized `s}` as a one-character pattern, throwing off
+            # everything that followed (Role::Tiny's `eval <<HEREDOC`
+            # ended up with an entire-file body and the subsequent
+            # parser tripped on the `1;` after a `sub greet { }`).
+            my int $__after_arrow_s = 0;
+            if (scalar(@tokens) > 0) {
+                my str $__pts = $tokens[scalar(@tokens) - 1]->{"type"};
+                if ($__pts eq "ARROW" || $__pts eq "FAT_ARROW") {
+                    $__after_arrow_s = 1;
+                } elsif ($__pts eq "LBRACE") {
+                    # After LBRACE: only bareword if `s` is followed by
+                    # something that closes the hash-key context (RBRACE,
+                    # FAT_ARROW, COMMA). `map { s/PAT/REPL/ }` has `{`
+                    # before `s/` but it's a regex op there, not a key.
+                    my str $__nc = "";
+                    if ($lx{"pos"} < $len) { $__nc = substr($source, $lx{"pos"}, 1); }
+                    if ($__nc eq "}" || $__nc eq "," || ($__nc eq "=" && $lx{"pos"} + 1 < $len && substr($source, $lx{"pos"} + 1, 1) eq ">")) {
+                        $__after_arrow_s = 1;
+                    }
+                }
+            }
+            # `s => "value"` — fat-comma auto-quotes the LHS. This
+            # applies even after COMMA (not just LBRACE), e.g.
+            # `{n=>1, s=>"one"}`. Without this guard the lexer parses
+            # `s=>"one"...` as an `s=...=...=` substitution and drops
+            # the rest of the hash literal silently.
+            if ($__after_arrow_s == 0 && $word eq "s" && $lx{"pos"} + 1 < $len) {
+                my int $__pa = $lx{"pos"};
+                while ($__pa < $len) {
+                    my str $__pc = substr($source, $__pa, 1);
+                    if ($__pc eq " " || $__pc eq "\t") { $__pa = $__pa + 1; } else { last; }
+                }
+                if ($__pa + 1 < $len && substr($source, $__pa, 1) eq "=" && substr($source, $__pa + 1, 1) eq ">") {
+                    $__after_arrow_s = 1;
+                }
+            }
+            if ($__after_arrow_s == 0 && $word eq "s" && $lx{"pos"} < $len && substr($source, $lx{"pos"}, 1) eq "/") {
+                $lx{"pos"} = $lx{"pos"} + 1;  # skip opening /
+                # Read pattern (until unescaped /)
+                my str $pat = "";
+                while ($lx{"pos"} < $len) {
+                    my str $rc = substr($source, $lx{"pos"}, 1);
+                    if ($rc eq "\\" && $lx{"pos"} + 1 < $len) {
+                        $pat = $pat . $rc . substr($source, $lx{"pos"} + 1, 1);
+                        $lx{"pos"} = $lx{"pos"} + 2;
+                        next;
+                    }
+                    if ($rc eq "/") { $lx{"pos"} = $lx{"pos"} + 1; last; }
+                    $pat = $pat . $rc;
+                    $lx{"pos"} = $lx{"pos"} + 1;
+                }
+                # Read replacement (until unescaped /)
+                my str $repl = "";
+                while ($lx{"pos"} < $len) {
+                    my str $rc = substr($source, $lx{"pos"}, 1);
+                    if ($rc eq "\\" && $lx{"pos"} + 1 < $len) {
+                        my str $next_rc = substr($source, $lx{"pos"} + 1, 1);
+                        if ($next_rc eq "/") {
+                            # \/ in replacement = literal / (delimiter escape)
+                            $repl = $repl . "/";
+                        } else {
+                            # Keep other escapes
+                            $repl = $repl . $rc . $next_rc;
+                        }
+                        $lx{"pos"} = $lx{"pos"} + 2;
+                        next;
+                    }
+                    if ($rc eq "/") { $lx{"pos"} = $lx{"pos"} + 1; last; }
+                    $repl = $repl . $rc;
+                    $lx{"pos"} = $lx{"pos"} + 1;
+                }
+                # Read flags
+                my str $flags = "";
+                while ($lx{"pos"} < $len) {
+                    my str $fc = substr($source, $lx{"pos"}, 1);
+                    if ($fc eq "g" || $fc eq "i" || $fc eq "m" || $fc eq "s" || $fc eq "x" || $fc eq "e" || $fc eq "o" || $fc eq "r" || $fc eq "c" || $fc eq "a" || $fc eq "u" || $fc eq "d" || $fc eq "l" || $fc eq "n" || $fc eq "p") {
+                        $flags = $flags . $fc;
+                        $lx{"pos"} = $lx{"pos"} + 1;
+                    } else { last; }
+                }
+                # Emit as a compound token: SUBST "pattern\0replacement\0flags"
+                push(@tokens, _tok("SUBST_PAT", $pat, $lx{"line"}));
+                push(@tokens, _tok("SUBST_REPL", $repl, $lx{"line"}));
+                push(@tokens, _tok("SUBST_FLAGS", $flags, $lx{"line"}));
+                next;
+            }
+
+            # s{pat}{repl}flags or s|pat|repl|flags — s with non-/ delimiters
+            if ($__after_arrow_s == 0 && $word eq "s" && $lx{"pos"} < $len && substr($source, $lx{"pos"}, 1) ne "/" && substr($source, $lx{"pos"}, 1) ne " " && substr($source, $lx{"pos"}, 1) ne "\t") {
+                my str $s_delim = substr($source, $lx{"pos"}, 1);
+                my str $s_close = $s_delim;
+                my int $s_paired = 0;
+                if ($s_delim eq "(") { $s_close = ")"; $s_paired = 1; }
+                if ($s_delim eq "[") { $s_close = "]"; $s_paired = 1; }
+                if ($s_delim eq "{") { $s_close = "}"; $s_paired = 1; }
+                if ($s_delim eq "<") { $s_close = ">"; $s_paired = 1; }
+                $lx{"pos"} = $lx{"pos"} + 1;
+                # Read pattern
+                my str $spat = "";
+                my int $sdepth = 1;
+                while ($lx{"pos"} < $len && $sdepth > 0) {
+                    my str $sc = substr($source, $lx{"pos"}, 1);
+                    if ($sc eq "\n") { $lx{"line"} = $lx{"line"} + 1; }
+                    if ($sc eq "\\" && $lx{"pos"} + 1 < $len) {
+                        $spat = $spat . $sc . substr($source, $lx{"pos"} + 1, 1);
+                        $lx{"pos"} = $lx{"pos"} + 2;
+                    } elsif ($s_paired == 1 && $sc eq $s_delim) {
+                        $sdepth = $sdepth + 1;
+                        $spat = $spat . $sc;
+                        $lx{"pos"} = $lx{"pos"} + 1;
+                    } elsif ($sc eq $s_close) {
+                        $sdepth = $sdepth - 1;
+                        if ($sdepth > 0) { $spat = $spat . $sc; }
+                        $lx{"pos"} = $lx{"pos"} + 1;
+                    } else {
+                        $spat = $spat . $sc;
+                        $lx{"pos"} = $lx{"pos"} + 1;
+                    }
+                }
+                # For paired delimiters, skip whitespace and read replacement in new pair
+                if ($s_paired == 1) {
+                    while ($lx{"pos"} < $len && (substr($source, $lx{"pos"}, 1) eq " " || substr($source, $lx{"pos"}, 1) eq "\t" || substr($source, $lx{"pos"}, 1) eq "\n")) {
+                        if (substr($source, $lx{"pos"}, 1) eq "\n") { $lx{"line"} = $lx{"line"} + 1; }
+                        $lx{"pos"} = $lx{"pos"} + 1;
+                    }
+                    if ($lx{"pos"} < $len) { $lx{"pos"} = $lx{"pos"} + 1; }
+                }
+                # Read replacement
+                my str $srepl = "";
+                my int $sdepth2 = 1;
+                while ($lx{"pos"} < $len && $sdepth2 > 0) {
+                    my str $sc2 = substr($source, $lx{"pos"}, 1);
+                    if ($sc2 eq "\n") { $lx{"line"} = $lx{"line"} + 1; }
+                    if ($sc2 eq "\\" && $lx{"pos"} + 1 < $len) {
+                        $srepl = $srepl . $sc2 . substr($source, $lx{"pos"} + 1, 1);
+                        $lx{"pos"} = $lx{"pos"} + 2;
+                    } elsif ($s_paired == 1 && $sc2 eq $s_delim) {
+                        $sdepth2 = $sdepth2 + 1;
+                        $srepl = $srepl . $sc2;
+                        $lx{"pos"} = $lx{"pos"} + 1;
+                    } elsif ($sc2 eq $s_close) {
+                        $sdepth2 = $sdepth2 - 1;
+                        if ($sdepth2 > 0) { $srepl = $srepl . $sc2; }
+                        $lx{"pos"} = $lx{"pos"} + 1;
+                    } else {
+                        $srepl = $srepl . $sc2;
+                        $lx{"pos"} = $lx{"pos"} + 1;
+                    }
+                }
+                # Read flags
+                my str $sflags = "";
+                while ($lx{"pos"} < $len) {
+                    my str $sf = substr($source, $lx{"pos"}, 1);
+                    if ($sf eq "g" || $sf eq "i" || $sf eq "m" || $sf eq "s" || $sf eq "x" || $sf eq "e" || $sf eq "o" || $sf eq "r" || $sf eq "c" || $sf eq "a" || $sf eq "u" || $sf eq "d" || $sf eq "l" || $sf eq "n" || $sf eq "p") {
+                        $sflags = $sflags . $sf;
+                        $lx{"pos"} = $lx{"pos"} + 1;
+                    } else { last; }
+                }
+                push(@tokens, _tok("SUBST_PAT", $spat, $lx{"line"}));
+                push(@tokens, _tok("SUBST_REPL", $srepl, $lx{"line"}));
+                push(@tokens, _tok("SUBST_FLAGS", $sflags, $lx{"line"}));
+                next;
+            }
+
+            # `tr` / `y` are transliteration only in a primary/operand
+            # context. When preceded by LBRACE (hash subscript: `$h->{y}`,
+            # `%h{y}`), FAT_ARROW (`y => 1`), or COMMA in a list position,
+            # the token is a bareword hash key. Without this guard the `y`
+            # in `$h->{y}` triggered the tr{}{} branch below, which then
+            # ate the closing `}` as a delimiter and broke the parser
+            # until EOF.
+            my int $tr_is_bareword_ctx = 0;
+            if (scalar(@tokens) > 0) {
+                my str $__prev_type = $tokens[scalar(@tokens) - 1]->{"type"};
+                # After ARROW (`->tr`) or FAT_ARROW (`tr => ...`) tr is a
+                # bareword. After LBRACE, only if followed by `=>` —
+                # otherwise tr after `{` is an operator inside a code
+                # block (e.g. `map { tr/a-z/A-Z/r } @items`).
+                if ($__prev_type eq "ARROW" || $__prev_type eq "FAT_ARROW") {
+                    $tr_is_bareword_ctx = 1;
+                } elsif ($__prev_type eq "LBRACE") {
+                    # After LBRACE: bareword if `y`/`tr` is followed by
+                    # RBRACE (`$h->{y}`), COMMA (`{y, x}`), or FAT_ARROW
+                    # (`{y => 1}`). Otherwise treat as transliteration
+                    # op (e.g. `map { tr/a-z/A-Z/r } @items`).
+                    my int $__lbpa = $lx{"pos"};
+                    while ($__lbpa < $len) {
+                        my str $__lbpc = substr($source, $__lbpa, 1);
+                        if ($__lbpc eq " " || $__lbpc eq "\t") { $__lbpa = $__lbpa + 1; } else { last; }
+                    }
+                    if ($__lbpa < $len) {
+                        my str $__lbnc = substr($source, $__lbpa, 1);
+                        if ($__lbnc eq "}" || $__lbnc eq ",") {
+                            $tr_is_bareword_ctx = 1;
+                        } elsif ($__lbpa + 1 < $len && $__lbnc eq "=" && substr($source, $__lbpa + 1, 1) eq ">") {
+                            $tr_is_bareword_ctx = 1;
+                        }
+                    }
+                }
+            }
+            # `y => ...` / `tr => ...` fat-comma auto-quotes the LHS
+            # regardless of preceding token. Same as the `s =>` guard
+            # above. Without this, `{x=>1, y=>"foo"}` had y trigger
+            # the y/// transliteration branch and consumed "foo"... as
+            # the from-chars, breaking the hash.
+            if ($tr_is_bareword_ctx == 0 && ($word eq "tr" || $word eq "y") && $lx{"pos"} + 1 < $len) {
+                my int $__tpa = $lx{"pos"};
+                while ($__tpa < $len) {
+                    my str $__tpc = substr($source, $__tpa, 1);
+                    if ($__tpc eq " " || $__tpc eq "\t") { $__tpa = $__tpa + 1; } else { last; }
+                }
+                if ($__tpa + 1 < $len && substr($source, $__tpa, 1) eq "=" && substr($source, $__tpa + 1, 1) eq ">") {
+                    $tr_is_bareword_ctx = 1;
+                }
+            }
+            # tr/from/to/ or y/from/to/ — transliteration
+            if ($tr_is_bareword_ctx == 0 && ($word eq "tr" || $word eq "y") && $lx{"pos"} < $len && substr($source, $lx{"pos"}, 1) eq "/") {
+                $lx{"pos"} = $lx{"pos"} + 1;
+                my str $from_chars = "";
+                while ($lx{"pos"} < $len) {
+                    my str $rc = substr($source, $lx{"pos"}, 1);
+                    if ($rc eq "\\" && $lx{"pos"} + 1 < $len) {
+                        $from_chars = $from_chars . $rc . substr($source, $lx{"pos"} + 1, 1);
+                        $lx{"pos"} = $lx{"pos"} + 2;
+                        next;
+                    }
+                    if ($rc eq "/") { $lx{"pos"} = $lx{"pos"} + 1; last; }
+                    $from_chars = $from_chars . $rc;
+                    $lx{"pos"} = $lx{"pos"} + 1;
+                }
+                my str $to_chars = "";
+                while ($lx{"pos"} < $len) {
+                    my str $rc = substr($source, $lx{"pos"}, 1);
+                    if ($rc eq "\\" && $lx{"pos"} + 1 < $len) {
+                        $to_chars = $to_chars . $rc . substr($source, $lx{"pos"} + 1, 1);
+                        $lx{"pos"} = $lx{"pos"} + 2;
+                        next;
+                    }
+                    if ($rc eq "/") { $lx{"pos"} = $lx{"pos"} + 1; last; }
+                    $to_chars = $to_chars . $rc;
+                    $lx{"pos"} = $lx{"pos"} + 1;
+                }
+                my str $tr_flags = "";
+                while ($lx{"pos"} < $len) {
+                    my str $fc = substr($source, $lx{"pos"}, 1);
+                    if ($fc eq "c" || $fc eq "d" || $fc eq "s" || $fc eq "r") {
+                        $tr_flags = $tr_flags . $fc;
+                        $lx{"pos"} = $lx{"pos"} + 1;
+                    } else { last; }
+                }
+                push(@tokens, _tok("TR_FROM", $from_chars, $lx{"line"}));
+                push(@tokens, _tok("TR_TO", $to_chars, $lx{"line"}));
+                push(@tokens, _tok("TR_FLAGS", $tr_flags, $lx{"line"}));
+                next;
+            }
+
+            # tr{from}{to}flags / tr[from][to]flags / tr(from)(to)flags / tr|from|to|flags
+            # — transliteration with non-`/` delimiters (bracket-pair or same-char).
+            # Mirrors the s{}{} handler above. Needed for idioms like
+            #   $wdir =~ tr[:][]d       (Template::Provider)
+            #   $x =~ tr{0-9}{}c        (many CPAN modules)
+            if ($tr_is_bareword_ctx == 0 && ($word eq "tr" || $word eq "y") && $lx{"pos"} < $len && substr($source, $lx{"pos"}, 1) ne "/" && substr($source, $lx{"pos"}, 1) ne " " && substr($source, $lx{"pos"}, 1) ne "\t") {
+                my str $t_delim = substr($source, $lx{"pos"}, 1);
+                my str $t_close = $t_delim;
+                my int $t_paired = 0;
+                if ($t_delim eq "(") { $t_close = ")"; $t_paired = 1; }
+                if ($t_delim eq "[") { $t_close = "]"; $t_paired = 1; }
+                if ($t_delim eq "{") { $t_close = "}"; $t_paired = 1; }
+                if ($t_delim eq "<") { $t_close = ">"; $t_paired = 1; }
+                $lx{"pos"} = $lx{"pos"} + 1;
+                # Read FROM
+                my str $tfrom = "";
+                my int $tdepth = 1;
+                while ($lx{"pos"} < $len && $tdepth > 0) {
+                    my str $tc = substr($source, $lx{"pos"}, 1);
+                    if ($tc eq "\n") { $lx{"line"} = $lx{"line"} + 1; }
+                    if ($tc eq "\\" && $lx{"pos"} + 1 < $len) {
+                        $tfrom = $tfrom . $tc . substr($source, $lx{"pos"} + 1, 1);
+                        $lx{"pos"} = $lx{"pos"} + 2;
+                    } elsif ($t_paired == 1 && $tc eq $t_delim) {
+                        $tdepth = $tdepth + 1;
+                        $tfrom = $tfrom . $tc;
+                        $lx{"pos"} = $lx{"pos"} + 1;
+                    } elsif ($tc eq $t_close) {
+                        $tdepth = $tdepth - 1;
+                        if ($tdepth > 0) { $tfrom = $tfrom . $tc; }
+                        $lx{"pos"} = $lx{"pos"} + 1;
+                    } else {
+                        $tfrom = $tfrom . $tc;
+                        $lx{"pos"} = $lx{"pos"} + 1;
+                    }
+                }
+                # For paired delimiters, skip whitespace and open a new pair for TO
+                if ($t_paired == 1) {
+                    while ($lx{"pos"} < $len && (substr($source, $lx{"pos"}, 1) eq " " || substr($source, $lx{"pos"}, 1) eq "\t" || substr($source, $lx{"pos"}, 1) eq "\n")) {
+                        if (substr($source, $lx{"pos"}, 1) eq "\n") { $lx{"line"} = $lx{"line"} + 1; }
+                        $lx{"pos"} = $lx{"pos"} + 1;
+                    }
+                    if ($lx{"pos"} < $len) { $lx{"pos"} = $lx{"pos"} + 1; }
+                }
+                # Read TO
+                my str $tto = "";
+                my int $tdepth2 = 1;
+                while ($lx{"pos"} < $len && $tdepth2 > 0) {
+                    my str $tc2 = substr($source, $lx{"pos"}, 1);
+                    if ($tc2 eq "\n") { $lx{"line"} = $lx{"line"} + 1; }
+                    if ($tc2 eq "\\" && $lx{"pos"} + 1 < $len) {
+                        $tto = $tto . $tc2 . substr($source, $lx{"pos"} + 1, 1);
+                        $lx{"pos"} = $lx{"pos"} + 2;
+                    } elsif ($t_paired == 1 && $tc2 eq $t_delim) {
+                        $tdepth2 = $tdepth2 + 1;
+                        $tto = $tto . $tc2;
+                        $lx{"pos"} = $lx{"pos"} + 1;
+                    } elsif ($tc2 eq $t_close) {
+                        $tdepth2 = $tdepth2 - 1;
+                        if ($tdepth2 > 0) { $tto = $tto . $tc2; }
+                        $lx{"pos"} = $lx{"pos"} + 1;
+                    } else {
+                        $tto = $tto . $tc2;
+                        $lx{"pos"} = $lx{"pos"} + 1;
+                    }
+                }
+                # Read flags
+                my str $tflags2 = "";
+                while ($lx{"pos"} < $len) {
+                    my str $tf = substr($source, $lx{"pos"}, 1);
+                    if ($tf eq "c" || $tf eq "d" || $tf eq "s" || $tf eq "r") {
+                        $tflags2 = $tflags2 . $tf;
+                        $lx{"pos"} = $lx{"pos"} + 1;
+                    } else { last; }
+                }
+                push(@tokens, _tok("TR_FROM", $tfrom, $lx{"line"}));
+                push(@tokens, _tok("TR_TO", $tto, $lx{"line"}));
+                push(@tokens, _tok("TR_FLAGS", $tflags2, $lx{"line"}));
+                next;
+            }
+
+            # m/pattern/flags or m{pattern}flags — regex match with any delimiter.
+            # After `->`, `m` is a method name, not the match operator, so skip
+            # this branch when the previous token is ARROW. Otherwise
+            # `$obj->m(5)` parses as `$obj->(m/5.../)` and the rest of the
+            # expression desyncs. Same after `{`: `$h->{m}` is a hash key.
+            my int $__after_arrow_m = 0;
+            if (scalar(@tokens) > 0) {
+                my str $__ptm = $tokens[scalar(@tokens) - 1]->{"type"};
+                if ($__ptm eq "ARROW" || $__ptm eq "FAT_ARROW") {
+                    $__after_arrow_m = 1;
+                } elsif ($__ptm eq "LBRACE") {
+                    my str $__ncm = "";
+                    if ($lx{"pos"} < $len) { $__ncm = substr($source, $lx{"pos"}, 1); }
+                    if ($__ncm eq "}" || $__ncm eq "," || ($__ncm eq "=" && $lx{"pos"} + 1 < $len && substr($source, $lx{"pos"} + 1, 1) eq ">")) {
+                        $__after_arrow_m = 1;
+                    }
+                }
+            }
+            if ($__after_arrow_m == 0 && $word eq "m" && $lx{"pos"} < $len) {
+                my str $m_delim = substr($source, $lx{"pos"}, 1);
+                # Perl accepts any non-alphanumeric, non-whitespace char as
+                # a regex delimiter. HTTP::Message uses `m,^message/,` (comma
+                # delimiter) which previously fell through to bareword `m`
+                # parsing and the file failed to compile.
+                if ($m_delim eq "/" || $m_delim eq "{" || $m_delim eq "[" || $m_delim eq "(" || $m_delim eq "<" || $m_delim eq "|" || $m_delim eq "!" || $m_delim eq "#" || $m_delim eq "," || $m_delim eq ":" || $m_delim eq ";" || $m_delim eq "~" || $m_delim eq "%" || $m_delim eq "^" || $m_delim eq "&" || $m_delim eq "*") {
+                    my str $m_close = $m_delim;
+                    if ($m_delim eq "(") { $m_close = ")"; }
+                    if ($m_delim eq "[") { $m_close = "]"; }
+                    if ($m_delim eq "{") { $m_close = "}"; }
+                    if ($m_delim eq "<") { $m_close = ">"; }
+                    $lx{"pos"} = $lx{"pos"} + 1;
+                    my str $pat = "";
+                    my int $mdepth = 1;
+                    while ($lx{"pos"} < $len && $mdepth > 0) {
+                        my str $rc = substr($source, $lx{"pos"}, 1);
+                        if ($rc eq "\n") { $lx{"line"} = $lx{"line"} + 1; }
+                        if ($rc eq "\\" && $lx{"pos"} + 1 < $len) {
+                            $pat = $pat . $rc . substr($source, $lx{"pos"} + 1, 1);
+                            $lx{"pos"} = $lx{"pos"} + 2;
+                        } elsif ($m_delim ne $m_close && $rc eq $m_delim) {
+                            $mdepth = $mdepth + 1;
+                            $pat = $pat . $rc;
+                            $lx{"pos"} = $lx{"pos"} + 1;
+                        } elsif ($rc eq $m_close) {
+                            $mdepth = $mdepth - 1;
+                            if ($mdepth > 0) { $pat = $pat . $rc; }
+                            $lx{"pos"} = $lx{"pos"} + 1;
+                        } else {
+                            $pat = $pat . $rc;
+                            $lx{"pos"} = $lx{"pos"} + 1;
+                        }
+                    }
+                    my str $flags = "";
+                    while ($lx{"pos"} < $len) {
+                        my str $fc = substr($source, $lx{"pos"}, 1);
+                        if ($fc eq "g" || $fc eq "i" || $fc eq "m" || $fc eq "s" || $fc eq "x" || $fc eq "o" || $fc eq "c" || $fc eq "a" || $fc eq "u" || $fc eq "d" || $fc eq "l" || $fc eq "n" || $fc eq "p") {
+                            $flags = $flags . $fc;
+                            $lx{"pos"} = $lx{"pos"} + 1;
+                        } else { last; }
+                    }
+                    push(@tokens, _tok("MATCH_PAT", $pat, $lx{"line"}));
+                    push(@tokens, _tok("MATCH_FLAGS", $flags, $lx{"line"}));
+                    next;
+                }
+            }
+
+            # Check for package-qualified: Foo::Bar::func
+            while ($lx{"pos"} + 1 < $len && substr($source, $lx{"pos"}, 2) eq "::") {
+                $lx{"pos"} = $lx{"pos"} + 2;
+                while ($lx{"pos"} < $len) {
+                    my str $pc = substr($source, $lx{"pos"}, 1);
+                    if (($pc ge "a" && $pc le "z") || ($pc ge "A" && $pc le "Z") || ($pc ge "0" && $pc le "9") || $pc eq "_") {
+                        $lx{"pos"} = $lx{"pos"} + 1;
+                    } else { last; }
+                }
+                $word = substr($source, $start, $lx{"pos"} - $start);
+            }
+
+            # `format NAME = \n PICTURES \n . \n` — consume the entire
+            # block here. We capture NAME and the body as a single
+            # FORMAT_DEFN token so the parser sees one statement.
+            # Picture interpretation happens at runtime via
+            # perla_register_format + perla_write_format.
+            if ($word eq "format") {
+                # Save state in case we need to rewind on no-match.
+                my int $__fmt_save_pos = $lx{"pos"};
+                my int $__fmt_save_line = $lx{"line"};
+                # Skip whitespace, then read format name.
+                while ($lx{"pos"} < $len) {
+                    my str $sc = substr($source, $lx{"pos"}, 1);
+                    if ($sc eq " " || $sc eq "\t") { $lx{"pos"} = $lx{"pos"} + 1; } else { last; }
+                }
+                my int $__fmt_name_start = $lx{"pos"};
+                while ($lx{"pos"} < $len) {
+                    my str $nc = substr($source, $lx{"pos"}, 1);
+                    if (($nc ge "a" && $nc le "z") || ($nc ge "A" && $nc le "Z")
+                        || ($nc ge "0" && $nc le "9") || $nc eq "_" || $nc eq ":") {
+                        $lx{"pos"} = $lx{"pos"} + 1;
+                    } else { last; }
+                }
+                my str $__fmt_name = substr($source, $__fmt_name_start, $lx{"pos"} - $__fmt_name_start);
+                # Skip whitespace, expect `=`.
+                while ($lx{"pos"} < $len) {
+                    my str $sc2 = substr($source, $lx{"pos"}, 1);
+                    if ($sc2 eq " " || $sc2 eq "\t") { $lx{"pos"} = $lx{"pos"} + 1; } else { last; }
+                }
+                my int $__fmt_is_block = 0;
+                if (length($__fmt_name) > 0 && $lx{"pos"} < $len
+                    && substr($source, $lx{"pos"}, 1) eq "=") {
+                    $__fmt_is_block = 1;
+                }
+                if ($__fmt_is_block == 1) {
+                    # Consume `=`, then walk to end of line.
+                    $lx{"pos"} = $lx{"pos"} + 1;
+                    while ($lx{"pos"} < $len && substr($source, $lx{"pos"}, 1) ne "\n") {
+                        $lx{"pos"} = $lx{"pos"} + 1;
+                    }
+                    if ($lx{"pos"} < $len) {
+                        $lx{"pos"} = $lx{"pos"} + 1;
+                        $lx{"line"} = $lx{"line"} + 1;
+                    }
+                    # Body: collect lines until a line whose first non-
+                    # whitespace char is `.` followed by end-of-line.
+                    my str $__fmt_body = "";
+                    while ($lx{"pos"} < $len) {
+                        my int $__line_start = $lx{"pos"};
+                        my int $__line_end = $__line_start;
+                        while ($__line_end < $len && substr($source, $__line_end, 1) ne "\n") {
+                            $__line_end = $__line_end + 1;
+                        }
+                        my str $__line = substr($source, $__line_start, $__line_end - $__line_start);
+                        # Check if line is a single "." (with optional whitespace).
+                        my int $__tx = 0;
+                        while ($__tx < length($__line) && (substr($__line, $__tx, 1) eq " " || substr($__line, $__tx, 1) eq "\t")) { $__tx = $__tx + 1; }
+                        my int $__is_dot = 0;
+                        if ($__tx < length($__line) && substr($__line, $__tx, 1) eq ".") {
+                            my int $__tx2 = $__tx + 1;
+                            while ($__tx2 < length($__line) && (substr($__line, $__tx2, 1) eq " " || substr($__line, $__tx2, 1) eq "\t")) { $__tx2 = $__tx2 + 1; }
+                            if ($__tx2 >= length($__line)) { $__is_dot = 1; }
+                        }
+                        $lx{"pos"} = $__line_end;
+                        if ($lx{"pos"} < $len) {
+                            $lx{"pos"} = $lx{"pos"} + 1;
+                            $lx{"line"} = $lx{"line"} + 1;
+                        }
+                        if ($__is_dot == 1) { last; }
+                        $__fmt_body = $__fmt_body . $__line . "\n";
+                    }
+                    # Emit a FORMAT_DEFN token. value carries
+                    # "NAME\x01BODY" so the parser unpacks both.
+                    push(@tokens, _tok("FORMAT_DEFN", $__fmt_name . "\x01" . $__fmt_body, $__fmt_save_line));
+                    next;
+                }
+                # Not a format block — rewind and fall through to
+                # normal classification (will be treated as a bareword
+                # named "format").
+                $lx{"pos"} = $__fmt_save_pos;
+                $lx{"line"} = $__fmt_save_line;
+            }
+
+            my str $type = _classify_word($word);
+            # After `->`, the identifier is a method name — never a
+            # bareword operator or keyword. Without this guard,
+            # `$obj->cmp(5) == 1` parses `cmp` as the string-compare
+            # OP and the rest of the expression desyncs. Same applies
+            # to `eq`/`ne`/`lt`/`gt`/`le`/`ge`/`x`/`and`/`or`/`xor`/
+            # `not`/`m`/`s`/`qr`/`q`/`qq`/`qw`/`tr`/`y` and every
+            # keyword (while/if/do/etc.) used as a Perl method name.
+            if (scalar(@tokens) > 0) {
+                my str $__ptype = $tokens[scalar(@tokens) - 1]->{"type"};
+                if ($__ptype eq "ARROW") {
+                    $type = "IDENT";
+                }
+            }
+            # If the next non-whitespace tokens are `=>`, the identifier
+            # is a bareword hash-key (Perl's fat-comma auto-quote rule).
+            # `my => 1, our => 2, local => 3, …` are all valid hash entries
+            # in Perl. Surfaced via DateTime::Locale::Data's %Codes which
+            # lists ~700 locale codes including `my` (Burmese), `do`
+            # (Dogri-related), `if` (Ifri-related?). Without this guard,
+            # the parser saw `my` as MY and choked at "expected RPAREN got
+            # INT '1'", silently dropping the entire %Codes hash → all
+            # DateTime locale lookups failed.
+            {
+                my int $__la = $lx{"pos"};
+                while ($__la < $len) {
+                    my str $__lc = substr($source, $__la, 1);
+                    if ($__lc eq " " || $__lc eq "\t" || $__lc eq "\n" || $__lc eq "\r") {
+                        $__la = $__la + 1;
+                    } else { last; }
+                }
+                if ($__la + 1 < $len
+                    && substr($source, $__la, 1) eq "="
+                    && substr($source, $__la + 1, 1) eq ">") {
+                    $type = "IDENT";
+                }
+            }
+            if ($type eq "QR") {
+                # qr/pattern/flags — read regex pattern with any delimiter
+                # Skip whitespace to delimiter
+                while ($lx{"pos"} < $len && (substr($source, $lx{"pos"}, 1) eq " " || substr($source, $lx{"pos"}, 1) eq "\t")) {
+                    $lx{"pos"} = $lx{"pos"} + 1;
+                }
+                if ($lx{"pos"} < $len) {
+                    my str $delim = substr($source, $lx{"pos"}, 1);
+                    my str $close = $delim;
+                    if ($delim eq "(") { $close = ")"; }
+                    if ($delim eq "[") { $close = "]"; }
+                    if ($delim eq "{") { $close = "}"; }
+                    if ($delim eq "<") { $close = ">"; }
+                    $lx{"pos"} = $lx{"pos"} + 1;
+                    my str $pat = "";
+                    my int $depth = 1;
+                    while ($lx{"pos"} < $len && $depth > 0) {
+                        my str $rc = substr($source, $lx{"pos"}, 1);
+                        if ($rc eq "\n") { $lx{"line"} = $lx{"line"} + 1; }
+                        if ($rc eq "\\" && $lx{"pos"} + 1 < $len) {
+                            $pat = $pat . $rc . substr($source, $lx{"pos"} + 1, 1);
+                            $lx{"pos"} = $lx{"pos"} + 2;
+                        } elsif ($delim ne $close && $rc eq $delim) {
+                            $depth = $depth + 1;
+                            $pat = $pat . $rc;
+                            $lx{"pos"} = $lx{"pos"} + 1;
+                        } elsif ($rc eq $close) {
+                            $depth = $depth - 1;
+                            if ($depth > 0) { $pat = $pat . $rc; }
+                            $lx{"pos"} = $lx{"pos"} + 1;
+                        } else {
+                            $pat = $pat . $rc;
+                            $lx{"pos"} = $lx{"pos"} + 1;
+                        }
+                    }
+                    # Read flags
+                    my str $flags = "";
+                    while ($lx{"pos"} < $len) {
+                        my str $fc = substr($source, $lx{"pos"}, 1);
+                        if ($fc eq "i" || $fc eq "m" || $fc eq "s" || $fc eq "x" || $fc eq "o" || $fc eq "a" || $fc eq "u" || $fc eq "d" || $fc eq "l" || $fc eq "n" || $fc eq "p") {
+                            $flags = $flags . $fc;
+                            $lx{"pos"} = $lx{"pos"} + 1;
+                        } else { last; }
+                    }
+                    # qr// emits QR_REGEX + (optional) QR_FLAGS so the parser
+                    # builds an N_REGEX with is_qr=1. Without this distinction
+                    # qr// was indistinguishable from /pat/ and codegen emitted
+                    # an immediate match against $_, so storing qr// in a hash
+                    # and matching later (List::Util::first { $op =~ $_->{regex} })
+                    # always failed — SAC's special_ops dispatch among other things.
+                    push(@tokens, _tok("QR_REGEX", $pat, $lx{"line"}));
+                    if (length($flags) > 0) {
+                        push(@tokens, _tok("QR_FLAGS", $flags, $lx{"line"}));
+                    }
+                    next;
+                }
+            }
+            if ($type eq "C_BLOCK_START") {
+                # Read __C__ { ... } raw block
+                my str $c_code = _read_c_block(\%lx);
+                push(@tokens, _tok("C_BLOCK", $c_code, $lx{"line"}));
+                next;
+            }
+            if ($type eq "STRADA_BLOCK_START") {
+                # Read __STRADA__ { ... } raw block (same brace-matching logic)
+                my str $strada_code = _read_c_block(\%lx);
+                push(@tokens, _tok("STRADA_BLOCK", $strada_code, $lx{"line"}));
+                next;
+            }
+            # __END__ stops tokenization, content discarded.
+            if ($type eq "END_MARKER") {
+                last;
+            }
+            # __DATA__ stops tokenization too, but captures everything
+            # after the marker (starting on the next line) as a
+            # DATA_SECTION token. Parser stashes the content on the AST
+            # root so codegen can open it as the `DATA` filehandle.
+            if ($type eq "DATA_MARKER") {
+                my int $dp = $lx{"pos"};
+                # Skip rest of the marker's line (everything up to and
+                # including the next newline).
+                while ($dp < $len && substr($source, $dp, 1) ne "\n") { $dp++; }
+                if ($dp < $len && substr($source, $dp, 1) eq "\n") { $dp++; }
+                my str $data_content = "";
+                if ($dp < $len) { $data_content = substr($source, $dp, $len - $dp); }
+                push(@tokens, _tok("DATA_SECTION", $data_content, $lx{"line"}));
+                last;
+            }
+            # qw with any delimiter (paren or non-paren). Words inside qw
+            # are raw — `qw(%Config)` must produce the literal string
+            # "%Config", not the hash variable. Without this branch the
+            # parser would tokenize `%Config` as HASH_VAR("Config"),
+            # stripping the sigil and breaking e.g. Config.pm's
+            # `@Config::EXPORT = qw(%Config)`.
+            if ($type eq "QW") {
+                # Skip whitespace to delimiter
+                while ($lx{"pos"} < $len && (substr($source, $lx{"pos"}, 1) eq " " || substr($source, $lx{"pos"}, 1) eq "\t")) {
+                    $lx{"pos"} = $lx{"pos"} + 1;
+                }
+                if ($lx{"pos"} < $len) {
+                    my str $delim = substr($source, $lx{"pos"}, 1);
+                    my str $close = $delim;
+                    if ($delim eq "(") { $close = ")"; }
+                    elsif ($delim eq "[") { $close = "]"; }
+                    elsif ($delim eq "{") { $close = "}"; }
+                    elsif ($delim eq "<") { $close = ">"; }
+                    $lx{"pos"} = $lx{"pos"} + 1;
+                    # Emit QW + synthetic LPAREN
+                    push(@tokens, _tok("QW", "qw", $lx{"line"}));
+                    push(@tokens, _tok("LPAREN", "(", $lx{"line"}));
+                    # Read words until closing delimiter. For paired
+                    # bracket delimiters (paren/bracket/brace/angle),
+                    # balance nesting so `qw(. * ( ) ...)` doesn't stop
+                    # at the first inner `)`. Perl balances the open/close
+                    # pair for these delimiters; non-bracket delims like
+                    # `qw|...|` have no balancing.
+                    my int $do_balance = 0;
+                    if ($delim eq "(" || $delim eq "[" || $delim eq "{" || $delim eq "<") {
+                        $do_balance = 1;
+                    }
+                    my int $depth = 0;
+                    while ($lx{"pos"} < $len) {
+                        my str $wc = substr($source, $lx{"pos"}, 1);
+                        if ($wc eq $close && $depth == 0) { last; }
+                        if ($wc eq " " || $wc eq "\t" || $wc eq "\n") {
+                            if ($wc eq "\n") { $lx{"line"} = $lx{"line"} + 1; }
+                            $lx{"pos"} = $lx{"pos"} + 1;
+                        } else {
+                            my str $qword = "";
+                            while ($lx{"pos"} < $len) {
+                                my str $qc = substr($source, $lx{"pos"}, 1);
+                                if ($qc eq " " || $qc eq "\t" || $qc eq "\n") { last; }
+                                if ($qc eq $close && $depth == 0) { last; }
+                                if ($do_balance == 1 && $qc eq $delim) { $depth = $depth + 1; }
+                                elsif ($do_balance == 1 && $qc eq $close) { $depth = $depth - 1; }
+                                $qword = $qword . $qc;
+                                $lx{"pos"} = $lx{"pos"} + 1;
+                            }
+                            push(@tokens, _tok("IDENT", $qword, $lx{"line"}));
+                        }
+                    }
+                    if ($lx{"pos"} < $len) { $lx{"pos"} = $lx{"pos"} + 1; }
+                    push(@tokens, _tok("RPAREN", ")", $lx{"line"}));
+                    next;
+                }
+            }
+            # qq with any delimiter: qq|...|, qq{...}, qq[...], qq/.../, qq(...), etc.
+            # qx{...} is the same shape but emits BACKTICK (shell capture)
+            # instead of DQSTRING.
+            if ($type eq "QQ" || $type eq "Q_QUOTE" || $type eq "QX") {
+                # Skip whitespace to delimiter
+                while ($lx{"pos"} < $len && (substr($source, $lx{"pos"}, 1) eq " " || substr($source, $lx{"pos"}, 1) eq "\t")) {
+                    $lx{"pos"} = $lx{"pos"} + 1;
+                }
+                if ($lx{"pos"} < $len) {
+                    my str $delim = substr($source, $lx{"pos"}, 1);
+                    # If q/qq is followed by an identifier char, }, ), comma, semicolon, or =>,
+                    # it's a bareword, not a quote operator
+                    if (_is_ident_char($delim) || $delim eq "}" || $delim eq ")" || $delim eq "," || $delim eq ";" || $delim eq "\n" || $delim eq "=") {
+                        $type = "IDENT";
+                        push(@tokens, _tok("IDENT", $word, $lx{"line"}));
+                        next;
+                    }
+                    my str $close = $delim;
+                    if ($delim eq "(") { $close = ")"; }
+                    if ($delim eq "[") { $close = "]"; }
+                    if ($delim eq "{") { $close = "}"; }
+                    if ($delim eq "<") { $close = ">"; }
+                    $lx{"pos"} = $lx{"pos"} + 1;
+                    # Scan for the closing delimiter without building the
+                    # content char-by-char — the old form
+                    # `$content = $content . $qc` inside this per-char loop
+                    # is O(n^2) on large string literals (Locale::SubCountry
+                    # ::Codes has a 500KB `q{...}` blob that took ~7 min
+                    # under the old loop). Find end position first, then
+                    # extract the span in one substr.
+                    my int $start = $lx{"pos"};
+                    my int $depth = 1;
+                    while ($lx{"pos"} < $len && $depth > 0) {
+                        my str $qc = substr($source, $lx{"pos"}, 1);
+                        if ($qc eq "\n") { $lx{"line"} = $lx{"line"} + 1; }
+                        if ($qc eq "\\" && $lx{"pos"} + 1 < $len) {
+                            $lx{"pos"} = $lx{"pos"} + 2;
+                        } elsif ($delim ne $close && $qc eq $delim) {
+                            $depth = $depth + 1;
+                            $lx{"pos"} = $lx{"pos"} + 1;
+                        } elsif ($qc eq $close) {
+                            $depth = $depth - 1;
+                            $lx{"pos"} = $lx{"pos"} + 1;
+                        } else {
+                            $lx{"pos"} = $lx{"pos"} + 1;
+                        }
+                    }
+                    # If depth reached 0, pos is one past the outer close;
+                    # content ends at pos-1. If we hit EOF unclosed, content
+                    # ends at pos (the remainder of source).
+                    my int $content_end = $lx{"pos"};
+                    if ($depth == 0) { $content_end = $content_end - 1; }
+                    my str $content = substr($source, $start, $content_end - $start);
+                    # qq/.../ interpolates and processes escapes — it's
+                    # the double-quoted form. q/.../ is the literal form
+                    # (no interpolation, only \\ and \DELIM escapes).
+                    # The parser's DQSTRING vs STRING distinction drives
+                    # which path runs. Without this, code like
+                    # `eval qq/sub $name { ... }/` emits the body with
+                    # literal `$name` and `\$enable`, which then fails to
+                    # compile or generates broken subs.
+                    my str $tok_type = "STRING";
+                    if ($type eq "QQ") { $tok_type = "DQSTRING"; }
+                    if ($type eq "QX") { $tok_type = "BACKTICK"; }
+                    push(@tokens, _tok($tok_type, $content, $lx{"line"}));
+                    next;
+                }
+            }
+            # `x=` (string repeat compound assign) — when word is "x"
+            # classified as OP and the next char is "=", emit OP "x="
+            # instead of two tokens. Avoids the parser seeing
+            # `OP "x"` + `OP "="` and treating them as separate ops.
+            if ($type eq "OP" && $word eq "x" && $lx{"pos"} < $len
+                && substr($source, $lx{"pos"}, 1) eq "=" && $lx{"pos"} + 1 < $len
+                && substr($source, $lx{"pos"} + 1, 1) ne "=") {
+                $lx{"pos"} = $lx{"pos"} + 1;
+                push(@tokens, _tok("OP", "x=", $lx{"line"}));
+                next;
+            }
+            push(@tokens, _tok($type, $word, $lx{"line"}));
+            next;
+        }
+
+        # Operators and punctuation
+        my str $ch2 = "";
+        if ($pos + 1 < $len) { $ch2 = substr($source, $pos, 2); }
+        my str $ch3 = "";
+        if ($pos + 2 < $len) { $ch3 = substr($source, $pos, 3); }
+
+        # Check for regex literal /pattern/ BEFORE operator checks
+        # (so // is regex-empty not defined-or when in regex context)
+        if ($ch eq "/" && scalar(@tokens) > 0) {
+            my str $prev_type = $tokens[scalar(@tokens) - 1]->{"type"};
+            if ($prev_type eq "LPAREN" || $prev_type eq "COMMA" || $prev_type eq "SEMI" ||
+                $prev_type eq "OP" || $prev_type eq "FAT_ARROW" || $prev_type eq "LBRACKET" ||
+                $prev_type eq "LBRACE" || $prev_type eq "RETURN" || $prev_type eq "NOT" ||
+                $prev_type eq "GREP" || $prev_type eq "MAP" || $prev_type eq "SORT" || $prev_type eq "SPLIT" ||
+                $prev_type eq "IF" || $prev_type eq "UNLESS" || $prev_type eq "WHILE" ||
+                $prev_type eq "UNTIL" || $prev_type eq "AND" || $prev_type eq "OR") {
+                $lx{"pos"} = $pos + 1;
+                my str $pat = "";
+                while ($lx{"pos"} < $len) {
+                    my str $rc = substr($source, $lx{"pos"}, 1);
+                    if ($rc eq "\\" && $lx{"pos"} + 1 < $len) {
+                        $pat = $pat . $rc . substr($source, $lx{"pos"} + 1, 1);
+                        $lx{"pos"} = $lx{"pos"} + 2;
+                    } elsif ($rc eq "/") {
+                        $lx{"pos"} = $lx{"pos"} + 1;
+                        last;
+                    } else {
+                        $pat = $pat . $rc;
+                        $lx{"pos"} = $lx{"pos"} + 1;
+                    }
+                }
+                my str $flags = "";
+                while ($lx{"pos"} < $len) {
+                    my str $fc = substr($source, $lx{"pos"}, 1);
+                    if ($fc eq "g" || $fc eq "i" || $fc eq "m" || $fc eq "s" || $fc eq "x" || $fc eq "o" || $fc eq "c" || $fc eq "a" || $fc eq "u" || $fc eq "d" || $fc eq "l" || $fc eq "n" || $fc eq "p") {
+                        $flags = $flags . $fc;
+                        $lx{"pos"} = $lx{"pos"} + 1;
+                    } else { last; }
+                }
+                push(@tokens, _tok("REGEX", $pat, $lx{"line"}));
+                # Emit flags as a MATCH_FLAGS token so the parser can attach
+                # them to N_REGEX. Earlier the flags were read but dropped,
+                # so `/foo/i` matched case-sensitively. Only emit when
+                # flags were actually present (non-empty) to keep regex
+                # tokens unchanged when no flags follow.
+                if (length($flags) > 0) {
+                    push(@tokens, _tok("MATCH_FLAGS", $flags, $lx{"line"}));
+                }
+                next;
+            }
+        }
+
+        # Three-char operators ("..." is the three-dot flip-flop infix
+        # operator, or — in statement position — the yada-yada placeholder)
+        if ($ch3 eq "<=>" || $ch3 eq "//=" || $ch3 eq "**=" || $ch3 eq "..=" || $ch3 eq "<<=" || $ch3 eq "||=" || $ch3 eq "&&=" || $ch3 eq ">>=" || $ch3 eq "...") {
+            push(@tokens, _tok("OP", $ch3, $lx{"line"}));
+            $lx{"pos"} = $pos + 3;
+            next;
+        }
+        # Arrow
+        if ($ch2 eq "->") {
+            push(@tokens, _tok("ARROW", "->", $lx{"line"}));
+            $lx{"pos"} = $pos + 2;
+            next;
+        }
+        # Fat arrow
+        if ($ch2 eq "=>") {
+            push(@tokens, _tok("FAT_ARROW", "=>", $lx{"line"}));
+            $lx{"pos"} = $pos + 2;
+            next;
+        }
+        # =~ and !~ with regex: =~ /pattern/flags or =~ s/pat/repl/flags
+        if ($ch2 eq "=~" || $ch2 eq "!~") {
+            push(@tokens, _tok("OP", $ch2, $lx{"line"}));
+            $lx{"pos"} = $pos + 2;
+            # Skip whitespace after =~
+            while ($lx{"pos"} < $len && (substr($source, $lx{"pos"}, 1) eq " " || substr($source, $lx{"pos"}, 1) eq "\t")) {
+                $lx{"pos"} = $lx{"pos"} + 1;
+            }
+            # Check for m/pattern/ or m{pattern} (m operator with any delimiter after =~)
+            if ($lx{"pos"} < $len && substr($source, $lx{"pos"}, 1) eq "m" && $lx{"pos"} + 1 < $len) {
+                my str $md = substr($source, $lx{"pos"} + 1, 1);
+                if ($md eq "/" || $md eq "{" || $md eq "[" || $md eq "(" || $md eq "<" || $md eq "|" || $md eq "!" || $md eq "#") {
+                    $lx{"pos"} = $lx{"pos"} + 1;  # skip 'm'
+                    my str $m_delim = substr($source, $lx{"pos"}, 1);
+                    my str $m_close = $m_delim;
+                    if ($m_delim eq "(") { $m_close = ")"; }
+                    if ($m_delim eq "[") { $m_close = "]"; }
+                    if ($m_delim eq "{") { $m_close = "}"; }
+                    if ($m_delim eq "<") { $m_close = ">"; }
+                    $lx{"pos"} = $lx{"pos"} + 1;  # skip delimiter
+                    my str $mpat = "";
+                    my int $mdepth = 1;
+                    while ($lx{"pos"} < $len && $mdepth > 0) {
+                        my str $mc = substr($source, $lx{"pos"}, 1);
+                        if ($mc eq "\n") { $lx{"line"} = $lx{"line"} + 1; }
+                        if ($mc eq "\\" && $lx{"pos"} + 1 < $len) {
+                            $mpat = $mpat . $mc . substr($source, $lx{"pos"} + 1, 1);
+                            $lx{"pos"} = $lx{"pos"} + 2;
+                        } elsif ($m_delim ne $m_close && $mc eq $m_delim) {
+                            $mdepth = $mdepth + 1;
+                            $mpat = $mpat . $mc;
+                            $lx{"pos"} = $lx{"pos"} + 1;
+                        } elsif ($mc eq $m_close) {
+                            $mdepth = $mdepth - 1;
+                            if ($mdepth > 0) { $mpat = $mpat . $mc; }
+                            $lx{"pos"} = $lx{"pos"} + 1;
+                        } else {
+                            $mpat = $mpat . $mc;
+                            $lx{"pos"} = $lx{"pos"} + 1;
+                        }
+                    }
+                    my str $mflags = "";
+                    while ($lx{"pos"} < $len) {
+                        my str $mf = substr($source, $lx{"pos"}, 1);
+                        if ($mf eq "g" || $mf eq "i" || $mf eq "m" || $mf eq "s" || $mf eq "x" || $mf eq "o" || $mf eq "c" || $mf eq "a" || $mf eq "u" || $mf eq "d" || $mf eq "l" || $mf eq "n" || $mf eq "p") {
+                            $mflags = $mflags . $mf;
+                            $lx{"pos"} = $lx{"pos"} + 1;
+                        } else { last; }
+                    }
+                    push(@tokens, _tok("MATCH_PAT", $mpat, $lx{"line"}));
+                    push(@tokens, _tok("MATCH_FLAGS", $mflags, $lx{"line"}));
+                    next;
+                }
+            }
+            # Check for /pattern/ (bare regex after =~)
+            if ($lx{"pos"} < $len && substr($source, $lx{"pos"}, 1) eq "/") {
+                $lx{"pos"} = $lx{"pos"} + 1;  # skip /
+                my str $pat = "";
+                while ($lx{"pos"} < $len) {
+                    my str $rc = substr($source, $lx{"pos"}, 1);
+                    if ($rc eq "\\" && $lx{"pos"} + 1 < $len) {
+                        $pat = $pat . $rc . substr($source, $lx{"pos"} + 1, 1);
+                        $lx{"pos"} = $lx{"pos"} + 2;
+                        next;
+                    }
+                    if ($rc eq "/") { $lx{"pos"} = $lx{"pos"} + 1; last; }
+                    $pat = $pat . $rc;
+                    $lx{"pos"} = $lx{"pos"} + 1;
+                }
+                my str $flags = "";
+                while ($lx{"pos"} < $len) {
+                    my str $fc = substr($source, $lx{"pos"}, 1);
+                    if ($fc eq "g" || $fc eq "i" || $fc eq "m" || $fc eq "s" || $fc eq "x" || $fc eq "o" || $fc eq "c" || $fc eq "a" || $fc eq "u" || $fc eq "d" || $fc eq "l" || $fc eq "n" || $fc eq "p") {
+                        $flags = $flags . $fc;
+                        $lx{"pos"} = $lx{"pos"} + 1;
+                    } else { last; }
+                }
+                push(@tokens, _tok("MATCH_PAT", $pat, $lx{"line"}));
+                push(@tokens, _tok("MATCH_FLAGS", $flags, $lx{"line"}));
+            }
+            next;
+        }
+        # Heredoc: <<EOF, <<'EOF', <<"EOF"
+        if ($ch2 eq "<<" && $pos + 2 < $len) {
+            my str $next_c = substr($source, $pos + 2, 1);
+            # `<<~` (indented heredoc, Perl 5.26+) — same as `<<` but strip
+            # common leading whitespace from each body line and allow the
+            # closing delim to be indented.
+            my int $is_indent = 0;
+            my int $hd_base = $pos + 2;   # where the terminator (or its quote) begins
+            if ($next_c eq "~" && $pos + 3 < $len) {
+                my str $after_tilde = substr($source, $pos + 3, 1);
+                if ($after_tilde eq "'" || $after_tilde eq "\"" || _is_ident_start($after_tilde)) {
+                    $is_indent = 1;
+                    $next_c = $after_tilde;
+                    $hd_base = $pos + 3;
+                }
+            }
+            # Perl allows whitespace between `<<` (or `<<~`) and a QUOTED
+            # terminator: `croak << "HERE"`, `<<~ 'END'`. A bareword terminator
+            # must follow immediately (modern perl treats `<< END` as a left
+            # shift, not a heredoc), so only skip whitespace when a quote
+            # follows. Without this, `<< "HERE"` lexed as `<<` (shift) and the
+            # heredoc body leaked into the token stream — in File::Temp it
+            # swallowed the enclosing block's closing braces and the whole
+            # module failed to parse.
+            if ($next_c eq " " || $next_c eq "\t") {
+                my int $ws_scan = $hd_base;
+                while ($ws_scan < $len && (substr($source, $ws_scan, 1) eq " " || substr($source, $ws_scan, 1) eq "\t")) { $ws_scan++; }
+                if ($ws_scan < $len) {
+                    my str $qc = substr($source, $ws_scan, 1);
+                    if ($qc eq "'" || $qc eq "\"") {
+                        $next_c = $qc;
+                        $hd_base = $ws_scan;
+                    }
+                }
+            }
+            if ($next_c ne "=" && $next_c ne "<" && ($next_c eq "'" || $next_c eq "\"" || _is_ident_start($next_c))) {
+                # Heredoc: <<IDENT or <<'IDENT' or <<"IDENT" (not <<NUMBER or <<SPACE)
+                my int $hd_start = $hd_base;
+                my int $is_raw = 0;  # 1 for single-quoted (no interpolation)
+                my str $delim = "";
+                # Skip optional quotes
+                if (substr($source, $hd_start, 1) eq "'") {
+                    $is_raw = 1;
+                    $hd_start++;
+                    my int $hd_end = $hd_start;
+                    while ($hd_end < $len && substr($source, $hd_end, 1) ne "'") { $hd_end++; }
+                    $delim = substr($source, $hd_start, $hd_end - $hd_start);
+                    $lx{"pos"} = $hd_end + 1;
+                } elsif (substr($source, $hd_start, 1) eq "\"") {
+                    $hd_start++;
+                    my int $hd_end = $hd_start;
+                    while ($hd_end < $len && substr($source, $hd_end, 1) ne "\"") { $hd_end++; }
+                    $delim = substr($source, $hd_start, $hd_end - $hd_start);
+                    $lx{"pos"} = $hd_end + 1;
+                } else {
+                    # Bare identifier
+                    my int $hd_end = $hd_start;
+                    while ($hd_end < $len && _is_ident_char(substr($source, $hd_end, 1))) { $hd_end++; }
+                    $delim = substr($source, $hd_start, $hd_end - $hd_start);
+                    $lx{"pos"} = $hd_end;
+                }
+                if (length($delim) > 0) {
+                    # Heredoc body lives starting at the line AFTER the line that
+                    # contains `<<'EOC'`. The lexer position (`$lx{"pos"}`) right
+                    # now points just past `<<'EOC'`, possibly mid-expression
+                    # (e.g. `sprintf( <<'EOC', $arg );` — there's `, $arg );` to
+                    # tokenize). Old behavior was to skip from `<<'EOC'` to the
+                    # next `\n` and start reading the body — which silently
+                    # discarded the rest of the current line, breaking patterns
+                    # like DBIC's `quote_sub PKG, sprintf(<<'EOC', ...), { ... };`
+                    # and dropping ~63 of 97 subs from DBI.pm.o.
+                    #
+                    # Fix: locate end of current line, scan forward to read the
+                    # body, then splice the body+delim lines out of the source
+                    # so the lexer continues with the rest of the current line
+                    # in its natural position.
+                    my int $line_end = $lx{"pos"};
+                    while ($line_end < $len && substr($source, $line_end, 1) ne "\n") { $line_end++; }
+                    my int $body_scan = $line_end;
+                    if ($body_scan < $len) { $body_scan = $body_scan + 1; }
+                    my str $body = "";
+                    my int $body_end = $body_scan;
+                    while ($body_end < $len) {
+                        my int $bl_start = $body_end;
+                        my int $bl_end = $bl_start;
+                        while ($bl_end < $len && substr($source, $bl_end, 1) ne "\n") { $bl_end++; }
+                        my str $line_text = substr($source, $bl_start, $bl_end - $bl_start);
+                        # For <<~ (indented), match delim allowing any
+                        # leading whitespace before it.
+                        my int $is_close = 0;
+                        if ($is_indent == 1) {
+                            my str $lt_trim = $line_text;
+                            while (length($lt_trim) > 0 && (substr($lt_trim, 0, 1) eq " " || substr($lt_trim, 0, 1) eq "\t")) {
+                                $lt_trim = substr($lt_trim, 1, length($lt_trim) - 1);
+                            }
+                            if ($lt_trim eq $delim) { $is_close = 1; }
+                        } else {
+                            if ($line_text eq $delim) { $is_close = 1; }
+                        }
+                        if ($is_close == 1) {
+                            $body_end = $bl_end;
+                            if ($body_end < $len) { $body_end = $body_end + 1; }
+                            last;
+                        }
+                        $body = $body . $line_text . "\n";
+                        $body_end = $bl_end;
+                        if ($body_end < $len) { $body_end = $body_end + 1; }
+                    }
+                    # For <<~ strip the common leading whitespace from each
+                    # line — find the indent of the closing delimiter line
+                    # (the line we just matched) and remove that prefix from
+                    # every body line that starts with it.
+                    if ($is_indent == 1 && length($body) > 0) {
+                        # Find minimum leading whitespace across non-empty lines
+                        my int $min_ind = -1;
+                        my int $bi = 0;
+                        my int $blen = length($body);
+                        while ($bi < $blen) {
+                            my int $ll = $bi;
+                            while ($ll < $blen && substr($body, $ll, 1) ne "\n") { $ll = $ll + 1; }
+                            my int $li_end = $ll;
+                            if ($ll - $bi > 0) {
+                                my int $wsi = $bi;
+                                while ($wsi < $ll && (substr($body, $wsi, 1) eq " " || substr($body, $wsi, 1) eq "\t")) {
+                                    $wsi = $wsi + 1;
+                                }
+                                if ($wsi < $ll) {
+                                    my int $ind = $wsi - $bi;
+                                    if ($min_ind == -1 || $ind < $min_ind) { $min_ind = $ind; }
+                                }
+                            }
+                            $bi = $li_end + 1;
+                        }
+                        if ($min_ind > 0) {
+                            my str $stripped = "";
+                            $bi = 0;
+                            while ($bi < $blen) {
+                                my int $ll = $bi;
+                                while ($ll < $blen && substr($body, $ll, 1) ne "\n") { $ll = $ll + 1; }
+                                my int $skip = 0;
+                                while ($skip < $min_ind && $bi + $skip < $ll
+                                       && (substr($body, $bi + $skip, 1) eq " " || substr($body, $bi + $skip, 1) eq "\t")) {
+                                    $skip = $skip + 1;
+                                }
+                                $stripped = $stripped . substr($body, $bi + $skip, $ll - $bi - $skip) . "\n";
+                                $bi = $ll + 1;
+                            }
+                            $body = $stripped;
+                        }
+                    }
+                    # Perl heredocs include the final newline before the
+                    # closing delimiter. Don't strip it — `<<END\n a\n b\n END`
+                    # is "a\nb\n", not "a\nb".
+                    # Splice out [body_scan..body_end) from source so the line
+                    # numbers stay roughly correct AND the rest of the current
+                    # line (after `<<'EOC'`) is still tokenized naturally.
+                    my str $before = substr($source, 0, $body_scan);
+                    my str $after = "";
+                    if ($body_end < $len) { $after = substr($source, $body_end); }
+                    $source = $before . $after;
+                    $len = length($source);
+                    $lx{"src"} = $source;
+                    $lx{"len"} = $len;
+                    # Push the heredoc body as a STRING/DQSTRING token at the
+                    # current position; subsequent loop iterations will continue
+                    # from `$lx{"pos"}` which still points just past `<<'EOC'`.
+                    if ($is_raw == 1) {
+                        push(@tokens, _tok("STRING", $body, $lx{"line"}));
+                    } else {
+                        push(@tokens, _tok("DQSTRING", $body, $lx{"line"}));
+                    }
+                    next;
+                }
+            }
+        }
+
+        # Two-char operators
+        if ($ch2 eq "==" || $ch2 eq "!=" ||
+            $ch2 eq "<=" || $ch2 eq ">=" || $ch2 eq "&&" || $ch2 eq "||" ||
+            $ch2 eq "//" || $ch2 eq "+=" || $ch2 eq "-=" || $ch2 eq "*=" ||
+            $ch2 eq "/=" || $ch2 eq ".=" || $ch2 eq "%=" || $ch2 eq "**" ||
+            $ch2 eq "++" || $ch2 eq "--" || $ch2 eq "<<" || $ch2 eq ">>" ||
+            $ch2 eq ".." || $ch2 eq "~~" ||
+            $ch2 eq "|=" || $ch2 eq "&=" || $ch2 eq "^=") {
+            push(@tokens, _tok("OP", $ch2, $lx{"line"}));
+            $lx{"pos"} = $pos + 2;
+            next;
+        }
+
+        # Diamond operator: <$fh> or <STDIN>
+        if ($ch eq "<") {
+            # Look ahead for $var> or IDENT>
+            my int $save = $lx{"pos"};
+            $lx{"pos"} = $pos + 1;
+            # Skip whitespace
+            while ($lx{"pos"} < $len && substr($source, $lx{"pos"}, 1) eq " ") { $lx{"pos"} = $lx{"pos"} + 1; }
+            if ($lx{"pos"} < $len && substr($source, $lx{"pos"}, 1) eq "$") {
+                # <$fh> — readline
+                my str $var_tok = _read_sigil_var(\%lx, "$");
+                if (length($var_tok) > 0) {
+                    # Skip whitespace
+                    while ($lx{"pos"} < $len && substr($source, $lx{"pos"}, 1) eq " ") { $lx{"pos"} = $lx{"pos"} + 1; }
+                    if ($lx{"pos"} < $len && substr($source, $lx{"pos"}, 1) eq ">") {
+                        $lx{"pos"} = $lx{"pos"} + 1;
+                        push(@tokens, _tok("READLINE", $var_tok, $lx{"line"}));
+                        next;
+                    }
+                }
+            }
+            # Bare <> — diamond against @ARGV (or STDIN if empty)
+            if ($lx{"pos"} < $len && substr($source, $lx{"pos"}, 1) eq ">") {
+                $lx{"pos"} = $lx{"pos"} + 1;
+                push(@tokens, _tok("READLINE", "ARGV", $lx{"line"}));
+                next;
+            }
+            # Check for <STDIN> or <STDOUT> or <STDERR>
+            my int $id_start = $lx{"pos"};
+            while ($lx{"pos"} < $len && _is_ident_char(substr($source, $lx{"pos"}, 1))) { $lx{"pos"} = $lx{"pos"} + 1; }
+            if ($lx{"pos"} > $id_start && $lx{"pos"} < $len && substr($source, $lx{"pos"}, 1) eq ">") {
+                my str $handle = substr($source, $id_start, $lx{"pos"} - $id_start);
+                $lx{"pos"} = $lx{"pos"} + 1;
+                push(@tokens, _tok("READLINE", $handle, $lx{"line"}));
+                next;
+            }
+            # <PATTERN> — glob form. If contents look like a glob pattern
+            # (contain *, ?, [, ~ — NOT . or / alone since `<` is often a
+            # less-than op like `$i < scalar(@items) - 1)`) and end with
+            # `>` on the same line with reasonable length, treat as
+            # `glob "PATTERN"`. Matches perl's <*.txt> shorthand.
+            #
+            # Conservative: require a strong glob indicator (* or ?), not
+            # just any path-like char, to avoid eating `$i < N >= M` and
+            # similar arithmetic. Also bail on whitespace inside (real
+            # glob patterns don't have spaces) and cap the scan length.
+            $lx{"pos"} = $save + 1;  # restart after `<`
+            my int $__gp_start = $lx{"pos"};
+            my int $__gp_strong_meta = 0;
+            my int $__gp_bail = 0;
+            my int $__gp_scan_limit = $__gp_start + 256;
+            if ($__gp_scan_limit > $len) { $__gp_scan_limit = $len; }
+            while ($lx{"pos"} < $__gp_scan_limit) {
+                my str $__gpc = substr($source, $lx{"pos"}, 1);
+                if ($__gpc eq ">") { last; }
+                if ($__gpc eq "\n" || $__gpc eq "\r") { $__gp_bail = 1; last; }
+                # Whitespace, semicolon, comma, parens — too perl-y, bail.
+                if ($__gpc eq " " || $__gpc eq "\t" || $__gpc eq ";"
+                    || $__gpc eq "," || $__gpc eq "(" || $__gpc eq ")"
+                    || $__gpc eq "{" || $__gpc eq "}") { $__gp_bail = 1; last; }
+                if ($__gpc eq "*" || $__gpc eq "?" || $__gpc eq "[") {
+                    $__gp_strong_meta = 1;
+                }
+                $lx{"pos"} = $lx{"pos"} + 1;
+            }
+            if ($__gp_bail == 0 && $__gp_strong_meta == 1 && $lx{"pos"} < $len
+                && substr($source, $lx{"pos"}, 1) eq ">") {
+                my str $__gp_pat = substr($source, $__gp_start, $lx{"pos"} - $__gp_start);
+                $lx{"pos"} = $lx{"pos"} + 1;  # consume `>`
+                # Emit as glob() call: IDENT "glob" + LPAREN + (D)STRING + RPAREN
+                # Use DQSTRING when pattern contains `$` or `@` so vars
+                # interpolate at runtime (matches perl's <$dir/*.txt>
+                # semantics). Plain STRING for literal patterns avoids
+                # the runtime interp overhead.
+                my int $__gp_has_var = 0;
+                my int $__gp_pi = 0;
+                my int $__gp_pl = length($__gp_pat);
+                while ($__gp_pi < $__gp_pl) {
+                    my str $__gp_pc = substr($__gp_pat, $__gp_pi, 1);
+                    if ($__gp_pc eq "\$" || $__gp_pc eq "@") {
+                        $__gp_has_var = 1;
+                        last;
+                    }
+                    $__gp_pi = $__gp_pi + 1;
+                }
+                push(@tokens, _tok("IDENT", "glob", $lx{"line"}));
+                push(@tokens, _tok("LPAREN", "(", $lx{"line"}));
+                if ($__gp_has_var == 1) {
+                    push(@tokens, _tok("DQSTRING", $__gp_pat, $lx{"line"}));
+                } else {
+                    push(@tokens, _tok("STRING", $__gp_pat, $lx{"line"}));
+                }
+                push(@tokens, _tok("RPAREN", ")", $lx{"line"}));
+                next;
+            }
+            # Not a diamond — restore and fall through to operator handling
+            $lx{"pos"} = $save;
+        }
+
+        # Single-char operators/punctuation
+        if ($ch eq "(") { push(@tokens, _tok("LPAREN", "(", $lx{"line"})); $lx{"pos"} = $pos + 1; next; }
+        if ($ch eq ")") { push(@tokens, _tok("RPAREN", ")", $lx{"line"})); $lx{"pos"} = $pos + 1; next; }
+        if ($ch eq "[") { push(@tokens, _tok("LBRACKET", "[", $lx{"line"})); $lx{"pos"} = $pos + 1; next; }
+        if ($ch eq "]") { push(@tokens, _tok("RBRACKET", "]", $lx{"line"})); $lx{"pos"} = $pos + 1; next; }
+        if ($ch eq "{") { push(@tokens, _tok("LBRACE", "{", $lx{"line"})); $lx{"pos"} = $pos + 1; next; }
+        if ($ch eq "}") { push(@tokens, _tok("RBRACE", "}", $lx{"line"})); $lx{"pos"} = $pos + 1; next; }
+        if ($ch eq ";") { push(@tokens, _tok("SEMI", ";", $lx{"line"})); $lx{"pos"} = $pos + 1; next; }
+        if ($ch eq ",") { push(@tokens, _tok("COMMA", ",", $lx{"line"})); $lx{"pos"} = $pos + 1; next; }
+        if ($ch eq "\\") { push(@tokens, _tok("BACKSLASH", "\\", $lx{"line"})); $lx{"pos"} = $pos + 1; next; }
+
+        # Single-char operators
+        if ($ch eq "+" || $ch eq "-" || $ch eq "*" || $ch eq "/" ||
+            $ch eq "%" || $ch eq "." || $ch eq "<" || $ch eq ">" ||
+            $ch eq "!" || $ch eq "~" || $ch eq "&" || $ch eq "|" ||
+            $ch eq "^" || $ch eq "?" || $ch eq ":" || $ch eq "=") {
+            push(@tokens, _tok("OP", $ch, $lx{"line"}));
+            $lx{"pos"} = $pos + 1;
+            next;
+        }
+
+        # Unknown character — skip
+        $lx{"pos"} = $pos + 1;
+    }
+
+    push(@tokens, _tok("EOF", "", $lx{"line"}));
+    return @tokens;
+}
+
+# --- Token constructor ---
+func _tok(str $type, str $value, int $line) scalar {
+    my hash %t = ();
+    $t{"type"} = $type;
+    $t{"value"} = $value;
+    $t{"line"} = $line;
+    return \%t;
+}
+
+# --- Read single-quoted string ---
+func _read_sq(scalar $lx) str {
+    my str $src = $lx->{"src"};
+    my int $len = $lx->{"len"};
+    $lx->{"pos"} = $lx->{"pos"} + 1;  # skip opening '
+    my str $result = "";
+    while ($lx->{"pos"} < $len) {
+        my int $pos = $lx->{"pos"};
+        my str $c = substr($src, $pos, 1);
+        if ($c eq "'") {
+            $lx->{"pos"} = $pos + 1;
+            return $result;
+        }
+        if ($c eq "\\" && $pos + 1 < $len) {
+            my str $next = substr($src, $pos + 1, 1);
+            if ($next eq "'" || $next eq "\\") {
+                $result = $result . $next;
+                $lx->{"pos"} = $pos + 2;
+                next;
+            }
+        }
+        $result = $result . $c;
+        $lx->{"pos"} = $pos + 1;
+    }
+    return $result;
+}
+
+# --- Read double-quoted string (no interpolation at lex stage — stored raw) ---
+func _read_dq(scalar $lx) str {
+    my str $src = $lx->{"src"};
+    my int $len = $lx->{"len"};
+    $lx->{"pos"} = $lx->{"pos"} + 1;  # skip opening "
+    my str $result = "";
+    while ($lx->{"pos"} < $len) {
+        my int $pos = $lx->{"pos"};
+        my str $c = substr($src, $pos, 1);
+        if ($c eq "\"") {
+            $lx->{"pos"} = $pos + 1;
+            return $result;
+        }
+        if ($c eq "\n") { $lx->{"line"} = $lx->{"line"} + 1; }
+        if ($c eq "\\" && $pos + 1 < $len) {
+            my str $next = substr($src, $pos + 1, 1);
+            $result = $result . $c . $next;
+            $lx->{"pos"} = $pos + 2;
+            next;
+        }
+        $result = $result . $c;
+        $lx->{"pos"} = $pos + 1;
+    }
+    return $result;
+}
+
+# --- Read sigil variable ($x, @arr, %hash, $$ref, $hash{k}, etc.) ---
+func _read_sigil_var(scalar $lx, str $sigil) str {
+    my str $src = $lx->{"src"};
+    my int $len = $lx->{"len"};
+    my int $pos = $lx->{"pos"};
+    $pos++;  # skip sigil
+
+    if ($pos >= $len) { return ""; }
+
+    my str $ch = substr($src, $pos, 1);
+
+    # `%+` (named regex captures hash) and `%-` (all named captures
+    # array-of-arrays). Without these, `%+` lexed as sigil-only and
+    # got parsed as modulo OP or DEREF_HASH_SIGIL, breaking
+    # `my %h = %+` and other whole-hash uses of the named-capture
+    # registry.
+    if ($sigil eq "%" && ($ch eq "+" || $ch eq "-")) {
+        $pos++;
+        $lx->{"pos"} = $pos;
+        return $ch;
+    }
+
+    # `@+` and `@-` — regex match offset arrays (counterpart to %+/%-).
+    # Without these, `@-` lexed as `@` sigil-only + `-` OP and the
+    # parser misread it as unary minus or arithmetic. Element form
+    # `$+[N]` / `$-[N]` already works via the SCALAR_VAR `+`/`-` path
+    # (see below); the whole-array form just needs the lex rule here.
+    if ($sigil eq "@" && ($ch eq "+" || $ch eq "-")) {
+        $pos++;
+        $lx->{"pos"} = $pos;
+        return $ch;
+    }
+
+    # Special variables: $_, $!, $@, $/, etc.
+    if ($sigil eq "$") {
+        if ($ch eq "_" && ($pos + 1 >= $len || !_is_ident_char(substr($src, $pos + 1, 1)))) {
+            $pos++;
+            $lx->{"pos"} = $pos;
+            return "_";
+        }
+        if ($ch eq "!" || $ch eq "@" || $ch eq "/" || $ch eq "\\" ||
+            $ch eq "," || $ch eq ";" || $ch eq "\"" || $ch eq "&" ||
+            $ch eq "`" || $ch eq "'" || $ch eq "+" || $ch eq "0" ||
+            $ch eq "|" || $ch eq "?" || $ch eq "-" || $ch eq "." ||
+            $ch eq "~" || $ch eq "=") {
+            # $~ — current format name; $= — page length.
+            # Perl format-control specials.
+            $pos++;
+            $lx->{"pos"} = $pos;
+            return $ch;
+        }
+        # $% — current page number — only when NOT followed by an
+        # identifier char, so the rare `$%foo` hash-deref idiom stays
+        # `$` + `%foo` (handled elsewhere).
+        if ($ch eq "%" && ($pos + 1 >= $len || !_is_ident_char(substr($src, $pos + 1, 1)))) {
+            $pos++;
+            $lx->{"pos"} = $pos;
+            return $ch;
+        }
+        # $< / $> — real / effective UID. $( / $) — real / effective GID.
+        # Without lexing these as SCALAR_VAR, the parser saw `$ <` and
+        # misread it as a sigil followed by a less-than OP. Codegen has
+        # paths for these names; see CodeGen.strada and Interp.strada.
+        # Only lex as SCALAR_VAR when not followed by an ident char (so
+        # we don't accidentally swallow `$<FH>` diamond reads or `${(}`
+        # syntax — the close-paren cases are vanishingly rare).
+        if ($ch eq "<" || $ch eq ">" || $ch eq "(" || $ch eq ")") {
+            my str $nc = $pos + 1 < $len ? substr($src, $pos + 1, 1) : "";
+            if (!_is_ident_char($nc)) {
+                $pos++;
+                $lx->{"pos"} = $pos;
+                return $ch;
+            }
+        }
+        # $$ — PID if not followed by ident, else $$ref (scalar deref).
+        # Multiple `$`s in a row — $$$ref is `${${$ref}}` (double deref),
+        # $$$$ref is triple, etc. Consume all leading `$`s and only treat
+        # as PID if nothing identifier-like follows.
+        if ($ch eq "$") {
+            my int $extra = 0;
+            while ($pos + $extra < $len && substr($src, $pos + $extra, 1) eq "$") {
+                $extra++;
+            }
+            # After the run of `$`s, is there an ident_start?
+            if ($pos + $extra < $len && _is_ident_start(substr($src, $pos + $extra, 1))) {
+                # `$$ref`, `$$$ref`, etc. — N-level deref. Return name as
+                # `$$...ref` (one `$` per extra deref level beyond the
+                # sigil). Parser peels one `$` per deref-wrap step.
+                $pos = $pos + $extra;
+                my int $start = $pos;
+                while ($pos < $len && _is_ident_char(substr($src, $pos, 1))) { $pos++; }
+                $lx->{"pos"} = $pos;
+                my str $prefix = "";
+                my int $pi = 0;
+                while ($pi < $extra) { $prefix = $prefix . "$"; $pi++; }
+                return $prefix . substr($src, $start, $pos - $start);
+            }
+            # Bare $$, no ident follows — PID.
+            $pos++;
+            $lx->{"pos"} = $pos;
+            return "$";
+        }
+        # $1 - $9 capture vars
+        if ($ch ge "1" && $ch le "9") {
+            $pos++;
+            $lx->{"pos"} = $pos;
+            return $ch;
+        }
+        # $$ref (scalar deref)
+        if ($ch eq "$") {
+            $pos++;
+            my int $start = $pos;
+            while ($pos < $len && _is_ident_char(substr($src, $pos, 1))) { $pos++; }
+            if ($pos > $start) {
+                $lx->{"pos"} = $pos;
+                return "$" . substr($src, $start, $pos - $start);
+            }
+            $lx->{"pos"} = $pos;
+            return "$";
+        }
+    }
+
+    # Caret-prefixed magic names for @ and % sigils: @^H, %^H, @^W, etc.
+    # `$` already has its own caret path earlier in the lexer; here we
+    # handle the same forms for @ and %. Without this, `%^H` returned
+    # an empty name and the parser then failed with a spurious
+    # "expected RPAREN, got IDENT 'H'" at the trailing identifier.
+    # ${^NAME} is handled separately by the braced-sigil path.
+    if (($sigil eq "@" || $sigil eq "%") && $ch eq "^" && $pos + 1 < $len) {
+        my str $caret_ch = substr($src, $pos + 1, 1);
+        if ($caret_ch ge "A" && $caret_ch le "Z") {
+            $lx->{"pos"} = $pos + 2;
+            return "^" . $caret_ch;
+        }
+    }
+
+    # `$::name` is Perl shorthand for `$main::name` — leading `::` denotes
+    # the main package. Without recognizing it here, the lexer bailed
+    # with empty name → `$::var` parsed as `$` (PID sigil) + bare `:`,
+    # which downstream emitted `strada_new_str("::var")` and gcc
+    # rejected `... = perla_increment(...)` on a string-literal lvalue.
+    if ($ch eq ":" && $pos + 1 < $len && substr($src, $pos + 1, 1) eq ":"
+        && $pos + 2 < $len && _is_ident_start(substr($src, $pos + 2, 1))) {
+        my int $lc_start = $pos + 2;
+        my int $lc_p = $lc_start;
+        while ($lc_p < $len && _is_ident_char(substr($src, $lc_p, 1))) { $lc_p++; }
+        while ($lc_p + 1 < $len && substr($src, $lc_p, 2) eq "::") {
+            $lc_p = $lc_p + 2;
+            while ($lc_p < $len && _is_ident_char(substr($src, $lc_p, 1))) { $lc_p++; }
+        }
+        $lx->{"pos"} = $lc_p;
+        return "main::" . substr($src, $lc_start, $lc_p - $lc_start);
+    }
+
+    # Regular identifier
+    if (!_is_ident_start($ch)) {
+        # Not a valid variable — back up (don't update lx pos)
+        return "";
+    }
+
+    my int $start = $pos;
+    while ($pos < $len && _is_ident_char(substr($src, $pos, 1))) { $pos++; }
+
+    # Check for package qualifier
+    while ($pos + 1 < $len && substr($src, $pos, 2) eq "::") {
+        $pos = $pos + 2;
+        while ($pos < $len && _is_ident_char(substr($src, $pos, 1))) { $pos++; }
+    }
+
+    my str $name = substr($src, $start, $pos - $start);
+    $lx->{"pos"} = $pos;
+    return $name;
+}
+
+func _is_ident_start(str $ch) int {
+    return ($ch ge "a" && $ch le "z") || ($ch ge "A" && $ch le "Z") || $ch eq "_";
+}
+
+# Read raw C code block: __C__ { ... }
+# Handles nested braces, C strings, C comments
+func _read_c_block(scalar $lx) str {
+    my str $source = $lx->{"src"};
+    my int $len = length($source);
+
+    # Skip whitespace to opening {
+    while ($lx->{"pos"} < $len) {
+        my str $c = substr($source, $lx->{"pos"}, 1);
+        if ($c eq " " || $c eq "\t" || $c eq "\r") { $lx->{"pos"} = $lx->{"pos"} + 1; }
+        elsif ($c eq "\n") { $lx->{"pos"} = $lx->{"pos"} + 1; $lx->{"line"} = $lx->{"line"} + 1; }
+        else { last; }
+    }
+
+    if ($lx->{"pos"} >= $len || substr($source, $lx->{"pos"}, 1) ne "{") {
+        return "";
+    }
+    $lx->{"pos"} = $lx->{"pos"} + 1;  # skip {
+
+    my str $result = "";
+    my int $depth = 1;
+    while ($lx->{"pos"} < $len && $depth > 0) {
+        my str $ch = substr($source, $lx->{"pos"}, 1);
+
+        if ($ch eq "\n") { $lx->{"line"} = $lx->{"line"} + 1; }
+
+        # C strings — don't count braces inside
+        if ($ch eq "\"") {
+            $result = $result . $ch;
+            $lx->{"pos"} = $lx->{"pos"} + 1;
+            while ($lx->{"pos"} < $len) {
+                my str $sc = substr($source, $lx->{"pos"}, 1);
+                $result = $result . $sc;
+                $lx->{"pos"} = $lx->{"pos"} + 1;
+                if ($sc eq "\"") { last; }
+                if ($sc eq "\\") {
+                    if ($lx->{"pos"} < $len) {
+                        $result = $result . substr($source, $lx->{"pos"}, 1);
+                        $lx->{"pos"} = $lx->{"pos"} + 1;
+                    }
+                }
+            }
+            next;
+        }
+        # C char literals
+        if ($ch eq "'") {
+            $result = $result . $ch;
+            $lx->{"pos"} = $lx->{"pos"} + 1;
+            while ($lx->{"pos"} < $len) {
+                my str $sc = substr($source, $lx->{"pos"}, 1);
+                $result = $result . $sc;
+                $lx->{"pos"} = $lx->{"pos"} + 1;
+                if ($sc eq "'") { last; }
+                if ($sc eq "\\") {
+                    if ($lx->{"pos"} < $len) {
+                        $result = $result . substr($source, $lx->{"pos"}, 1);
+                        $lx->{"pos"} = $lx->{"pos"} + 1;
+                    }
+                }
+            }
+            next;
+        }
+        # Block comments /* */
+        if ($ch eq "/" && $lx->{"pos"} + 1 < $len && substr($source, $lx->{"pos"} + 1, 1) eq "*") {
+            $result = $result . "/*";
+            $lx->{"pos"} = $lx->{"pos"} + 2;
+            while ($lx->{"pos"} + 1 < $len) {
+                if (substr($source, $lx->{"pos"}, 2) eq "*/") {
+                    $result = $result . "*/";
+                    $lx->{"pos"} = $lx->{"pos"} + 2;
+                    last;
+                }
+                $result = $result . substr($source, $lx->{"pos"}, 1);
+                $lx->{"pos"} = $lx->{"pos"} + 1;
+            }
+            next;
+        }
+        # Line comments //
+        if ($ch eq "/" && $lx->{"pos"} + 1 < $len && substr($source, $lx->{"pos"} + 1, 1) eq "/") {
+            while ($lx->{"pos"} < $len && substr($source, $lx->{"pos"}, 1) ne "\n") {
+                $result = $result . substr($source, $lx->{"pos"}, 1);
+                $lx->{"pos"} = $lx->{"pos"} + 1;
+            }
+            next;
+        }
+        # Nested braces
+        if ($ch eq "{") { $depth = $depth + 1; $result = $result . $ch; }
+        elsif ($ch eq "}") {
+            $depth = $depth - 1;
+            if ($depth > 0) { $result = $result . $ch; }
+        }
+        else { $result = $result . $ch; }
+        $lx->{"pos"} = $lx->{"pos"} + 1;
+    }
+    return $result;
+}
+
+func _is_ident_char(str $ch) int {
+    return ($ch ge "a" && $ch le "z") || ($ch ge "A" && $ch le "Z") || ($ch ge "0" && $ch le "9") || $ch eq "_";
+}
+
+# --- Classify identifier/keyword ---
+func _classify_word(str $word) str {
+    if ($word eq "my") { return "MY"; }
+    if ($word eq "our") { return "OUR"; }
+    if ($word eq "local") { return "LOCAL"; }
+    if ($word eq "sub") { return "SUB"; }
+    if ($word eq "if") { return "IF"; }
+    if ($word eq "elsif") { return "ELSIF"; }
+    if ($word eq "else") { return "ELSE"; }
+    if ($word eq "unless") { return "UNLESS"; }
+    if ($word eq "while") { return "WHILE"; }
+    if ($word eq "until") { return "UNTIL"; }
+    if ($word eq "for") { return "FOR"; }
+    if ($word eq "foreach") { return "FOREACH"; }
+    if ($word eq "do") { return "DO"; }
+    if ($word eq "return") { return "RETURN"; }
+    if ($word eq "last") { return "LAST"; }
+    if ($word eq "next") { return "NEXT"; }
+    if ($word eq "redo") { return "REDO"; }
+    if ($word eq "given") { return "GIVEN"; }
+    if ($word eq "when") { return "WHEN"; }
+    if ($word eq "default") { return "DEFAULT"; }
+    if ($word eq "package") { return "PACKAGE"; }
+    if ($word eq "use") { return "USE"; }
+    if ($word eq "no") { return "NO"; }
+    if ($word eq "require") { return "REQUIRE"; }
+    if ($word eq "BEGIN") { return "BEGIN"; }
+    if ($word eq "END") { return "END"; }
+    if ($word eq "INIT") { return "BEGIN"; }
+    if ($word eq "CHECK") { return "BEGIN"; }
+    if ($word eq "UNITCHECK") { return "BEGIN"; }
+    if ($word eq "eval") { return "EVAL"; }
+    if ($word eq "die") { return "DIE"; }
+    if ($word eq "warn") { return "WARN"; }
+    if ($word eq "print") { return "PRINT"; }
+    if ($word eq "say") { return "SAY"; }
+    if ($word eq "undef") { return "UNDEF"; }
+    if ($word eq "defined") { return "DEFINED"; }
+    if ($word eq "ref") { return "REF_FUNC"; }
+    if ($word eq "bless") { return "BLESS"; }
+    if ($word eq "wantarray") { return "WANTARRAY"; }
+    if ($word eq "caller") { return "CALLER"; }
+    if ($word eq "and") { return "OP"; }
+    if ($word eq "or") { return "OP"; }
+    if ($word eq "xor") { return "OP"; }
+    if ($word eq "not") { return "OP"; }
+    if ($word eq "eq") { return "OP"; }
+    if ($word eq "ne") { return "OP"; }
+    if ($word eq "lt") { return "OP"; }
+    if ($word eq "gt") { return "OP"; }
+    if ($word eq "le") { return "OP"; }
+    if ($word eq "ge") { return "OP"; }
+    if ($word eq "cmp") { return "OP"; }
+    if ($word eq "x") { return "OP"; }
+    if ($word eq "qw") { return "QW"; }
+    if ($word eq "qq") { return "QQ"; }
+    if ($word eq "q") { return "Q_QUOTE"; }
+    if ($word eq "qr") { return "QR"; }
+    if ($word eq "qx") { return "QX"; }
+    if ($word eq "map") { return "MAP"; }
+    if ($word eq "grep") { return "GREP"; }
+    if ($word eq "sort") { return "SORT"; }
+    if ($word eq "split") { return "SPLIT"; }
+    if ($word eq "push") { return "PUSH"; }
+    if ($word eq "pop") { return "POP"; }
+    if ($word eq "shift") { return "SHIFT"; }
+    if ($word eq "unshift") { return "UNSHIFT"; }
+    if ($word eq "splice") { return "SPLICE"; }
+    if ($word eq "keys") { return "KEYS"; }
+    if ($word eq "values") { return "VALUES"; }
+    if ($word eq "each") { return "EACH"; }
+    if ($word eq "exists") { return "EXISTS"; }
+    if ($word eq "delete") { return "DELETE"; }
+    if ($word eq "chomp") { return "CHOMP"; }
+    if ($word eq "chop") { return "CHOP"; }
+    if ($word eq "open") { return "OPEN"; }
+    if ($word eq "close") { return "CLOSE"; }
+    if ($word eq "strict") { return "IDENT"; }
+    if ($word eq "warnings") { return "IDENT"; }
+    if ($word eq "__C__") { return "C_BLOCK_START"; }
+    if ($word eq "__STRADA__") { return "STRADA_BLOCK_START"; }
+    if ($word eq "__FILE__") { return "FILE_CONST"; }
+    if ($word eq "__LINE__") { return "LINE_CONST"; }
+    if ($word eq "__PACKAGE__") { return "PACKAGE_CONST"; }
+    if ($word eq "__SUB__") { return "SUB_CONST"; }
+    if ($word eq "__END__") { return "END_MARKER"; }
+    if ($word eq "__DATA__") { return "DATA_MARKER"; }
+    return "IDENT";
+}

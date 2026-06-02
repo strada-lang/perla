@@ -1,0 +1,1515 @@
+# Perla::CodeGen::Subs — sub-definition codegen.
+#
+# Owns the three entry points that walk the AST emitting C function
+# bodies for Perl subs: `gen_sub_bodies_from_stmts` (top-level + nested
+# named sub hoisting), `gen_sub_bodies_from_stmts_eb` (eval-body-aware
+# variant that only hoists `sub NAME () { N }` empty-proto subs), and
+# `gen_sub_def` (the heavy lifter — emits the full StradaValue * function
+# body with arg unmarshaling, local-chain bookkeeping, closure cell
+# allocation, before/after hook dispatch, etc).
+#
+# Cross-module helpers we call are forward-declared in the __C__ block
+# below. We can't `use Perla::CodeGen;` because CodeGen.strada `use`s us
+# (cycle); without the decls gcc treats the calls as implicit-int and
+# truncates pointer returns to 32 bits in inline expressions → SIGSEGV.
+# Void-returning helpers are declared StradaValue* to match the
+# cross-module call codegen's `__call_result` capture pattern.
+
+use Perla::AST;
+use Perla::CodeGen::Collect;
+
+package Perla::CodeGen::Subs;
+
+# Cross-module forward decls for Perla::CodeGen helpers. We can't `use
+# Perla::CodeGen;` because CodeGen.strada `use`s us (cycle). Strada's native
+# body-less qualified `extern func` registers these in $cg->{"functions"}
+# with proper return-type info so call sites use the ordinary calling
+# convention and needs_temp_cleanup recognises owned returns. See the
+# matching block in Perla::CodeGen::Interp for context.
+extern func Perla::CodeGen::emit(scalar $cg, str $s) void;
+extern func Perla::CodeGen::ind(scalar $cg) void;
+extern func Perla::CodeGen::gen_expr(scalar $cg, scalar $node) void;
+extern func Perla::CodeGen::gen_stmt(scalar $cg, scalar $node) void;
+extern func Perla::CodeGen::gen_block_stmts(scalar $cg, scalar $node) void;
+extern func Perla::CodeGen::gen_expr_safe(scalar $cg, scalar $node) void;
+extern func Perla::CodeGen::gen_if_capture_return(scalar $cg, scalar $node, str $ret_var) void;
+extern func Perla::CodeGen::c_var(str $name) str;
+extern func Perla::CodeGen::c_var_a(str $name) str;
+extern func Perla::CodeGen::c_var_h(str $name) str;
+extern func Perla::CodeGen::c_var_for_vtype(str $vtype, str $name) str;
+extern func Perla::CodeGen::safe_ident(str $name) str;
+extern func Perla::CodeGen::sub_cname_q(str $qname) str;
+extern func Perla::CodeGen::perla_activate_sub_collisions(str $qname) scalar;
+extern func Perla::CodeGen::perla_restore_collisions(scalar $saved_ref) void;
+extern func Perla::CodeGen::expr_is_borrowed(scalar $node) int;
+
+# Conservative scan of a sub body AST to detect whether @_ (or anything
+# that needs perla_at_ live) is referenced. Returns 1 if @_ MAY be used,
+# 0 only when we're confident it isn't. Used by the __direct entry-point
+# codegen to skip the per-call perla_at_ rebuild for subs like
+# `sub fib { my (\$n)=@_; ... \$n ... }` whose bodies never touch @_
+# after the initial parameter bind.
+#
+# We err on the side of returning 1 (build perla_at_) — false positives
+# only cost the rebuild we'd have done anyway; false negatives are bugs
+# (NULL perla_at_ deref). Anything we don't recognize: return 1.
+#
+# `\$skip_top_param_bind` controls whether to ignore the initial
+# `my (...) = \@_;` pattern — that's the standard parameter unmarshal
+# already optimized to direct args, so its `\@_` reference doesn't
+# count as "uses \@_ in the body".
+func body_uses_at_underscore(scalar $node) int {
+    if (!defined($node)) { return 0; }
+    if (ref($node) ne "HASH") { return 0; }
+    my int $t = $node->{"type"};
+    # Direct @_ references that need perla_at_.
+    if ($t == Perla::AST::N_ARRAY_VAR() && defined($node->{"name"}) && $node->{"name"} eq "_") { return 1; }
+    if ($t == Perla::AST::N_HASH_VAR() && defined($node->{"name"}) && $node->{"name"} eq "_") { return 1; }
+    # `\$_[N]` — array elem on @_.
+    if ($t == Perla::AST::N_ARRAY_ELEM() && defined($node->{"array"}) && $node->{"array"} eq "_") { return 1; }
+    # Builtins that default to @_ when called with no args: shift, pop,
+    # unshift (default-pushes), wantarray (uses caller frame, NOT
+    # perla_at_), caller (also frame, not perla_at_). We treat
+    # shift/pop bare as @_-dependent. We're conservative — for any
+    # call we don't recognize, return 1 to be safe.
+    if ($t == Perla::AST::N_CALL() && defined($node->{"name"})) {
+        my str $nm = $node->{"name"};
+        my int $argc = 0;
+        if (defined($node->{"args"})) { $argc = scalar(@{$node->{"args"}}); }
+        # Bare shift/pop with no arg consult @_.
+        if (($nm eq "shift" || $nm eq "pop") && $argc == 0) { return 1; }
+        # `&IDENT` (no parens) passes caller's @_ — handled by a
+        # pass_caller_args flag on the call node.
+        if (defined($node->{"pass_caller_args"}) && $node->{"pass_caller_args"} == 1) { return 1; }
+        # Bareword `goto &foo` semantics — we don't bother distinguishing,
+        # just treat goto as needing @_.
+        if ($nm eq "goto") { return 1; }
+        # eval STRING — the eval'd code could reference @_ at runtime;
+        # be safe.
+        if ($nm eq "eval" && $argc >= 1 && defined($node->{"args"}->[0])
+            && $node->{"args"}->[0]->{"type"} != Perla::AST::N_BLOCK()) {
+            return 1;
+        }
+    }
+    # Symbolic deref like `@{"_"}` or `@$ref` where ref might be @_'s
+    # reference. Conservative: any deref-array of a non-literal is risky.
+    # We can't easily tell, so return 1 for any DEREF_ARRAY whose ref
+    # isn't a plain hashref/arrayref literal.
+    if ($t == Perla::AST::N_DEREF_ARRAY()) {
+        # Worth scanning the ref inner expression too.
+        if (defined($node->{"ref"}) && body_uses_at_underscore($node->{"ref"}) == 1) {
+            return 1;
+        }
+    }
+    # Recurse into all child AST nodes. Walk known structural fields
+    # without depending on the exact AST shape (different node types
+    # use different field names).
+    my array @field_names = ("body", "stmts", "then", "else", "init",
+                             "cond", "step", "expr", "value", "target",
+                             "ref", "object", "key", "index", "array",
+                             "hash", "left", "right", "operand", "from",
+                             "to", "lhs", "rhs", "true_branch",
+                             "false_branch", "block", "args", "elems",
+                             "keys_list", "indices", "vars");
+    my int $fi = 0;
+    while ($fi < scalar(@field_names)) {
+        my str $fn = $field_names[$fi];
+        if (exists($node->{$fn})) {
+            my scalar $child = $node->{$fn};
+            if (defined($child)) {
+                # If it's an arrayref of nodes, walk each.
+                if (ref($child) eq "ARRAY") {
+                    my int $ai = 0;
+                    while ($ai < scalar(@{$child})) {
+                        if (body_uses_at_underscore($child->[$ai]) == 1) { return 1; }
+                        $ai = $ai + 1;
+                    }
+                } else {
+                    if (body_uses_at_underscore($child) == 1) { return 1; }
+                }
+            }
+        }
+        $fi = $fi + 1;
+    }
+    return 0;
+}
+
+# Top-level scan for a sub body: skip the canonical `my (vars) = @_;`
+# parameter-binding statement at the head (the direct-call optimization
+# already handled it via positional params), then scan the rest.
+func sub_body_needs_perla_at(scalar $body_stmts) int {
+    if (!defined($body_stmts)) { return 0; }
+    my int $n = scalar(@{$body_stmts});
+    if ($n == 0) { return 0; }
+    my int $start = 0;
+    # Skip leading `my (...) = @_;` parameter bind — it's optimized to
+    # direct args, so its @_ reference doesn't need perla_at_.
+    my scalar $first = $body_stmts->[0];
+    if (defined($first) && $first->{"type"} == Perla::AST::N_MY()
+        && defined($first->{"init"})) {
+        my scalar $init = $first->{"init"};
+        if (defined($init) && $init->{"type"} == Perla::AST::N_ARRAY_VAR()
+            && defined($init->{"name"}) && $init->{"name"} eq "_") {
+            $start = 1;
+        }
+    }
+    # Also skip a leading run of `my $x = shift;` / `my $x = shift @_;`
+    # param binds — those too are bound positionally by __direct (and the
+    # eligibility check in analyze_sub_params already guaranteed the rest
+    # of the body never observes @_). Without skipping them, their bare
+    # `shift` would force a needless per-call @_ rebuild.
+    if ($start == 0) {
+        my int $ssi = 0;
+        while ($ssi < $n) {
+            my scalar $st = $body_stmts->[$ssi];
+            if (!defined($st) || $st->{"type"} != Perla::AST::N_MY()
+                || !defined($st->{"var"}) || !defined($st->{"init"})) { last; }
+            my scalar $sv = $st->{"var"};
+            if (!defined($sv) || $sv->{"type"} ne "SCALAR_VAR") { last; }
+            my scalar $ini = $st->{"init"};
+            if (!defined($ini) || $ini->{"type"} != Perla::AST::N_CALL()
+                || !defined($ini->{"name"}) || $ini->{"name"} ne "shift") { last; }
+            my int $sac = 0;
+            if (defined($ini->{"args"})) { $sac = scalar(@{$ini->{"args"}}); }
+            if ($sac > 0) {
+                if ($sac != 1) { last; }
+                my scalar $a0 = $ini->{"args"}->[0];
+                if (!defined($a0) || $a0->{"type"} != Perla::AST::N_ARRAY_VAR()
+                    || !defined($a0->{"name"}) || $a0->{"name"} ne "_") { last; }
+            }
+            $ssi = $ssi + 1;
+        }
+        $start = $ssi;
+    }
+    my int $si = $start;
+    while ($si < $n) {
+        if (body_uses_at_underscore($body_stmts->[$si]) == 1) { return 1; }
+        $si = $si + 1;
+    }
+    return 0;
+}
+
+# Collect the resolved C-variable names of single-var `my @arr` / `my %h`
+# sub-locals (for the sub-exit cleanup). Scalars are handled by the
+# sub_local_scalars list + decref/NULL at exit; arrays/hashes get NO such
+# cleanup, so each re-execution of `my @a = ...` in a repeatedly-called sub
+# orphans the prior container (a per-call leak). Returns an array of resolved
+# c-names (c_var_a / c_var_h). Skips param names and a `captures` set.
+func collect_sub_local_aggregates(scalar $node, scalar $param_names, scalar $capture_seen) scalar {
+    my array @aggs = ();
+    if (!defined($node->{"body"}) || !defined($node->{"body"}->{"stmts"})) { return \@aggs; }
+    my scalar $stmts = $node->{"body"}->{"stmts"};
+    my hash %seen = ();
+    my int $i = 0;
+    while ($i < scalar(@{$stmts})) {
+        my scalar $s = $stmts->[$i];
+        if (defined($s) && $s->{"type"} == Perla::AST::N_MY() && defined($s->{"var"})) {
+            my str $vn = $s->{"var"}->{"value"};
+            my str $vt = "" . $s->{"var"}->{"type"};
+            my str $cn = "";
+            if ($vt eq "ARRAY_VAR") { $cn = Perla::CodeGen::c_var_a($vn); }
+            elsif ($vt eq "HASH_VAR") { $cn = Perla::CodeGen::c_var_h($vn); }
+            if (length($cn) > 0
+                && !defined($seen{$cn})
+                && (!defined($param_names) || !defined($param_names->{$vn}))
+                && (!defined($capture_seen) || !defined($capture_seen->{$vn}))) {
+                push(@aggs, $cn);
+                $seen{$cn} = 1;
+            }
+        }
+        $i = $i + 1;
+    }
+    # Reverse to LIFO (declaration order) like the scalar list.
+    @aggs = reverse(@aggs);
+    return \@aggs;
+}
+
+# Emit `if (cn) { strada_decref(cn); cn = NULL; }` for each resolved
+# aggregate c-name. Inline form (no ind/newline) so it composes in both the
+# block-exit and N_RETURN emission contexts.
+func emit_sub_local_agg_cleanup(scalar $cg, scalar $aggs) void {
+    if (!defined($aggs)) { return; }
+    my int $i = 0;
+    while ($i < scalar(@{$aggs})) {
+        my str $cn = $aggs->[$i];
+        Perla::CodeGen::emit($cg, "if (" . $cn . ") { strada_decref(" . $cn . "); " . $cn . " = NULL; } ");
+        $i = $i + 1;
+    }
+}
+
+func gen_sub_bodies_from_stmts(scalar $cg, scalar $stmts) void {
+    # Perl's `sub X { A } ...; sub X { B };` redefinition semantic: at
+    # runtime the LAST definition wins (earlier `sub X` gets replaced,
+    # with a "Subroutine X redefined" warning). C linking is less
+    # forgiving — two function definitions with the same name are a
+    # hard error. Match Perl's semantic by counting how many times each
+    # qualified name appears across the AST, then emitting only on the
+    # LAST occurrence as we walk.
+    if (!defined($cg->{"_sub_emit_counts"})) {
+        my hash %totals = ();
+        Perla::CodeGen::Collect::count_subs_from_stmts(\%totals, $stmts);
+        $cg->{"_sub_emit_counts"} = \%totals;
+        $cg->{"_sub_emit_seen"} = {};
+    }
+    my scalar $totals = $cg->{"_sub_emit_counts"};
+    my scalar $seen = $cg->{"_sub_emit_seen"};
+    my int $i = 0;
+    while ($i < scalar(@{$stmts})) {
+        my scalar $stmt = $stmts->[$i];
+        if (defined($stmt)) {
+            if ($stmt->{"type"} == Perla::AST::N_SUB() && defined($stmt->{"name"})) {
+                my str $sn = $stmt->{"name"};
+                # Anonymous subs get a synthetic `__perla_anon_N` name
+                # assigned during expression-codegen (~CodeGen.strada
+                # line 10672). They're emitted separately via the
+                # `$cg->{anon_subs}` array AFTER this hoist pass runs.
+                # Without this skip, an anon sub whose use-site ran
+                # BEFORE this pass (`my $x = do { sub { ... } }`) gets
+                # double-emitted: once here (because it now has a name)
+                # and once from the anon_subs loop — gcc rejects with
+                # "redefinition of perla_sub_main___perla_anon_N".
+                if (length($sn) > 13 && substr($sn, 0, 13) eq "__perla_anon_") {
+                    $i = $i + 1;
+                    next;
+                }
+                my str $sp = $stmt->{"package"};
+                if (!defined($sp)) { $sp = "main"; }
+                my str $qn = $sp . "::" . $sn;
+                my int $cur = 0;
+                if (exists($seen->{$qn})) { $cur = 0 + $seen->{$qn}; }
+                $cur = $cur + 1;
+                $seen->{$qn} = $cur;
+                my int $total = 0;
+                if (exists($totals->{$qn})) { $total = 0 + $totals->{$qn}; }
+                if ($cur == $total) {
+                    gen_sub_def($cg, $stmt);
+                }
+                # Also emit any nested named subs (Perl semantics: they
+                # live in the enclosing package, not as closures).
+                if (defined($stmt->{"body"}) && defined($stmt->{"body"}->{"stmts"})) {
+                    my str $sname = $stmt->{"name"};
+                    my int $is_eb = 0;
+                    if (length($sname) > 18 && substr($sname, 0, 18) eq "__perla_eval_body_") {
+                        $is_eb = 1;
+                    }
+                    gen_sub_bodies_from_stmts_eb($cg, $stmt->{"body"}->{"stmts"}, $is_eb);
+                }
+            }
+            if ($stmt->{"type"} == Perla::AST::N_BLOCK() && defined($stmt->{"stmts"})) {
+                gen_sub_bodies_from_stmts($cg, $stmt->{"stmts"});
+            }
+            # Recurse into BEGIN/END blocks too (see _collect_subs_from_stmts).
+            if (($stmt->{"type"} == Perla::AST::N_BEGIN() || $stmt->{"type"} == Perla::AST::N_END())
+                && defined($stmt->{"body"}) && defined($stmt->{"body"}->{"stmts"})) {
+                gen_sub_bodies_from_stmts($cg, $stmt->{"body"}->{"stmts"});
+            }
+            # Recurse into eval { BLOCK } so a `sub NAME { ... }` declared
+            # inside an eval block gets emitted as a top-level function.
+            # Without this, the user's nested sub had no body — calls to
+            # it ran a no-op stub and `die` inside never fired.
+            if ($stmt->{"type"} == Perla::AST::N_EVAL_BLOCK()
+                && defined($stmt->{"body"}) && defined($stmt->{"body"}->{"stmts"})) {
+                gen_sub_bodies_from_stmts($cg, $stmt->{"body"}->{"stmts"});
+            }
+            # Recurse into if/unless/while/until/foreach/for_c bodies —
+            # `sub NAME { ... }` declared inside these is hoisted into
+            # the enclosing package (Perl semantics). Without recursion
+            # the named-sub body never gets emitted as a top-level fn.
+            if (($stmt->{"type"} == Perla::AST::N_IF() || $stmt->{"type"} == Perla::AST::N_UNLESS())) {
+                if (defined($stmt->{"then"}) && defined($stmt->{"then"}->{"stmts"})) {
+                    gen_sub_bodies_from_stmts($cg, $stmt->{"then"}->{"stmts"});
+                }
+                if (defined($stmt->{"else"}) && defined($stmt->{"else"}->{"stmts"})) {
+                    gen_sub_bodies_from_stmts($cg, $stmt->{"else"}->{"stmts"});
+                }
+            }
+            if (($stmt->{"type"} == Perla::AST::N_WHILE() || $stmt->{"type"} == Perla::AST::N_UNTIL()
+                 || $stmt->{"type"} == Perla::AST::N_FOREACH() || $stmt->{"type"} == Perla::AST::N_FOR_C())
+                && defined($stmt->{"body"}) && defined($stmt->{"body"}->{"stmts"})) {
+                gen_sub_bodies_from_stmts($cg, $stmt->{"body"}->{"stmts"});
+            }
+            # Recurse into `my $x = do { ... }` / `our $x = do { ... }` init.
+            if (($stmt->{"type"} == Perla::AST::N_MY() || $stmt->{"type"} == Perla::AST::N_OUR())
+                && defined($stmt->{"init"})) {
+                my scalar $init = $stmt->{"init"};
+                if (defined($init) && $init->{"type"} == Perla::AST::N_BLOCK()
+                    && defined($init->{"stmts"})) {
+                    gen_sub_bodies_from_stmts($cg, $init->{"stmts"});
+                }
+            }
+        }
+        $i++;
+    }
+}
+
+# Eval-body-aware variant of gen_sub_bodies_from_stmts. See
+# _collect_subs_from_stmts_eb for the rationale.
+func gen_sub_bodies_from_stmts_eb(scalar $cg, scalar $stmts, int $is_eb) void {
+    my scalar $totals = $cg->{"_sub_emit_counts"};
+    my scalar $seen = $cg->{"_sub_emit_seen"};
+    my int $i = 0;
+    while ($i < scalar(@{$stmts})) {
+        my scalar $stmt = $stmts->[$i];
+        if (defined($stmt)) {
+            # Mirror the hoist gate from collect_subs_from_stmts_eb:
+            # hoist empty-proto subs (constants) AND no-proto subs
+            # (eval STRING defining regular subs). Skip subs with
+            # non-empty prototypes to keep the bizowie regression
+            # avoidance from memory note 395.
+            my int $hoist_ok = 1;
+            # Hoist all sub forms from eval-body contexts: empty-proto
+            # (constants), no-proto (regular subs), AND non-empty proto
+            # (`sub myadd ($$) { ... }`). The earlier gate skipped non-
+            # empty-proto subs to avoid a bizowie regression (memory
+            # 395); the current bizowie still passes with the wider
+            # hoist and `eval q{ sub X (proto) { ... } }` now lands
+            # the prototype on perla_proto_table so prototype("X")
+            # returns the right value at runtime.
+            if ($stmt->{"type"} == Perla::AST::N_SUB() && defined($stmt->{"name"}) && $hoist_ok == 1) {
+                my str $sn = $stmt->{"name"};
+                # Skip synthetic-name anon subs (handled via anon_subs).
+                # See same guard in gen_sub_bodies_from_stmts above.
+                if (length($sn) > 13 && substr($sn, 0, 13) eq "__perla_anon_") {
+                    $i = $i + 1;
+                    next;
+                }
+                my str $sp = $stmt->{"package"};
+                if (!defined($sp)) { $sp = "main"; }
+                my str $qn = $sp . "::" . $sn;
+                my int $cur = 0;
+                if (exists($seen->{$qn})) { $cur = 0 + $seen->{$qn}; }
+                $cur = $cur + 1;
+                $seen->{$qn} = $cur;
+                my int $total = 0;
+                if (exists($totals->{$qn})) { $total = 0 + $totals->{$qn}; }
+                if ($cur == $total) {
+                    gen_sub_def($cg, $stmt);
+                }
+                if (defined($stmt->{"body"}) && defined($stmt->{"body"}->{"stmts"})) {
+                    gen_sub_bodies_from_stmts($cg, $stmt->{"body"}->{"stmts"});
+                }
+            }
+            if ($stmt->{"type"} == Perla::AST::N_BLOCK() && defined($stmt->{"stmts"})) {
+                gen_sub_bodies_from_stmts_eb($cg, $stmt->{"stmts"}, $is_eb);
+            }
+            if (($stmt->{"type"} == Perla::AST::N_BEGIN() || $stmt->{"type"} == Perla::AST::N_END())
+                && defined($stmt->{"body"}) && defined($stmt->{"body"}->{"stmts"})) {
+                gen_sub_bodies_from_stmts($cg, $stmt->{"body"}->{"stmts"});
+            }
+            if ($is_eb == 1
+                && ($stmt->{"type"} == Perla::AST::N_MY() || $stmt->{"type"} == Perla::AST::N_OUR())
+                && defined($stmt->{"init"})) {
+                my scalar $init = $stmt->{"init"};
+                if (defined($init) && $init->{"type"} == Perla::AST::N_BLOCK()
+                    && defined($init->{"stmts"})) {
+                    gen_sub_bodies_from_stmts_eb($cg, $init->{"stmts"}, $is_eb);
+                }
+            }
+            # Descend into if/unless branches and loop bodies so
+            # \`eval 'if (\$x) { sub foo { ... } }'\` actually emits
+            # the foo C function. Perla's eval wrapper inserts an
+            # outer if/then/else around the user's do-block; the
+            # nested sub lives in those branches.
+            if ($is_eb == 1
+                && ($stmt->{"type"} == Perla::AST::N_IF() || $stmt->{"type"} == Perla::AST::N_UNLESS())) {
+                if (defined($stmt->{"then"}) && defined($stmt->{"then"}->{"stmts"})) {
+                    gen_sub_bodies_from_stmts_eb($cg, $stmt->{"then"}->{"stmts"}, $is_eb);
+                }
+                if (defined($stmt->{"else"}) && defined($stmt->{"else"}->{"stmts"})) {
+                    gen_sub_bodies_from_stmts_eb($cg, $stmt->{"else"}->{"stmts"}, $is_eb);
+                }
+            }
+            if ($is_eb == 1
+                && ($stmt->{"type"} == Perla::AST::N_WHILE() || $stmt->{"type"} == Perla::AST::N_UNTIL()
+                    || $stmt->{"type"} == Perla::AST::N_FOREACH() || $stmt->{"type"} == Perla::AST::N_FOR_C())
+                && defined($stmt->{"body"}) && defined($stmt->{"body"}->{"stmts"})) {
+                gen_sub_bodies_from_stmts_eb($cg, $stmt->{"body"}->{"stmts"}, $is_eb);
+            }
+        }
+        $i++;
+    }
+}
+
+
+
+# --- Collect sigil collisions across the whole AST.
+# For each name declared via `my` / `our` / `state`, record the sigil.
+# If the same name is declared with two different sigils anywhere in the
+# compilation unit, mark it for C-name mangling so `%foo` / `@foo` /
+# `$foo` don't fight over a single `v_foo` slot. Only collision-marked
+# names get `__h` / `__a` suffixes; everything else keeps the legacy
+# `v_NAME` C var name, which preserves the historical behavior where
+# `$config->{key}` could read a `my %config` hash stored in v_config.
+func gen_sub_def(scalar $cg, scalar $node) void {
+    my str $name = $node->{"name"};
+    my str $pkg = $node->{"package"};
+    if (!defined($pkg)) { $pkg = $cg->{"pkg"}; }
+    my str $old_pkg = $cg->{"pkg"};
+    $cg->{"pkg"} = $pkg;  # Set current package for SUPER:: resolution
+    # Clear label map for new function scope (prevents stale label references)
+    $cg->{"label_map"} = {};
+    my str $qname = $pkg . "::" . $name;
+    my str $fname = Perla::CodeGen::sub_cname_q($qname);
+    # Track current sub's C function name for __SUB__ self-reference
+    # in anon (and named) sub bodies. Restored at exit so nested subs
+    # don't see the outer sub's name.
+    my str $__cs_saved_fname = "";
+    if (defined($cg->{"current_sub_fname"})) {
+        $__cs_saved_fname = "" . $cg->{"current_sub_fname"};
+    }
+    $cg->{"current_sub_fname"} = $fname;
+    # Activate per-sub collision view (file-scope ∪ this sub's local collisions).
+    # Restored at function exit so file-scope state is preserved across sub bodies.
+    my scalar $__sub_coll_saved = Perla::CodeGen::perla_activate_sub_collisions($qname);
+    # Closure cells are scope-local: each sub has its own sub-local
+    # `__perla_cell[64]` array (emitted at function entry — shadows the
+    # file-scope global). Cell indices restart at 0 per sub so each sub's
+    # cells fit in its own array, regardless of how many closures other
+    # subs in the module declared.
+    my scalar $__sub_sc_saved = $cg->{"shared_cells"};
+    my int $__sub_ci_saved = defined($cg->{"cell_idx"}) ? $cg->{"cell_idx"} : 0;
+    my scalar $__sub_sce_saved = $cg->{"shared_cells_emitted"};
+    $cg->{"shared_cells"} = {};
+    $cg->{"cell_idx"} = 0;
+    $cg->{"shared_cells_emitted"} = {};
+
+    # Check if this sub has known direct-arg params
+    my scalar $pinfo = $cg->{"sub_params"}->{$qname};
+    my int $has_direct = 0;
+    if (defined($pinfo)) { $has_direct = 1; }
+
+    if ($has_direct == 1) {
+        # Generate the direct-arg version first
+        my int $arity = $pinfo->{"arity"};
+        my scalar $pnames = $pinfo->{"names"};
+        # Number of leading param-bind statements the body emission skips
+        # (1 for `my (...) = @_`; N for a run of N `my $x = shift`).
+        my int $bind_skip = 1;
+        if (defined($pinfo->{"bind_stmts"})) { $bind_skip = $pinfo->{"bind_stmts"}; }
+        Perla::CodeGen::emit($cg, "StradaValue* " . $fname . "__direct(");
+        my int $pi = 0;
+        while ($pi < $arity) {
+            if ($pi > 0) { Perla::CodeGen::emit($cg, ", "); }
+            Perla::CodeGen::emit($cg, "StradaValue *" . Perla::CodeGen::c_var($pnames->[$pi]));
+            $pi++;
+        }
+        # Always trailing StradaValue *perla_args_full so __direct sees
+        # the ACTUAL @_ — extra args beyond declared arity aren't lost.
+        # Without this, `sub setter { my ($s,$k)=@_; @_==3 ? ... : ... }`
+        # called as setter($o, "k", "v") saw @_ as [s,k] only because
+        # __direct rebuilt perla_at_ from declared params only.
+        if ($arity > 0) { Perla::CodeGen::emit($cg, ", "); }
+        Perla::CodeGen::emit($cg, "StradaValue *perla_args_full");
+        Perla::CodeGen::emit($cg, ") {\n");
+        $cg->{"indent"} = 1;
+
+        # Push call stack for caller()
+        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "perla_call_push(\"" . $pkg . "\", \"" . $name . "\", \"" . $cg->{"filename"} . "\", 0);\n");
+
+        # Populate a local perla_at_ from the positional params so the body
+        # can reference @_ correctly. Real Perl: `my ($a, $b) = @_` doesn't
+        # consume @_, and `scalar @_` / `@_ < N` checks still see the count.
+        # Without this, __direct's body inherits whatever perla_at_ the
+        # caller happened to leave global — usually undef or unrelated args
+        # — and DBIC's `store_column`'s `@_ < 3` check falsely fires
+        # "set_column called for COL without value".
+        # Skip when the sub has no positional params (e.g. nullary
+        # methods like getters: `sub name { $_[0]->{name} }` — there `@_`
+        # via `$_[N]` reads positional args from perla_at_; if perla_at_
+        # is the caller's, that's what we want).
+        if ($arity > 0) {
+            # Detect whether the body actually uses @_. If not, skip the
+            # per-call array-rebuild — for tight recursive subs like
+            # `sub fib { my (\$n)=@_; ... }` whose body never references
+            # @_ after the initial param bind, this elides a
+            # strada_new_array + N strada_array_push_take + cleanup_push
+            # per call. For fib(30) that's ~1.6M skipped allocations.
+            my scalar $body_stmts = undef;
+            if (defined($node->{"body"}) && defined($node->{"body"}->{"stmts"})) {
+                $body_stmts = $node->{"body"}->{"stmts"};
+            }
+            my int $needs_at = 1;
+            if (defined($body_stmts)) {
+                $needs_at = sub_body_needs_perla_at($body_stmts);
+            }
+            # perla_at_ is the FULL caller args when available, else
+            # build from declared params (direct-call sites pass NULL).
+            # `my ($a,$b)=@_; @_==3 ? ...` patterns need to see all args.
+            Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "StradaValue *perla_at_;\n");
+            Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "if (perla_args_full) { perla_at_ = perla_args_full; strada_incref(perla_at_); }\n");
+            Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "else {\n");
+            if ($needs_at == 1) {
+                Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "  perla_at_ = strada_new_array();\n");
+                Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "  StradaArray *__pat_av = strada_deref_array(perla_at_);\n");
+                $pi = 0;
+                while ($pi < $arity) {
+                    my str $pn = Perla::CodeGen::c_var($pnames->[$pi]);
+                    Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "  if (" . $pn . ") { strada_incref(" . $pn . "); strada_array_push_take(__pat_av, " . $pn . "); } else { strada_array_push_take(__pat_av, strada_new_undef()); }\n");
+                    $pi++;
+                }
+            } else {
+                # Body doesn't touch @_ — leave perla_at_ as a sentinel
+                # empty-array marker that nothing in the body will read.
+                # NULL would crash any belt-and-suspenders reader; the
+                # shared static is cheap (no alloc, no decref).
+                Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "  perla_at_ = NULL; /* body doesn't access @_ */\n");
+            }
+            Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "}\n");
+            if ($needs_at == 1) {
+                Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "strada_cleanup_push(perla_at_);\n");
+            } else {
+                # Conditional cleanup: only push when perla_args_full was
+                # provided (so we'd hold a ref); skip otherwise (NULL).
+                Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "if (perla_at_) strada_cleanup_push(perla_at_);\n");
+            }
+            $pi = 0;
+        }
+
+        # Save cleanup-stack baseline so an early `return` only drains
+        # cleanups pushed by THIS function, not the caller's. Without
+        # this, `strada_cleanup_drain()` inside a `return EXPR` decrefs
+        # outer function's params (e.g. blessed `$self`) — they get
+        # freed mid-call, the StradaValue pool reuses the address for
+        # something else, and the bless silently disappears. Concrete
+        # case: DBIx::Class::ResultSet::_normalize_selection holds
+        # `$self` in its cleanup stack. Then it calls Hash::Merge::new,
+        # which has `return …` that emits `strada_cleanup_drain()` and
+        # decrefs `$self` to 0 — ResultSet::new then returns an
+        # unblessed value, schema lookups all return undef.
+        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "int __perla_cleanup_mark = strada_cleanup_mark();\n");
+        # Snapshot caller's wantarray context — internal `my @x = ()` assigns
+        # toggle __perla_want_list during the body, so the global doesn't
+        # reflect the caller's intent by the time we hit `return`. Use this
+        # local instead.
+        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "int __perla_caller_want_list = __perla_want_list;\n");
+        # Per-call mark for `local $h->{k} = v` save records — captures
+        # the runtime-global chain head on entry so we can restore back
+        # to it on exit (and the eval BLOCK can unwind through us).
+        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "void *__perla_local_chain_mark __attribute__((unused)) = __perla_local_chain;\n");
+        # Per-sub closure-cell table. Shadows the file-scope `__perla_cell[]`
+        # global so closures created in THIS sub don't collide with closures
+        # created by other subs (or by code we call between two same-scope
+        # closure creations). Concrete victim: setup_site creates a dbh_maker
+        # closure capturing $self, then runs a method chain whose DBIC code
+        # creates ITS OWN closures (overwriting global cell[0]), then
+        # creates a second dbh_maker that shares cell[0] for $self — and
+        # picks up the DBIC closure's slot pointer instead of $self's.
+        # With a sub-local table, intervening calls own their own array;
+        # this sub's cells are untouchable from the outside.
+        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "StradaValue **__perla_cell[64] __attribute__((unused)) = {0};\n");
+
+        # Safety: incref parameters so they stay alive even if caller's
+        # variable is reassigned. Push to cleanup stack for exception safety.
+        # Also record param names so subst-writeback can use the
+        # cleanup-aware reassignment pattern (see _emit_subst_writeback) —
+        # otherwise `$x =~ s///` on a param double-decrefs the caller's
+        # value via the stale cleanup-stack entry, corrupting caller's $t.
+        my scalar $saved_param_vars = $cg->{"param_vars"};
+        $cg->{"param_vars"} = {};
+        $pi = 0;
+        while ($pi < $arity) {
+            my str $pn = Perla::CodeGen::c_var($pnames->[$pi]);
+            Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "strada_incref(" . $pn . ");\n");
+            Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "strada_cleanup_push(" . $pn . ");\n");
+            $cg->{"param_vars"}->{$pnames->[$pi]} = 1;
+            $pi++;
+        }
+
+        # Reset local var and declared var tracking
+        my scalar $old_local_vars = $cg->{"local_vars"};
+        $cg->{"local_vars"} = {};
+        my int $old_local_chain_used = 0;
+        if (defined($cg->{"local_chain_used"})) { $old_local_chain_used = $cg->{"local_chain_used"}; }
+        $cg->{"local_chain_used"} = 0;
+        my scalar $old_declared_vars = $cg->{"declared_vars"};
+        $cg->{"declared_vars"} = {};
+        my scalar $old_same_scope_decls = $cg->{"same_scope_decls"};
+        $cg->{"same_scope_decls"} = {};
+        my scalar $old_my_lexicals = $cg->{"my_lexicals"};
+        $cg->{"my_lexicals"} = [];
+        # state_vars: track `state $X` decls so closures returned from
+        # this sub know to share via &v_X. Saved/restored to avoid bleed
+        # across sub boundaries.
+        my scalar $old_state_vars = $cg->{"state_vars"};
+        $cg->{"state_vars"} = {};
+        # Mark parameters as already declared so `my $param` doesn't re-declare.
+        # Also record them as in-scope `my` scalars for eval STRING capture.
+        $pi = 0;
+        while ($pi < $arity) {
+            $cg->{"declared_vars"}->{Perla::CodeGen::c_var($pnames->[$pi])} = 1;
+            my scalar $pl_entry = {};
+            $pl_entry->{"name"} = $pnames->[$pi];
+            $pl_entry->{"c_name"} = Perla::CodeGen::c_var($pnames->[$pi]);
+            $pl_entry->{"sigil"} = "\$";
+            push(@{$cg->{"my_lexicals"}}, $pl_entry);
+            $pi++;
+        }
+        my scalar $old_main_vars = $cg->{"main_vars"};
+        $cg->{"main_vars"} = undef;
+        my int $old_in_sub = $cg->{"in_sub"};
+        $cg->{"in_sub"} = 1;
+
+        # Collect top-level scalar `my $x` decls in the sub body so we
+        # can decref + NULL them at sub exit. perla uses file-scope C
+        # statics for sub-locals; without explicit reset, blessed objs
+        # held by the slot persist past the sub's return and DESTROY
+        # only fires at program-exit cleanup (the global registry sweep).
+        # Conservative: scan TOP-LEVEL stmts only; skip params (already
+        # handled by cleanup_pop loop), nested blocks (handled by the
+        # bare-block decref pass), if/while/for branches (each their own
+        # scope but currently share static slots — separate fix), and
+        # state vars (must persist across calls by design).
+        my array @__sub_local_scalars = ();
+        my hash %__sub_local_seen = ();
+        my hash %__sub_param_names = ();
+        my int $__sps_pi = 0;
+        while ($__sps_pi < $arity) {
+            $__sub_param_names{$pnames->[$__sps_pi]} = 1;
+            $__sps_pi = $__sps_pi + 1;
+        }
+        # DESTROY guard: skip sub-local cleanup for DESTROY methods.
+        # `sub DESTROY { my $self = shift; ... }` — the cleanup pass
+        # would decref $self at sub end, re-firing DESTROY on the same
+        # object → infinite recursion. The object's storage is being
+        # freed by the caller (perla_destroy_hook); $self is borrowed.
+        if ($name eq "DESTROY" && defined($node->{"body"}) && defined($node->{"body"}->{"stmts"})) {
+            # Skip collection entirely for DESTROY.
+        } elsif (defined($node->{"body"}) && defined($node->{"body"}->{"stmts"})) {
+            my scalar $__sb_stmts = $node->{"body"}->{"stmts"};
+            my int $__sb_si = 0;
+            while ($__sb_si < scalar(@{$__sb_stmts})) {
+                my scalar $__sb_s = $__sb_stmts->[$__sb_si];
+                if (defined($__sb_s) && $__sb_s->{"type"} == Perla::AST::N_MY()) {
+                    # Single-var form: { var => { value, type } }
+                    if (defined($__sb_s->{"var"})) {
+                        my str $__sb_vn = $__sb_s->{"var"}->{"value"};
+                        my str $__sb_vt = "" . $__sb_s->{"var"}->{"type"};
+                        if (length($__sb_vt) == 0) { $__sb_vt = "SCALAR_VAR"; }
+                        if ($__sb_vt eq "SCALAR_VAR"
+                            && !defined($__sub_param_names{$__sb_vn})
+                            && !defined($__sub_local_seen{$__sb_vn})) {
+                            push(@__sub_local_scalars, $__sb_vn);
+                            $__sub_local_seen{$__sb_vn} = 1;
+                        }
+                    }
+                    # Destructure form: { vars => [...] }. We DON'T track
+                    # destructure vars here because the param extraction
+                    # uses the same form and we'd double-cleanup it. A
+                    # destructure that's NOT the param-extraction (e.g.
+                    # `my ($x, $y) = some_call()`) is also typically
+                    # short-lived; conservative skip until a probe needs it.
+                }
+                $__sb_si = $__sb_si + 1;
+            }
+        }
+        # Reverse to declaration-LIFO order: Perl destroys sub-local
+        # lexicals at return in reverse order of declaration, so
+        # `my $a=Obj->new(1); my $b=Obj->new(2);` fires DESTROY(2) then
+        # DESTROY(1). Every consumer of this list (the exit decref loops
+        # below and the N_RETURN pass) just decrefs, so reversing here is
+        # the single point that fixes the order everywhere.
+        @__sub_local_scalars = reverse(@__sub_local_scalars);
+        # Stash the collected list in $cg so the N_RETURN codegen in
+        # CodeGen.strada can emit the same decref+NULL pass at explicit
+        # return points. Save/restore so nested subs don't bleed.
+        my scalar $__sub_locals_saved = $cg->{"sub_local_scalars"};
+        $cg->{"sub_local_scalars"} = \@__sub_local_scalars;
+        # Array/hash sub-locals get decref+NULL at exit too (see
+        # collect_sub_local_aggregates) — otherwise `my @x`/`my %h` leak per
+        # call. Stash for the N_RETURN pass; restored below.
+        my scalar $__sub_aggs = collect_sub_local_aggregates($node, \%__sub_param_names, undef);
+        my scalar $__sub_aggs_saved = $cg->{"sub_local_aggregates"};
+        $cg->{"sub_local_aggregates"} = $__sub_aggs;
+
+        # Generate body, skipping the first `my (...) = @_;` statement.
+        # Last statement: implicit return (matching the non-direct sub
+        # codegen). Without this, `sub { ...; $new; }` returned undef
+        # because __direct emitted `v_new;` (a no-op) followed by
+        # `return strada_undef_static();`. Foundational Perl semantics —
+        # broke DBIx::Class::Storage::new and any sub relying on
+        # implicit return.
+        if (defined($node->{"body"})) {
+            my scalar $stmts = $node->{"body"}->{"stmts"};
+            if (defined($stmts) && scalar(@{$stmts}) > $bind_skip) {
+                my int $last_s = scalar(@{$stmts}) - 1;
+                my int $si = $bind_skip;  # skip the param-extraction statement(s)
+                while ($si < $last_s) {
+                    Perla::CodeGen::gen_stmt($cg, $stmts->[$si]);
+                    $si++;
+                }
+                # Handle last statement: if it's an expression, capture
+                # as return value. Otherwise emit as statement (and fall
+                # to the trailing `return strada_undef_static();`).
+                my scalar $last_stmt = $stmts->[$last_s];
+                if (defined($last_stmt)) {
+                    my int $lst = $last_stmt->{"type"};
+                    my int $is_anon_sub = 0;
+                    if ($lst == Perla::AST::N_SUB() && !defined($last_stmt->{"name"})) {
+                        $is_anon_sub = 1;
+                    }
+                    if (!$is_anon_sub && ($lst == Perla::AST::N_IF() || $lst == Perla::AST::N_UNLESS())) {
+                        # Implicit-return-from-if. Set up __ret_val, let
+                        # each branch's tail capture into it. Falls through
+                        # to the trailing return path which now picks up
+                        # __ret_val if any branch ran.
+                        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "StradaValue *__ret_val = NULL;\n");
+                        Perla::CodeGen::gen_if_capture_return($cg, $last_stmt, "__ret_val");
+                        # Restore local vars + cleanup before returning
+                        if (defined($cg->{"local_vars"})) {
+                            my array @lv_r = keys(%{$cg->{"local_vars"}});
+                            my int $li_r = 0;
+                            while ($li_r < scalar(@lv_r)) {
+                                my str $lvname_r = $lv_r[$li_r];
+                                my str $lvt_r = "" . $cg->{"local_vars"}->{$lvname_r};
+                                if (length($lvt_r) == 0 || $lvt_r eq "1") { $lvt_r = "SCALAR_VAR"; }
+                                Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, Perla::CodeGen::c_var_for_vtype($lvt_r, $lvname_r) . " = __local_save_" . Perla::CodeGen::safe_ident($lvname_r) . ";\n");
+                                $li_r++;
+                            }
+                        }
+                        # Drain ALL cleanup entries pushed since the entry mark
+                        # — the params AND any temps the body left on the stack
+                        # (e.g. an array-slice-assign's `@{$self}` deref temp).
+                        # The old per-param strada_cleanup_pop()+decref popped
+                        # the body's temps off the top instead of the params,
+                        # stranding each param's OWN cleanup entry for the
+                        # caller's drain to hit later — double-decreffing a
+                        # blessed invocant `$self` (Path::Tiny::_splitpath, whose
+                        # only statement is `@{$self}[...] = ...`, freed $p out
+                        # from under its caller). drain_to matches the explicit
+                        # `return` path.
+                        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "strada_cleanup_drain_to(__perla_cleanup_mark);\n");
+                        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "if (__perla_local_chain != __perla_local_chain_mark) { perla_local_chain_restore_to(__perla_local_chain, __perla_local_chain_mark); __perla_local_chain = __perla_local_chain_mark; }\n");
+                        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "perla_call_pop();\n");
+                        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "return __ret_val ? __ret_val : strada_undef_static();\n");
+                        Perla::CodeGen::emit($cg, "}\n\n");
+                        $cg->{"indent"} = 0;
+                        $cg->{"local_vars"} = $old_local_vars;
+                        $cg->{"local_chain_used"} = $old_local_chain_used;
+                        $cg->{"declared_vars"} = $old_declared_vars;
+                        $cg->{"same_scope_decls"} = $old_same_scope_decls;
+                        $cg->{"main_vars"} = $old_main_vars;
+                        $cg->{"in_sub"} = $old_in_sub;
+                        $has_direct = 99;
+                    } elsif (!$is_anon_sub && (
+                        $lst == Perla::AST::N_WHILE() || $lst == Perla::AST::N_UNTIL() ||
+                        $lst == Perla::AST::N_FOR_C() || $lst == Perla::AST::N_FOREACH() ||
+                        $lst == Perla::AST::N_RETURN() || $lst == Perla::AST::N_SUB() ||
+                        $lst == Perla::AST::N_PACKAGE() || $lst == Perla::AST::N_USE() ||
+                        $lst == Perla::AST::N_BEGIN() || $lst == Perla::AST::N_END() ||
+                        $lst == Perla::AST::N_GOTO_SUB() ||
+                        $lst == Perla::AST::N_OUR() || $lst == Perla::AST::N_STATE())) {
+                        # Control flow / declaration — generate normally.
+                        # N_OUR/N_STATE need gen_stmt routing so the side effect
+                        # (stash mirror, lexical assign) actually happens. Without
+                        # this, `sub set_X { our $X = shift; }` falls into the
+                        # expression-return branch where gen_expr emits a TODO
+                        # placeholder — neither the assignment nor the package
+                        # mirror runs, and a sibling `sub get_X { our $X; $X }`
+                        # reads undef.
+                        Perla::CodeGen::gen_stmt($cg, $last_stmt);
+                    } else {
+                        # Expression — capture as return value.
+                        # CRITICAL: incref __ret_val BEFORE decref'ing the
+                        # params, since `__ret_val = v_param` (implicit
+                        # return of the param after `s///`) shares the
+                        # buffer with the param. Decrefing first frees the
+                        # buffer, then strada_incref re-grabs a stale
+                        # pointer (or one that's been recycled), corrupting
+                        # the returned string. Concrete: URI::Escape's
+                        # `$text =~ s///; $text` returning `$text` whose
+                        # value was reassigned to a fresh __esb by the
+                        # subst-writeback param-push path.
+                        # Set perla_pending_call_line when the implicit-return
+                        # expression is a bare call/method — so the callee's
+                        # perla_call_push records this call-site's line for
+                        # caller(0). Without this, calls in tail position
+                        # (e.g. `sub mid { deep(); }` where `deep()` is the
+                        # last stmt and becomes the implicit return) record
+                        # line=0 in the new frame.
+                        my int $__lr_type = $last_stmt->{"type"};
+                        my int $__lr_is_call = ($__lr_type == Perla::AST::N_CALL()
+                                                || $__lr_type == Perla::AST::N_METHOD()) ? 1 : 0;
+                        if ($__lr_is_call == 1) {
+                            my int $__lr_line = $last_stmt->{"line"} + 0;
+                            if ($__lr_line > 0) {
+                                Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "perla_pending_call_line = " . $__lr_line . ";\n");
+                            }
+                        }
+                        # Skip incref for already-owned returns (calls,
+                        # literals, anon ctors) — see expr_is_borrowed.
+                        my int $__lr_needs_incref = Perla::CodeGen::expr_is_borrowed($last_stmt);
+                        # bless is transparent (rc+0). If its first arg is
+                        # borrowed (a variable whose scope-cleanup decref
+                        # will fire), incref so caller sees a live ref.
+                        # If the arg is a fresh literal / anon ctor, leave
+                        # at 0 — extra incref leaks past DESTROY-at-exit.
+                        if ($__lr_needs_incref == 0
+                            && $last_stmt->{"type"} == Perla::AST::N_CALL()
+                            && defined($last_stmt->{"name"})
+                            && ($last_stmt->{"name"} eq "bless"
+                                || $last_stmt->{"name"} eq "CORE::bless")) {
+                            my scalar $__lr_bless_args = $last_stmt->{"args"};
+                            if (defined($__lr_bless_args)
+                                && scalar(@{$__lr_bless_args}) >= 1
+                                && Perla::CodeGen::expr_is_borrowed($__lr_bless_args->[0]) == 1) {
+                                $__lr_needs_incref = 1;
+                            }
+                        }
+                        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "{ StradaValue *__ret_val = ");
+                        Perla::CodeGen::gen_expr_safe($cg, $last_stmt);
+                        Perla::CodeGen::emit($cg, ";\n");
+                        if ($__lr_needs_incref == 1) {
+                            Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "if (__ret_val) strada_incref(__ret_val);\n");
+                        }
+                        # Restore local vars + cleanup before returning
+                        if (defined($cg->{"local_vars"})) {
+                            my array @lv_r = keys(%{$cg->{"local_vars"}});
+                            my int $li_r = 0;
+                            while ($li_r < scalar(@lv_r)) {
+                                my str $lvname_r = $lv_r[$li_r];
+                                my str $lvt_r = "" . $cg->{"local_vars"}->{$lvname_r};
+                                if (length($lvt_r) == 0 || $lvt_r eq "1") { $lvt_r = "SCALAR_VAR"; }
+                                Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, Perla::CodeGen::c_var_for_vtype($lvt_r, $lvname_r) . " = __local_save_" . Perla::CodeGen::safe_ident($lvname_r) . ";\n");
+                                $li_r++;
+                            }
+                        }
+                        # Drain ALL cleanup entries pushed since the entry mark
+                        # — the params AND any temps the body left on the stack
+                        # (e.g. an array-slice-assign's `@{$self}` deref temp).
+                        # The old per-param strada_cleanup_pop()+decref popped
+                        # the body's temps off the top instead of the params,
+                        # stranding each param's OWN cleanup entry for the
+                        # caller's drain to hit later — double-decreffing a
+                        # blessed invocant `$self` (Path::Tiny::_splitpath, whose
+                        # only statement is `@{$self}[...] = ...`, freed $p out
+                        # from under its caller). drain_to matches the explicit
+                        # `return` path.
+                        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "strada_cleanup_drain_to(__perla_cleanup_mark);\n");
+                        # Sub-local scalar `my` cleanup — fire DESTROY at sub exit.
+                        my int $__slc_i = 0;
+                        while ($__slc_i < scalar(@__sub_local_scalars)) {
+                            my str $__slc_vn = Perla::CodeGen::c_var($__sub_local_scalars[$__slc_i]);
+                            Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "if (" . $__slc_vn . ") { strada_decref(" . $__slc_vn . "); " . $__slc_vn . " = NULL; }\n");
+                            $__slc_i = $__slc_i + 1;
+                        }
+                        Perla::CodeGen::ind($cg); emit_sub_local_agg_cleanup($cg, $__sub_aggs); Perla::CodeGen::emit($cg, "\n");
+                        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "if (__perla_local_chain != __perla_local_chain_mark) { perla_local_chain_restore_to(__perla_local_chain, __perla_local_chain_mark); __perla_local_chain = __perla_local_chain_mark; }\n");
+                        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "perla_call_pop();\n");
+                        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "return __ret_val ? __ret_val : strada_undef_static(); }\n");
+                        Perla::CodeGen::emit($cg, "}\n\n");
+                        $cg->{"indent"} = 0;
+                        $cg->{"local_vars"} = $old_local_vars;
+                        $cg->{"local_chain_used"} = $old_local_chain_used;
+                        $cg->{"declared_vars"} = $old_declared_vars;
+                        $cg->{"same_scope_decls"} = $old_same_scope_decls;
+                        $cg->{"main_vars"} = $old_main_vars;
+                        $cg->{"in_sub"} = $old_in_sub;
+                        # Skip trailing cleanup since we already emitted it
+                        $has_direct = 99;
+                    }
+                }
+            } elsif (defined($stmts) && scalar(@{$stmts}) == 1) {
+                # Only the param-extraction statement — empty body.
+                # Fall through to the trailing return strada_undef_static().
+            }
+        }
+
+        if ($has_direct == 99) {
+            # Already emitted return path above.
+            $has_direct = 1;  # restore for downstream logic
+        } else {
+
+        # Restore local vars
+        if (defined($cg->{"local_vars"})) {
+            my array @lv = keys(%{$cg->{"local_vars"}});
+            my int $li = 0;
+            while ($li < scalar(@lv)) {
+                my str $lvname = $lv[$li];
+                my str $lvt = "" . $cg->{"local_vars"}->{$lvname};
+                if (length($lvt) == 0 || $lvt eq "1") { $lvt = "SCALAR_VAR"; }
+                Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, Perla::CodeGen::c_var_for_vtype($lvt, $lvname) . " = __local_save_" . Perla::CodeGen::safe_ident($lvname) . ";\n");
+                $li++;
+            }
+        }
+
+        # Cleanup: drain everything pushed since the entry mark (params plus
+        # any temps the body left on the cleanup stack). The old per-param
+        # strada_cleanup_pop()+decref mis-paired entries when the body pushed
+        # its own temps, stranding param cleanup entries for the caller to
+        # double-decref. drain_to matches the explicit `return` path.
+        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "strada_cleanup_drain_to(__perla_cleanup_mark);\n");
+        # Sub-local scalar `my` cleanup — fall-off-end path (see comment
+        # at last-expr-implicit-return path above).
+        my int $__sl2_i = 0;
+        while ($__sl2_i < scalar(@__sub_local_scalars)) {
+            my str $__sl2_vn = Perla::CodeGen::c_var($__sub_local_scalars[$__sl2_i]);
+            Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "if (" . $__sl2_vn . ") { strada_decref(" . $__sl2_vn . "); " . $__sl2_vn . " = NULL; }\n");
+            $__sl2_i = $__sl2_i + 1;
+        }
+        Perla::CodeGen::ind($cg); emit_sub_local_agg_cleanup($cg, $__sub_aggs); Perla::CodeGen::emit($cg, "\n");
+        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "if (__perla_local_chain != __perla_local_chain_mark) { perla_local_chain_restore_to(__perla_local_chain, __perla_local_chain_mark); __perla_local_chain = __perla_local_chain_mark; }\n");
+        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "perla_call_pop();\n");
+        # Context-sensitive fall-off-end return matching perl semantics:
+        # `sub foo {}` in list context returns (); in scalar returns undef.
+        # Without this perla returned a single undef value in both contexts,
+        # so `my @a = empty()` gave 1-element array instead of 0.
+        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "return __perla_caller_want_list ? strada_new_array() : strada_undef_static();\n");
+        Perla::CodeGen::emit($cg, "}\n\n");
+        }
+        $cg->{"indent"} = 0;
+        $cg->{"local_vars"} = $old_local_vars;
+        $cg->{"local_chain_used"} = $old_local_chain_used;
+        $cg->{"declared_vars"} = $old_declared_vars;
+        $cg->{"same_scope_decls"} = $old_same_scope_decls;
+        $cg->{"my_lexicals"} = $old_my_lexicals;
+        $cg->{"state_vars"} = $old_state_vars;
+        $cg->{"main_vars"} = $old_main_vars;
+        $cg->{"in_sub"} = $old_in_sub;
+        $cg->{"param_vars"} = $saved_param_vars;
+        # Restore the sub-local-scalar tracker so nested subs don't see
+        # this sub's list at N_RETURN cleanup time.
+        $cg->{"sub_local_scalars"} = $__sub_locals_saved;
+        $cg->{"sub_local_aggregates"} = $__sub_aggs_saved;
+
+        # Generate the wrapper that unpacks args and calls direct version
+        Perla::CodeGen::emit($cg, "StradaValue* " . $fname . "(StradaValue *perla_args) {\n");
+        Perla::CodeGen::emit($cg, "    StradaValue *perla_at_ = perla_args ? perla_args : strada_new_array();\n");
+        Perla::CodeGen::emit($cg, "    StradaArray *__pav = strada_deref_array(perla_at_);\n");
+        Perla::CodeGen::emit($cg, "    int __plen = __pav ? strada_array_length(__pav) : 0;\n");
+        Perla::CodeGen::emit($cg, "    return " . $fname . "__direct(");
+        $pi = 0;
+        while ($pi < $arity) {
+            if ($pi > 0) { Perla::CodeGen::emit($cg, ", "); }
+            Perla::CodeGen::emit($cg, "(" . $pi . " < __plen ? strada_array_get(__pav, " . $pi . ") : strada_new_undef())");
+            $pi++;
+        }
+        # Pass full perla_args so __direct's perla_at_ sees ALL caller args.
+        if ($arity > 0) { Perla::CodeGen::emit($cg, ", "); }
+        Perla::CodeGen::emit($cg, "perla_at_");
+        Perla::CodeGen::emit($cg, ");\n}\n\n");
+        $cg->{"pkg"} = $old_pkg;
+        return;
+    }
+
+    # Check if sub has captures (closure)
+    my scalar $captures = $node->{"captures"};
+    my int $has_captures = 0;
+    if (defined($captures) && scalar(@{$captures}) > 0) { $has_captures = 1; }
+
+    # Standard sub generation (no direct-arg optimization).
+    # Anonymous subs (`__perla_anon_N`) are emitted `static` so each
+    # .pm.so's copy stays file-local — otherwise two .so's loaded with
+    # RTLD_GLOBAL into the same process both export the same anon
+    # symbol and the dynamic linker interposes them, making every
+    # closure built in either eval point at the first eval's body
+    # (root cause of validators silently sharing implementations
+    # across distinct validation_for() calls).
+    my str $sub_static = "";
+    if (length($name) >= 13 && substr($name, 0, 13) eq "__perla_anon_") {
+        $sub_static = "static ";
+    }
+    if ($has_captures == 1) {
+        # Closure function: receives captures + perla_args
+        Perla::CodeGen::emit($cg, $sub_static . "StradaValue* " . $fname . "(StradaValue ***__captures, StradaValue *perla_args) {\n");
+    } else {
+        Perla::CodeGen::emit($cg, $sub_static . "StradaValue* " . $fname . "(StradaValue *perla_args) {\n");
+    }
+    $cg->{"indent"} = 1;
+
+    # Set up @_ from args array
+    Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "StradaValue *perla_at_ = perla_args ? perla_args : strada_new_array();\n");
+
+    # Push call stack for caller()
+    my str $fn_file = "" . $cg->{"filename"};
+    if (length($fn_file) == 0) { $fn_file = "(unknown)"; }
+    Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "perla_call_push(\"" . $pkg . "\", \"" . $name . "\", \"" . $fn_file . "\", 0);\n");
+
+    # Save cleanup-stack baseline (see comment on the __direct path).
+    Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "int __perla_cleanup_mark = strada_cleanup_mark();\n");
+    # @_ lifetime: when called with no args, perla_args is NULL and we created
+    # a fresh @_ above (strada_new_array) — it must be freed at exit or every
+    # no-arg call to this sub leaks one array. When perla_args is non-NULL we
+    # borrowed the caller's array; incref so the drain's decref balances and
+    # the caller's ownership is preserved. Pushed AFTER the mark so the
+    # drain_to(mark) at every exit path reclaims it (matches the __direct path,
+    # which increfs-if-borrowed + cleanup_pushes perla_at_).
+    Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "if (perla_args) strada_incref(perla_at_); strada_cleanup_push(perla_at_);\n");
+    # Snapshot caller's wantarray context (see __direct path comment).
+    Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "int __perla_caller_want_list = __perla_want_list;\n");
+    # Per-call mark for `local` save records (chain itself is a runtime global).
+    Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "void *__perla_local_chain_mark __attribute__((unused)) = __perla_local_chain;\n");
+    # Per-sub closure-cell table — shadows the file-scope global so closures
+    # created in this sub don't get their slot pointer overwritten by closure
+    # creations in code we call. See comment on __direct path.
+    Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "StradaValue **__perla_cell[64] __attribute__((unused)) = {0};\n");
+
+    # Extract captured variables — use #define so mutations go through the cell
+    if ($has_captures == 1) {
+        if (!defined($cg->{"capture_vars"})) { $cg->{"capture_vars"} = {}; }
+        my int $ci = 0;
+        while ($ci < scalar(@{$captures})) {
+            my str $cv = Perla::CodeGen::c_var($captures->[$ci]);
+            Perla::CodeGen::emit($cg, "#define " . $cv . " (*__captures[" . $ci . "])\n");
+            $cg->{"declared_vars"}->{$cv} = 1;
+            $cg->{"capture_vars"}->{$cv} = 1;
+            $ci++;
+        }
+    }
+    # Per-closure state pad: mark state vars that the create site
+    # already allocated pad slots for. _gen_state detects this and
+    # emits a lazy init-on-first-call check (`if (!v_X) { v_X = INIT;
+    # }`) instead of the static C var + flag. The #define above maps
+    # v_X to *captures[K], so each closure instance has its own slot.
+    my scalar $old_anon_state_cap = $cg->{"anon_state_capture"};
+    $cg->{"anon_state_capture"} = {};
+    if (defined($node->{"state_vars"})) {
+        my scalar $svs = $node->{"state_vars"};
+        my int $svi2 = 0;
+        while ($svi2 < scalar(@{$svs})) {
+            $cg->{"anon_state_capture"}->{$svs->[$svi2]} = 1;
+            $svi2 = $svi2 + 1;
+        }
+    }
+
+    # Sort comparator: inject $a = $_[0], $b = $_[1]. ASSIGN to the
+    # file-scope v_a / v_b (not a local shadow) so a nested closure
+    # (`sort { \$cmp->() }` where \$cmp references $a/$b) reads the
+    # same C globals. Save the prior values into __sort_save_a/b and
+    # restore at sub exit so callers' file-scope state is preserved.
+    # Without this, the sort_cmp's local shadow hid the args from the
+    # closure and the comparator's $a/$b read NULL → comparator
+    # collapsed to "always equal" / fallback alphabetical sort.
+    if (defined($node->{"is_sort_cmp"}) && $node->{"is_sort_cmp"} == 1) {
+        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "StradaValue *__sort_save_a = v_a; StradaValue *__sort_save_b = v_b;\n");
+        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "v_a = strada_array_get(strada_deref_array(perla_at_), 0);\n");
+        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "v_b = strada_array_get(strada_deref_array(perla_at_), 1);\n");
+        # Inject captured variables from static context array
+        if (defined($node->{"sort_captures"})) {
+            my scalar $caps = $node->{"sort_captures"};
+            my int $ci = 0;
+            while ($ci < scalar(@{$caps}) && $ci < 16) {
+                # Use #define so v_X expands to *__perla_sort_ctx[N];
+                # write-through to the outer var (same mechanism as
+                # regular closure captures use via __captures[]).
+                Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "#define " . Perla::CodeGen::c_var($caps->[$ci]) . " (*__perla_sort_ctx[" . $ci . "])\n");
+                $ci++;
+            }
+        }
+    }
+
+    # Reset local var and declared var tracking for this function
+    my scalar $old_local_vars = $cg->{"local_vars"};
+    $cg->{"local_vars"} = {};
+    my int $old_local_chain_used2 = 0;
+    if (defined($cg->{"local_chain_used"})) { $old_local_chain_used2 = $cg->{"local_chain_used"}; }
+    $cg->{"local_chain_used"} = 0;
+    my scalar $old_declared_vars = $cg->{"declared_vars"};
+    $cg->{"declared_vars"} = {};
+    my scalar $old_same_scope_decls2 = $cg->{"same_scope_decls"};
+    $cg->{"same_scope_decls"} = {};
+    my scalar $old_my_lexicals2 = $cg->{"my_lexicals"};
+    $cg->{"my_lexicals"} = [];
+    # Re-add captured variable names so _my_prefix won't re-declare them
+    if ($has_captures == 1) {
+        my int $ci = 0;
+        while ($ci < scalar(@{$captures})) {
+            $cg->{"declared_vars"}->{Perla::CodeGen::c_var($captures->[$ci])} = 1;
+            my scalar $cap_le = {};
+            $cap_le->{"name"} = $captures->[$ci];
+            $cap_le->{"c_name"} = Perla::CodeGen::c_var($captures->[$ci]);
+            $cap_le->{"sigil"} = "\$";
+            push(@{$cg->{"my_lexicals"}}, $cap_le);
+            $ci++;
+        }
+    }
+    # Re-add sort comparator captures + $a/$b so the body's
+    # `my $X` (e.g. `sort { my ($an) = $a =~ /(\d+)/ }`) doesn't
+    # re-declare a v_X local that the pre-declared
+    # `StradaValue *v_X = __perla_sort_ctx[N];` already provides.
+    # The body's `my` becomes a no-op decl + assign (the existing
+    # local gets overwritten), which is what we want.
+    if (defined($node->{"is_sort_cmp"}) && $node->{"is_sort_cmp"} == 1) {
+        if (defined($node->{"sort_captures"})) {
+            my scalar $sc_caps = $node->{"sort_captures"};
+            my int $sci = 0;
+            while ($sci < scalar(@{$sc_caps}) && $sci < 16) {
+                $cg->{"declared_vars"}->{Perla::CodeGen::c_var($sc_caps->[$sci])} = 1;
+                $sci++;
+            }
+        }
+        $cg->{"declared_vars"}->{"v_a"} = 1;
+        $cg->{"declared_vars"}->{"v_b"} = 1;
+    }
+    my scalar $old_main_vars = $cg->{"main_vars"};
+    $cg->{"main_vars"} = undef;
+    my int $old_in_sub2 = $cg->{"in_sub"};
+    $cg->{"in_sub"} = 1;
+
+    # Collect top-level scalar `my $x` decls — same rationale as the
+    # __direct branch (see Subs.strada earlier). perla's file-scope C
+    # statics for sub-locals normally pin blessed objs past the sub's
+    # return; decref + NULL at sub exit lets DESTROY fire at the right
+    # time. Conservative: top-level scalars only; skip nested blocks,
+    # if/while branches, state vars, destructure, and capture vars.
+    my array @__nd_sub_local_scalars = ();
+    my hash %__nd_sub_local_seen = ();
+    my hash %__nd_capture_seen = ();
+    if ($has_captures == 1) {
+        my int $__nd_cci = 0;
+        while ($__nd_cci < scalar(@{$captures})) {
+            $__nd_capture_seen{$captures->[$__nd_cci]} = 1;
+            $__nd_cci = $__nd_cci + 1;
+        }
+    }
+    # DESTROY guard: skip sub-local cleanup for DESTROY methods.
+    # `sub DESTROY { my $self = shift; ... }` — the cleanup pass would
+    # decref $self at sub end, re-firing DESTROY → infinite recursion.
+    if ($name eq "DESTROY") {
+        # Skip collection entirely.
+    } elsif (defined($node->{"body"}) && defined($node->{"body"}->{"stmts"})) {
+        my scalar $__nd_stmts = $node->{"body"}->{"stmts"};
+        my int $__nd_si = 0;
+        while ($__nd_si < scalar(@{$__nd_stmts})) {
+            my scalar $__nd_s = $__nd_stmts->[$__nd_si];
+            if (defined($__nd_s) && $__nd_s->{"type"} == Perla::AST::N_MY()) {
+                if (defined($__nd_s->{"var"})) {
+                    my str $__nd_vn = $__nd_s->{"var"}->{"value"};
+                    my str $__nd_vt = "" . $__nd_s->{"var"}->{"type"};
+                    if (length($__nd_vt) == 0) { $__nd_vt = "SCALAR_VAR"; }
+                    if ($__nd_vt eq "SCALAR_VAR"
+                        && !defined($__nd_capture_seen{$__nd_vn})
+                        && !defined($__nd_sub_local_seen{$__nd_vn})) {
+                        push(@__nd_sub_local_scalars, $__nd_vn);
+                        $__nd_sub_local_seen{$__nd_vn} = 1;
+                    }
+                }
+            }
+            $__nd_si = $__nd_si + 1;
+        }
+    }
+    # Reverse to declaration-LIFO order (see __direct branch comment):
+    # Perl destroys sub-local lexicals at return in reverse declaration
+    # order. Every consumer just decrefs, so reversing here fixes the
+    # order at all exit points.
+    @__nd_sub_local_scalars = reverse(@__nd_sub_local_scalars);
+    # Stash for N_RETURN's cleanup pass (see __direct branch comment).
+    my scalar $__nd_sub_locals_saved = $cg->{"sub_local_scalars"};
+    $cg->{"sub_local_scalars"} = \@__nd_sub_local_scalars;
+    # Array/hash sub-locals get decref+NULL at exit too (per-call leak fix).
+    my scalar $__nd_sub_aggs = collect_sub_local_aggregates($node, undef, \%__nd_capture_seen);
+    my scalar $__nd_sub_aggs_saved = $cg->{"sub_local_aggregates"};
+    $cg->{"sub_local_aggregates"} = $__nd_sub_aggs;
+
+    # Subroutine signatures (Perl 5.20+): `sub name ($a, $b, $c = expr)`.
+    # Emit `StradaValue *v_a = strada_array_get(strada_deref_array(perla_at_), I);`
+    # for each param. Optional defaults: if undef or out of bounds, use the
+    # default expression. Sigils @/% slurp the remainder.
+    if (defined($node->{"sig_params"})) {
+        my scalar $sps = $node->{"sig_params"};
+        my int $spn = scalar(@{$sps});
+        my int $spi = 0;
+        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "StradaArray *__sig_av = strada_deref_array(perla_at_);\n");
+        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "size_t __sig_n = strada_array_length(__sig_av);\n");
+        # Arg-count enforcement (Perl signatures semantics):
+        #   - count required scalar params (no default)
+        #   - count total scalar params (required + optional-with-default)
+        #   - if trailing @arr or %h slurp, max is unbounded
+        # Die if too few or too many args.
+        my int $__sig_req = 0;
+        my int $__sig_max = 0;
+        my int $__sig_unbounded = 0;
+        my int $__sig_ci = 0;
+        while ($__sig_ci < $spn) {
+            my scalar $__sig_cp = $sps->[$__sig_ci];
+            my str $__sig_csig = $__sig_cp->{"sigil"};
+            if ($__sig_csig eq "SCALAR_VAR") {
+                $__sig_max = $__sig_max + 1;
+                if (!defined($__sig_cp->{"default"})) {
+                    $__sig_req = $__sig_max;
+                }
+            } else {
+                # @arr / %h slurp — unbounded
+                $__sig_unbounded = 1;
+            }
+            $__sig_ci = $__sig_ci + 1;
+        }
+        if ($__sig_req > 0 || $__sig_unbounded == 0) {
+            Perla::CodeGen::ind($cg);
+            Perla::CodeGen::emit($cg, "if (__sig_n < " . $__sig_req . ") strada_die(\"%s\", \"Too few arguments for subroutine\");\n");
+        }
+        if ($__sig_unbounded == 0) {
+            Perla::CodeGen::ind($cg);
+            Perla::CodeGen::emit($cg, "if (__sig_n > " . $__sig_max . ") strada_die(\"%s\", \"Too many arguments for subroutine\");\n");
+        }
+        while ($spi < $spn) {
+            my scalar $sp = $sps->[$spi];
+            my str $sigil = $sp->{"sigil"};
+            my str $pname = $sp->{"name"};
+            my str $cn = Perla::CodeGen::c_var($pname);
+            if ($sigil eq "SCALAR_VAR") {
+                Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "StradaValue *" . $cn . " = (" . $spi . " < (int)__sig_n) ? strada_array_get(__sig_av, " . $spi . ") : NULL;\n");
+                if (defined($sp->{"default"})) {
+                    Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "if (!" . $cn . " || (!STRADA_IS_TAGGED_INT(" . $cn . ") && " . $cn . "->type == STRADA_UNDEF)) { " . $cn . " = ");
+                    Perla::CodeGen::gen_expr($cg, $sp->{"default"});
+                    Perla::CodeGen::emit($cg, "; }\n");
+                } else {
+                    Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "if (!" . $cn . ") { " . $cn . " = strada_new_undef(); }\n");
+                }
+                Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "strada_incref(" . $cn . "); strada_cleanup_push(" . $cn . ");\n");
+                $cg->{"declared_vars"}->{$cn} = 1;
+                my scalar $sple = {};
+                $sple->{"name"} = $pname;
+                $sple->{"c_name"} = $cn;
+                $sple->{"sigil"} = "\$";
+                push(@{$cg->{"my_lexicals"}}, $sple);
+            } elsif ($sigil eq "ARRAY_VAR") {
+                my str $cn_a = Perla::CodeGen::c_var_a($pname);
+                Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "StradaValue *" . $cn_a . " = strada_new_array();\n");
+                Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "{ StradaArray *__slv = strada_deref_array(" . $cn_a . "); for (size_t __si = " . $spi . "; __si < __sig_n; __si++) { StradaValue *__se = strada_array_get(__sig_av, __si); if (__se) { strada_incref(__se); strada_array_push_take(__slv, __se); } } }\n");
+                Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "strada_cleanup_push(" . $cn_a . ");\n");
+                $cg->{"declared_vars"}->{$cn_a} = 1;
+            } elsif ($sigil eq "HASH_VAR") {
+                my str $cn_h = Perla::CodeGen::c_var_h($pname);
+                Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "StradaValue *" . $cn_h . " = strada_new_hash();\n");
+                Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "{ StradaHash *__slh = strada_deref_hash(" . $cn_h . "); for (size_t __si = " . $spi . "; __si + 1 < __sig_n; __si += 2) { StradaValue *__sk = strada_array_get(__sig_av, __si); StradaValue *__sv = strada_array_get(__sig_av, __si + 1); if (__sk && __sv) { char *__skc = strada_to_str(__sk); strada_incref(__sv); strada_hash_set_take(__slh, __skc, __sv); free(__skc); } } }\n");
+                Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "strada_cleanup_push(" . $cn_h . ");\n");
+                $cg->{"declared_vars"}->{$cn_h} = 1;
+            }
+            $spi++;
+        }
+    }
+
+    # Generate body — for sort comparators, return the last expression
+    if (defined($node->{"body"})) {
+        if (defined($node->{"is_sort_cmp"}) && $node->{"is_sort_cmp"} == 1) {
+            # Sort comparator: last expression is the return value.
+            # If the last statement is itself a `return` (N_RETURN) or
+            # other control flow, emit it as a statement so it produces
+            # its own return — wrapping it in another `return ...` would
+            # call gen_expr on a stmt-type node and emit a TODO undef.
+            my scalar $stmts = $node->{"body"}->{"stmts"};
+            if (defined($stmts) && scalar(@{$stmts}) > 0) {
+                my int $last = scalar(@{$stmts}) - 1;
+                my int $si = 0;
+                while ($si < $last) {
+                    Perla::CodeGen::gen_stmt($cg, $stmts->[$si]);
+                    $si++;
+                }
+                my scalar $last_stmt = $stmts->[$last];
+                my int $last_t = defined($last_stmt) ? $last_stmt->{"type"} : -1;
+                if ($last_t == Perla::AST::N_RETURN()
+                    || $last_t == Perla::AST::N_IF()
+                    || $last_t == Perla::AST::N_UNLESS()) {
+                    Perla::CodeGen::gen_stmt($cg, $last_stmt);
+                    # If the last stmt was a control-flow that didn't
+                    # actually return (e.g. if-without-else fell
+                    # through), fall back to undef. C requires every
+                    # path to return.
+                    Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "v_a = __sort_save_a; v_b = __sort_save_b; perla_call_pop(); return strada_new_undef();\n");
+                } else {
+                    # Pair the perla_call_push at sub entry with a pop
+                    # before returning. Without this, each sort cmp
+                    # call leaks a frame in perla_real_call_depth,
+                    # triggering spurious "Deep recursion" warnings
+                    # after ~100 comparisons.
+                    # Restore the file-scope v_a/v_b that we clobbered
+                    # at sub entry so caller's state survives.
+                    Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "{ StradaValue *__sc_ret = ");
+                    Perla::CodeGen::gen_expr($cg, $last_stmt);
+                    Perla::CodeGen::emit($cg, "; v_a = __sort_save_a; v_b = __sort_save_b; perla_call_pop(); return __sc_ret; }\n");
+                }
+            }
+        } else {
+            # Perl implicit return: last expression in a sub is the return value
+            my scalar $body_stmts = $node->{"body"}->{"stmts"};
+            if (defined($body_stmts) && scalar(@{$body_stmts}) > 0) {
+                my int $last_s = scalar(@{$body_stmts}) - 1;
+                my int $si3 = 0;
+                while ($si3 < $last_s) {
+                    Perla::CodeGen::gen_stmt($cg, $body_stmts->[$si3]);
+                    $si3++;
+                }
+                # If last statement is an expression (not if/while/etc.), return it
+                my scalar $last_stmt = $body_stmts->[$last_s];
+                if (defined($last_stmt)) {
+                    my int $lst = $last_stmt->{"type"};
+                    # N_SUB without a name is an anonymous sub — implicit return it
+                    my int $is_anon_sub = 0;
+                    if ($lst == Perla::AST::N_SUB() && !defined($last_stmt->{"name"})) {
+                        $is_anon_sub = 1;
+                    }
+                    if (!$is_anon_sub && ($lst == Perla::AST::N_IF() || $lst == Perla::AST::N_UNLESS())) {
+                        # Implicit-return-from-if (see gen_if_capture_return).
+                        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "{ StradaValue *__ret_val = NULL;\n");
+                        Perla::CodeGen::gen_if_capture_return($cg, $last_stmt, "__ret_val");
+                        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "if (__ret_val) strada_incref(__ret_val); strada_cleanup_drain_to(__perla_cleanup_mark); ");
+                        # Sub-local scalar cleanup (see __direct branch).
+                        my int $__nl1_i = 0;
+                        while ($__nl1_i < scalar(@__nd_sub_local_scalars)) {
+                            my str $__nl1_vn = Perla::CodeGen::c_var($__nd_sub_local_scalars[$__nl1_i]);
+                            Perla::CodeGen::emit($cg, "if (" . $__nl1_vn . ") { strada_decref(" . $__nl1_vn . "); " . $__nl1_vn . " = NULL; } ");
+                            $__nl1_i = $__nl1_i + 1;
+                        }
+                        emit_sub_local_agg_cleanup($cg, $__nd_sub_aggs);
+                        # Restore local-vars before return so recursive
+                        # \`local \$g = …\` chains pop correctly.
+                        if (defined($cg->{"local_vars"})) {
+                            my array @lv_if = keys(%{$cg->{"local_vars"}});
+                            my int $li_if = 0;
+                            while ($li_if < scalar(@lv_if)) {
+                                my str $lvname_if = $lv_if[$li_if];
+                                my str $lvt_if = "" . $cg->{"local_vars"}->{$lvname_if};
+                                if (length($lvt_if) == 0 || $lvt_if eq "1") { $lvt_if = "SCALAR_VAR"; }
+                                Perla::CodeGen::emit($cg, Perla::CodeGen::c_var_for_vtype($lvt_if, $lvname_if) . " = __local_save_" . Perla::CodeGen::safe_ident($lvname_if) . "; ");
+                                $li_if++;
+                            }
+                        }
+                        Perla::CodeGen::emit($cg, "if (__perla_local_chain != __perla_local_chain_mark) { perla_local_chain_restore_to(__perla_local_chain, __perla_local_chain_mark); __perla_local_chain = __perla_local_chain_mark; } perla_call_pop(); return __ret_val ? __ret_val : strada_undef_static(); }\n");
+                    } elsif (!$is_anon_sub && (
+                        $lst == Perla::AST::N_WHILE() || $lst == Perla::AST::N_UNTIL() ||
+                        $lst == Perla::AST::N_FOR_C() || $lst == Perla::AST::N_FOREACH() ||
+                        $lst == Perla::AST::N_RETURN() || $lst == Perla::AST::N_SUB() ||
+                        $lst == Perla::AST::N_PACKAGE() || $lst == Perla::AST::N_USE() ||
+                        $lst == Perla::AST::N_BEGIN() || $lst == Perla::AST::N_END() ||
+                        $lst == Perla::AST::N_GOTO_SUB() ||
+                        $lst == Perla::AST::N_OUR() || $lst == Perla::AST::N_STATE())) {
+                        # Control flow or declaration — generate as statement.
+                        # See companion __direct branch above for the N_OUR/N_STATE rationale.
+                        Perla::CodeGen::gen_stmt($cg, $last_stmt);
+                    } else {
+                        # Expression — return its value (Perl implicit return).
+                        # Drain THIS function's cleanup pushes (params + body
+                        # temps) so they don't leak into the parent frame's
+                        # cleanup stack. Without this drain, pushed params
+                        # accumulate and eventually overflow the 64-slot cap.
+                        # Also restore any \`local \$x\` saves before returning
+                        # — otherwise the implicit-return path skipped the
+                        # restore emit below and \`local\` leaked past the sub.
+                        # caller() line propagation for tail calls: set
+                        # perla_pending_call_line when the implicit-return
+                        # expression is a bare call/method.
+                        my int $__nslr_type = $last_stmt->{"type"};
+                        my int $__nslr_is_call = ($__nslr_type == Perla::AST::N_CALL()
+                                                  || $__nslr_type == Perla::AST::N_METHOD()) ? 1 : 0;
+                        if ($__nslr_is_call == 1) {
+                            my int $__nslr_line = $last_stmt->{"line"} + 0;
+                            if ($__nslr_line > 0) {
+                                Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "perla_pending_call_line = " . $__nslr_line . ";\n");
+                            }
+                        }
+                        # Skip incref when last_stmt is already owned —
+                        # matches strada's return_needs_incref. Borrowed
+                        # reads (variables) still need incref to survive
+                        # the cleanup_drain below.
+                        my int $__nslr_needs_incref = Perla::CodeGen::expr_is_borrowed($last_stmt);
+                        # bless is transparent — see same fix in __direct
+                        # branch and N_RETURN. Only incref when bless's
+                        # first arg is borrowed (otherwise rc-leak past
+                        # DESTROY-at-scope-exit).
+                        if ($__nslr_needs_incref == 0
+                            && $last_stmt->{"type"} == Perla::AST::N_CALL()
+                            && defined($last_stmt->{"name"})
+                            && ($last_stmt->{"name"} eq "bless"
+                                || $last_stmt->{"name"} eq "CORE::bless")) {
+                            my scalar $__nslr_bless_args = $last_stmt->{"args"};
+                            if (defined($__nslr_bless_args)
+                                && scalar(@{$__nslr_bless_args}) >= 1
+                                && Perla::CodeGen::expr_is_borrowed($__nslr_bless_args->[0]) == 1) {
+                                $__nslr_needs_incref = 1;
+                            }
+                        }
+                        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "{ StradaValue *__ret_val = ");
+                        Perla::CodeGen::gen_expr_safe($cg, $last_stmt);
+                        Perla::CodeGen::emit($cg, "; ");
+                        if ($__nslr_needs_incref == 1) {
+                            Perla::CodeGen::emit($cg, "strada_incref(__ret_val); ");
+                        }
+                        Perla::CodeGen::emit($cg, "strada_cleanup_drain_to(__perla_cleanup_mark); ");
+                        # Sub-local scalar cleanup at implicit-return-expr path.
+                        my int $__nl2_i = 0;
+                        while ($__nl2_i < scalar(@__nd_sub_local_scalars)) {
+                            my str $__nl2_vn = Perla::CodeGen::c_var($__nd_sub_local_scalars[$__nl2_i]);
+                            Perla::CodeGen::emit($cg, "if (" . $__nl2_vn . ") { strada_decref(" . $__nl2_vn . "); " . $__nl2_vn . " = NULL; } ");
+                            $__nl2_i = $__nl2_i + 1;
+                        }
+                        emit_sub_local_agg_cleanup($cg, $__nd_sub_aggs);
+                        if (defined($cg->{"local_vars"})) {
+                            my array @lv_ir = keys(%{$cg->{"local_vars"}});
+                            my int $li_ir = 0;
+                            while ($li_ir < scalar(@lv_ir)) {
+                                my str $lvname_ir = $lv_ir[$li_ir];
+                                my str $lvt_ir = "" . $cg->{"local_vars"}->{$lvname_ir};
+                                if (length($lvt_ir) == 0 || $lvt_ir eq "1") { $lvt_ir = "SCALAR_VAR"; }
+                                Perla::CodeGen::emit($cg, Perla::CodeGen::c_var_for_vtype($lvt_ir, $lvname_ir) . " = __local_save_" . Perla::CodeGen::safe_ident($lvname_ir) . "; ");
+                                $li_ir++;
+                            }
+                        }
+                        Perla::CodeGen::emit($cg, "if (__perla_local_chain != __perla_local_chain_mark) { perla_local_chain_restore_to(__perla_local_chain, __perla_local_chain_mark); __perla_local_chain = __perla_local_chain_mark; } perla_call_pop(); return __ret_val; }\n");
+                    }
+                }
+            } else {
+                Perla::CodeGen::gen_block_stmts($cg, $node->{"body"});
+            }
+        }
+    }
+
+    # Restore any local vars before return
+    if (defined($cg->{"local_vars"})) {
+        my array @lv = keys(%{$cg->{"local_vars"}});
+        my int $li = 0;
+        while ($li < scalar(@lv)) {
+            my str $lvname = $lv[$li];
+            my str $lvt = "" . $cg->{"local_vars"}->{$lvname};
+            if (length($lvt) == 0 || $lvt eq "1") { $lvt = "SCALAR_VAR"; }
+            Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, Perla::CodeGen::c_var_for_vtype($lvt, $lvname) . " = __local_save_" . Perla::CodeGen::safe_ident($lvname) . ";\n");
+            $li++;
+        }
+    }
+
+    # Sub-local scalar cleanup at fall-off-end path.
+    my int $__nl3_i = 0;
+    while ($__nl3_i < scalar(@__nd_sub_local_scalars)) {
+        my str $__nl3_vn = Perla::CodeGen::c_var($__nd_sub_local_scalars[$__nl3_i]);
+        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "if (" . $__nl3_vn . ") { strada_decref(" . $__nl3_vn . "); " . $__nl3_vn . " = NULL; }\n");
+        $__nl3_i = $__nl3_i + 1;
+    }
+    Perla::CodeGen::ind($cg); emit_sub_local_agg_cleanup($cg, $__nd_sub_aggs); Perla::CodeGen::emit($cg, "\n");
+    Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "if (__perla_local_chain != __perla_local_chain_mark) { perla_local_chain_restore_to(__perla_local_chain, __perla_local_chain_mark); __perla_local_chain = __perla_local_chain_mark; }\n");
+    Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "perla_call_pop();\n");
+    # Context-sensitive fall-off-end return — see comment in
+    # gen_sub_def's main path above.
+    Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "return __perla_caller_want_list ? strada_new_array() : strada_undef_static();\n");
+    Perla::CodeGen::emit($cg, "}\n");
+    # Undef capture macros
+    if ($has_captures == 1) {
+        my int $ci = 0;
+        while ($ci < scalar(@{$captures})) {
+            Perla::CodeGen::emit($cg, "#undef " . Perla::CodeGen::c_var($captures->[$ci]) . "\n");
+            $ci++;
+        }
+    }
+    Perla::CodeGen::emit($cg, "\n");
+    $cg->{"indent"} = 0;
+    $cg->{"local_vars"} = $old_local_vars;
+    $cg->{"local_chain_used"} = $old_local_chain_used2;
+    $cg->{"declared_vars"} = $old_declared_vars;
+    $cg->{"same_scope_decls"} = $old_same_scope_decls2;
+    $cg->{"my_lexicals"} = $old_my_lexicals2;
+    $cg->{"capture_vars"} = {};
+    $cg->{"anon_state_capture"} = $old_anon_state_cap;
+    $cg->{"main_vars"} = $old_main_vars;
+    $cg->{"in_sub"} = $old_in_sub2;
+    $cg->{"pkg"} = $old_pkg;
+    $cg->{"sub_local_scalars"} = $__nd_sub_locals_saved;
+    $cg->{"sub_local_aggregates"} = $__nd_sub_aggs_saved;
+    # Restore file-scope collision view
+    Perla::CodeGen::perla_restore_collisions($__sub_coll_saved);
+    # Restore closure-cell state.
+    $cg->{"shared_cells"} = $__sub_sc_saved;
+    $cg->{"cell_idx"} = $__sub_ci_saved;
+    $cg->{"shared_cells_emitted"} = $__sub_sce_saved;
+    # Restore __SUB__ self-reference tracker.
+    $cg->{"current_sub_fname"} = $__cs_saved_fname;
+}
+
+# --- Block ---

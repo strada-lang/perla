@@ -1,0 +1,685 @@
+#!/usr/bin/env bash
+#
+# perla-cpan — install CPAN distributions into a Perla-accessible directory
+#
+# Usage:
+#   perla-cpan [options] SOURCE
+#
+# SOURCE:
+#   /path/to/Foo-Bar-1.0/          pre-unpacked distribution directory
+#   /path/to/Foo-Bar-1.0.tar.gz   distribution tarball (auto-unpacked)
+#   Foo::Bar                       module name (fetched from MetaCPAN)
+#
+# Fetches from fastapi.metacpan.org when given a bare module name, and
+# resolves runtime dependencies from META.json by default (--no-deps
+# to skip). Core modules (Exporter, Carp, strict, …) are skipped.
+#
+# What it does per distribution:
+#   1. If source is Module::Name, fetch the tarball URL from MetaCPAN.
+#   2. Unpack the tarball if needed.
+#   3. Read META.json / META.yml for the distribution name.
+#   4. Walk lib/**/*.pm and copy to $PREFIX/$LIB_SUBDIR preserving paths.
+#   5. For every .xs file — compile via perla-xs-build → auto/<path>/<base>.{so,o}
+#   6. If --with-deps / fetched from CPAN — recurse over runtime/requires.
+#   7. Write a manifest listing every file installed.
+#
+# Usage after install:
+#   export PERLA_LIB=$PREFIX/$LIB_SUBDIR
+#   perla myprog.pl                 # perla now finds installed modules
+#
+# Limits:
+#   - Pure-Perl modules and XS modules (compiled + loaded via XSLoader)
+#     work end-to-end.
+#   - No Makefile.PL execution — lib/ layout is read directly. Works
+#     for the vast majority of CPAN modules; unusual distributions may
+#     need to be pre-built first.
+#   - Dep resolution uses META.json runtime/requires. Distributions
+#     without META.json are installed standalone (no transitive deps).
+#
+# Part of https://github.com/strada-lang/perla — see docs/
+
+set -e -o pipefail
+
+# --- defaults ------------------------------------------------------
+
+PERLA_CPAN_VERSION="0.1"
+
+PREFIX="${PERLA_PREFIX:-$HOME/.perla/local}"
+LIB_SUBDIR="lib/perla5"
+PRECOMPILE=0
+NO_XS=0
+XS_STATIC=0           # Default off — build .so so XSLoader can dlopen at runtime
+DRY_RUN=0
+VERBOSE=0
+WITH_TESTS=0
+MANIFEST=""
+SOURCE=""
+FROM_CPAN=""          # Set to force CPAN fetch regardless of source format
+DEPS=""               # "" = auto (on for CPAN fetch, off for local), "on", "off"
+METACPAN_BASE="${METACPAN_BASE:-https://fastapi.metacpan.org/v1}"
+
+usage() {
+    cat <<EOF
+perla-cpan $PERLA_CPAN_VERSION — install CPAN distributions into a Perla library directory
+
+Usage: perla-cpan [options] SOURCE
+
+SOURCE:
+  /path/to/Dist-1.0/             pre-unpacked distribution directory
+  /path/to/Dist-1.0.tar.gz       tarball (.tar.gz / .tgz auto-detected)
+  Module::Name                   fetched from MetaCPAN (https://fastapi.metacpan.org)
+
+Options:
+  --prefix DIR         Install prefix (default: \$HOME/.perla/local)
+  --lib-subdir DIR     Sub-directory under prefix for .pm files (default: lib/perla5)
+  --precompile         Run perla -M on each installed .pm to build .pm.o / .pm.so
+  --no-xs              Skip XS compilation (pure-Perl only)
+  --xs-static          Build XS as .o (for manual static linking) instead of .so
+                       (default: .so so Perla's XSLoader can dlopen at runtime)
+  --with-tests         Also install t/ directory
+  --from-cpan          Force CPAN fetch (treat SOURCE as a module name even if
+                       it might look like a file/dir)
+  --deps               Also install transitive runtime deps from META.json
+                       (default: on for CPAN fetch, off for local source)
+  --no-deps            Skip transitive deps even when fetching from CPAN
+  --manifest FILE      Write manifest to FILE (default: \$PREFIX/var/perla/cpan/<dist>.manifest)
+  -n, --dry-run        Don't install; show what would be done
+  -v, --verbose        Print each command as it runs
+  -h, --help           Show this help
+  --version            Show version
+
+Environment:
+  PERLA_BIN            Path to the perla binary (default: auto-detected)
+  STRADA_DIR           Strada source tree (optional; system strada used by default)
+  PERLA_PREFIX         Alternative to --prefix
+  METACPAN_BASE        Override MetaCPAN API base (default: https://fastapi.metacpan.org/v1)
+  PERLA_CPAN_VISITED   Internal: colon-separated visited-set for dep recursion
+
+Examples:
+  # Install by name from CPAN with deps
+  perla-cpan --prefix=/opt/perla-libs Try::Tiny
+
+  # Install pre-unpacked distribution
+  perla-cpan ~/build/Try-Tiny-0.31/
+
+  # Install from tarball without deps
+  perla-cpan --no-deps ~/dl/List-Util-1.68.tar.gz
+
+  # Using installed modules:
+  export PERLA_LIB=\$HOME/.perla/local/lib/perla5
+  perla myprog.pl
+EOF
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --prefix)       PREFIX="$2";      shift 2 ;;
+        --prefix=*)     PREFIX="${1#*=}"; shift ;;
+        --lib-subdir)   LIB_SUBDIR="$2";  shift 2 ;;
+        --lib-subdir=*) LIB_SUBDIR="${1#*=}"; shift ;;
+        --precompile)   PRECOMPILE=1;     shift ;;
+        --no-xs)        NO_XS=1;          shift ;;
+        --xs-static)    XS_STATIC=1;      shift ;;
+        --with-tests)   WITH_TESTS=1;     shift ;;
+        --from-cpan)    FROM_CPAN=1;      shift ;;
+        --deps)         DEPS=on;          shift ;;
+        --no-deps)      DEPS=off;         shift ;;
+        --manifest)     MANIFEST="$2";    shift 2 ;;
+        --manifest=*)   MANIFEST="${1#*=}"; shift ;;
+        -n|--dry-run)   DRY_RUN=1;        shift ;;
+        -v|--verbose)   VERBOSE=1;        shift ;;
+        -h|--help)      usage; exit 0 ;;
+        --version)      echo "perla-cpan $PERLA_CPAN_VERSION"; exit 0 ;;
+        -*)             echo "unknown flag: $1" >&2; usage >&2; exit 2 ;;
+        *)
+            if [ -n "$SOURCE" ]; then
+                echo "error: only one source supported (got $SOURCE and $1)" >&2
+                exit 2
+            fi
+            SOURCE="$1"
+            shift
+            ;;
+    esac
+done
+
+if [ -z "$SOURCE" ]; then
+    echo "error: no source given" >&2
+    usage >&2
+    exit 2
+fi
+
+# --- resolve strada dir + perla-xs-build ---------------------------
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Locate the perla binary. Priority: $PERLA_BIN env var; the sibling build-tree
+# binary (<perla>/perla, since this script is <perla>/tools/perla-cpan); `perla`
+# on PATH. Falls back to the sibling path for a clean error if none exist.
+if [ -n "${PERLA_BIN:-}" ] && [ -x "$PERLA_BIN" ]; then
+    :
+elif [ -x "$SCRIPT_DIR/../perla" ]; then
+    PERLA_BIN="$(cd "$SCRIPT_DIR/.." && pwd)/perla"
+elif command -v perla >/dev/null 2>&1; then
+    PERLA_BIN="$(command -v perla)"
+else
+    PERLA_BIN="$SCRIPT_DIR/../perla"
+fi
+
+# Locate perla-xs-build: sibling of this script, else on PATH.
+if [ -x "$SCRIPT_DIR/perla-xs-build" ]; then
+    PERLA_XS_BUILD="$SCRIPT_DIR/perla-xs-build"
+else
+    PERLA_XS_BUILD="$(command -v perla-xs-build 2>/dev/null || echo "$SCRIPT_DIR/perla-xs-build")"
+fi
+
+if [ ! -x "$PERLA_XS_BUILD" ]; then
+    echo "error: perla-xs-build not found at $PERLA_XS_BUILD" >&2
+    exit 1
+fi
+
+# --- logging + run helpers -----------------------------------------
+
+log()  { echo "[cpan] $*" >&2; }
+vlog() { [ "$VERBOSE" = 1 ] && echo "[cpan] $*" >&2 || true; }
+run()  {
+    [ "$VERBOSE" = 1 ] && echo "+ $*" >&2
+    if [ "$DRY_RUN" = 1 ]; then return 0; fi
+    "$@"
+}
+
+# --- resolve source: unpack if tarball -----------------------------
+
+TMPDIR_CLEANUP=""
+cleanup() {
+    [ -n "$TMPDIR_CLEANUP" ] && [ -d "$TMPDIR_CLEANUP" ] && rm -rf "$TMPDIR_CLEANUP"
+}
+trap cleanup EXIT
+
+# --- MetaCPAN fetch helpers ----------------------------------------
+
+# Return the dist download URL for a module name, or "" on failure.
+# Uses MetaCPAN's /module/<Module> endpoint (follows module → dist), then
+# /release/<dist> for the tarball URL. Two-call shape handles the common
+# case of module name != distribution name (e.g. List::Util is in
+# Scalar-List-Utils).
+#
+# Refuses dual-life core modules that resolve to the `perl` distribution
+# (JSON::PP, Pod::*, File::Spec, etc.) — downloading the full perl
+# source tarball is never what we want.
+metacpan_download_url() {
+    local module="$1"
+    local dist_slug="${module//:://-}"       # Naive: Module::Name → Module-Name
+    # Resolve to the actual distribution via /module/<Module>
+    local dist
+    dist=$(curl -fsSL "$METACPAN_BASE/module/$module" 2>/dev/null \
+           | grep -oE '"distribution"[[:space:]]*:[[:space:]]*"[^"]+"' \
+           | head -1 | sed -E 's/.*"([^"]+)"$/\1/')
+    if [ -n "$dist" ]; then dist_slug="$dist"; fi
+    # Refuse core-Perl distributions — we'd drag in ~4000 .pm files
+    if [ "$dist_slug" = "perl" ]; then
+        echo "error: $module is dual-life core (distribution=perl); skipping" >&2
+        return 1
+    fi
+    # Grab the release's download_url
+    curl -fsSL "$METACPAN_BASE/release/$dist_slug" 2>/dev/null \
+        | grep -oE '"download_url"[[:space:]]*:[[:space:]]*"[^"]+"' \
+        | head -1 | sed -E 's/.*"([^"]+)"$/\1/'
+}
+
+# Download a tarball to a temp path, echo the path.
+cpan_fetch_tarball() {
+    local module="$1"
+    local url
+    url=$(metacpan_download_url "$module")
+    if [ -z "$url" ]; then
+        echo "error: MetaCPAN: no download URL for $module" >&2
+        return 1
+    fi
+    local dest="$(mktemp --suffix=.tar.gz -t perla-cpan-fetch.XXXXXX)"
+    vlog "fetching $url → $dest"
+    if ! curl -fsSL "$url" -o "$dest"; then
+        echo "error: curl failed for $url" >&2
+        return 1
+    fi
+    echo "$dest"
+}
+
+# Pattern match: does SOURCE look like a CPAN module name?
+#   Foo, Foo::Bar, Foo::Bar::Baz — alphanumeric + underscore segments
+#   separated by :: and at least one segment.
+looks_like_module_name() {
+    case "$1" in
+        */*) return 1 ;;                   # contains path separator
+        *.tar.gz|*.tgz|*.tar.bz2|*.tbz|*.tar) return 1 ;;
+    esac
+    [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_]*(::[A-Za-z_][A-Za-z0-9_]*)*$ ]]
+}
+
+# --- Source resolution --------------------------------------------
+
+SRC=""
+RESOLVED_FROM_CPAN=0
+
+if [ "$FROM_CPAN" = 1 ] || ([ ! -e "$SOURCE" ] && looks_like_module_name "$SOURCE"); then
+    log "fetching $SOURCE from CPAN"
+    FETCHED_TARBALL="$(cpan_fetch_tarball "$SOURCE")"
+    if [ -z "$FETCHED_TARBALL" ] || [ ! -f "$FETCHED_TARBALL" ]; then
+        echo "error: couldn't fetch $SOURCE from CPAN" >&2
+        exit 1
+    fi
+    SOURCE="$FETCHED_TARBALL"
+    RESOLVED_FROM_CPAN=1
+fi
+
+# Default deps: on for CPAN fetch, off for local (honoring explicit --deps/--no-deps)
+if [ -z "$DEPS" ]; then
+    if [ "$RESOLVED_FROM_CPAN" = 1 ]; then DEPS=on; else DEPS=off; fi
+fi
+
+if [ -d "$SOURCE" ]; then
+    SRC="$(cd "$SOURCE" && pwd)"
+elif [ -f "$SOURCE" ]; then
+    # Tarball — unpack
+    case "$SOURCE" in
+        *.tar.gz|*.tgz)
+            TMPDIR_CLEANUP="$(mktemp -d -t perla-cpan.XXXXXX)"
+            log "unpacking $SOURCE → $TMPDIR_CLEANUP"
+            tar -xzf "$SOURCE" -C "$TMPDIR_CLEANUP"
+            # First directory inside is the dist dir
+            SRC="$TMPDIR_CLEANUP/$(ls "$TMPDIR_CLEANUP" | head -1)"
+            if [ ! -d "$SRC" ]; then
+                echo "error: tarball didn't unpack a single top-level directory" >&2
+                exit 1
+            fi
+            ;;
+        *.tar.bz2|*.tbz)
+            TMPDIR_CLEANUP="$(mktemp -d -t perla-cpan.XXXXXX)"
+            log "unpacking $SOURCE → $TMPDIR_CLEANUP"
+            tar -xjf "$SOURCE" -C "$TMPDIR_CLEANUP"
+            SRC="$TMPDIR_CLEANUP/$(ls "$TMPDIR_CLEANUP" | head -1)"
+            ;;
+        *.tar)
+            TMPDIR_CLEANUP="$(mktemp -d -t perla-cpan.XXXXXX)"
+            tar -xf "$SOURCE" -C "$TMPDIR_CLEANUP"
+            SRC="$TMPDIR_CLEANUP/$(ls "$TMPDIR_CLEANUP" | head -1)"
+            ;;
+        *)
+            echo "error: unrecognized source format: $SOURCE" >&2
+            echo "(expected directory, .tar.gz, .tgz, .tar.bz2, .tbz, or .tar)" >&2
+            exit 2
+            ;;
+    esac
+else
+    echo "error: source does not exist: $SOURCE" >&2
+    echo "(not a path; not a fetchable module name either — try 'Module::Name')" >&2
+    exit 1
+fi
+
+# --- extract distribution name ------------------------------------
+
+get_distname() {
+    local name=""
+    # Prefer META.json
+    if [ -f "$SRC/META.json" ]; then
+        name=$(grep -oE '"name"[[:space:]]*:[[:space:]]*"[^"]+"' "$SRC/META.json" \
+               | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
+    fi
+    if [ -z "$name" ] && [ -f "$SRC/META.yml" ]; then
+        name=$(awk '/^name:/ { print $2; exit }' "$SRC/META.yml" | tr -d '"')
+    fi
+    if [ -z "$name" ]; then
+        # Fallback: basename of source dir with version stripped
+        name="$(basename "$SRC" | sed 's/-[0-9].*$//')"
+    fi
+    echo "$name"
+}
+
+DISTNAME="$(get_distname)"
+log "distribution: $DISTNAME"
+log "source: $SRC"
+log "prefix: $PREFIX"
+log "lib subdir: $LIB_SUBDIR"
+
+LIB_ABS="$PREFIX/$LIB_SUBDIR"
+INSTALLED_FILES=()
+
+# --- install .pm files --------------------------------------------
+
+PM_COUNT=0
+PM_MODULES=()   # Module::Name for each installed .pm
+
+install_pm() {
+    local src_pm="$1"
+    local rel="$2"   # path relative to lib/
+    local dest="$LIB_ABS/$rel"
+    local dest_dir="$(dirname "$dest")"
+    vlog "install .pm: $rel"
+    run mkdir -p "$dest_dir"
+    run cp "$src_pm" "$dest"
+    INSTALLED_FILES+=("$dest")
+    # derive Module::Name from rel path
+    local mod="${rel%.pm}"
+    mod="${mod//\//::}"
+    PM_MODULES+=("$mod")
+    PM_COUNT=$((PM_COUNT + 1))
+}
+
+if [ -d "$SRC/lib" ]; then
+    # Walk lib/ for .pm files
+    while IFS= read -r -d '' pm; do
+        rel="${pm#$SRC/lib/}"
+        install_pm "$pm" "$rel"
+    done < <(find "$SRC/lib" -type f -name '*.pm' -print0)
+else
+    # No lib/ dir — try top-level .pm files (rare: single-file dists)
+    for pm in "$SRC"/*.pm; do
+        [ -f "$pm" ] || continue
+        install_pm "$pm" "$(basename "$pm")"
+    done
+fi
+
+if [ "$PM_COUNT" = 0 ]; then
+    log "warning: no .pm files found"
+fi
+
+# --- compile & install .xs files ----------------------------------
+
+XS_COUNT=0
+XS_FAILED=0
+
+xs_module_name() {
+    # Parse `MODULE = Foo::Bar` from the .xs file.
+    local xs="$1"
+    local mod
+    mod=$(grep -E '^\s*MODULE\s*=' "$xs" | head -1 \
+          | sed -E 's/^[[:space:]]*MODULE[[:space:]]*=[[:space:]]*([A-Za-z0-9:_]+).*/\1/')
+    if [ -n "$mod" ]; then
+        echo "$mod"
+        return
+    fi
+    # Fallback: path-based inference
+    local rel="${xs#$SRC/}"
+    rel="${rel#lib/}"
+    rel="${rel%.xs}"
+    rel="${rel//\//::}"
+    echo "$rel"
+}
+
+install_xs() {
+    local src_xs="$1"
+    local module
+    module="$(xs_module_name "$src_xs")"
+
+    # Strip the leaf to get auto/ path: Foo::Bar → auto/Foo/Bar/Bar.{so,o}
+    local path="${module//:://}"
+    local leaf="${path##*/}"
+    local auto_dir="$LIB_ABS/auto/$path"
+
+    # Default: .so (Perla's XSLoader dlopens at runtime).
+    # --xs-static: .o (user links manually).
+    local out ext shared_flag
+    if [ "$XS_STATIC" = 1 ]; then
+        ext="o"
+        shared_flag=""
+    else
+        ext="so"
+        shared_flag="--shared"
+    fi
+    out="$auto_dir/$leaf.$ext"
+
+    vlog "compile .xs: $src_xs → $out (module $module)"
+    run mkdir -p "$auto_dir"
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "+ perla-xs-build $shared_flag -o $out $src_xs"
+    else
+        if ! "$PERLA_XS_BUILD" $shared_flag -o "$out" --module "$module" "$src_xs" \
+                 > /tmp/perla-cpan-xs-$$.log 2>&1; then
+            log "warning: XS build failed for $module (see /tmp/perla-cpan-xs-$$.log)"
+            if [ "$VERBOSE" = 1 ]; then
+                cat /tmp/perla-cpan-xs-$$.log >&2
+            fi
+            XS_FAILED=$((XS_FAILED + 1))
+            return
+        fi
+        rm -f /tmp/perla-cpan-xs-$$.log
+    fi
+    INSTALLED_FILES+=("$out")
+    XS_COUNT=$((XS_COUNT + 1))
+}
+
+if [ "$NO_XS" = 0 ]; then
+    # Find all .xs in the tree. Limit depth so we don't pick up vendored
+    # third-party .xs (which some dists ship in blib/ or _build/).
+    while IFS= read -r -d '' xs; do
+        install_xs "$xs"
+    done < <(find "$SRC" -maxdepth 4 -type f -name '*.xs' \
+             -not -path "*/blib/*" \
+             -not -path "*/_build/*" \
+             -not -path "*/.git/*" \
+             -print0)
+fi
+
+# --- optional: precompile .pm → .pm.so / .pm.o --------------------
+
+PRECOMP_COUNT=0
+PRECOMP_FAILED=0
+
+if [ "$PRECOMPILE" = 1 ] && [ "$PM_COUNT" -gt 0 ] && [ "$DRY_RUN" = 0 ]; then
+    if [ ! -x "$PERLA_BIN" ]; then
+        log "warning: perla binary not found at $PERLA_BIN — skipping --precompile"
+    else
+        log "precompiling $PM_COUNT modules with $PERLA_BIN -M ..."
+        for module in "${PM_MODULES[@]}"; do
+            vlog "perla -M $module"
+            # Point perla at our install so -M finds the .pm we just installed.
+            if PERLA_LIB="$LIB_ABS" PERLA_BUILD_PM_SO=1 \
+                 "$PERLA_BIN" -M "$module" \
+                 > /tmp/perla-cpan-M-$$.log 2>&1; then
+                PRECOMP_COUNT=$((PRECOMP_COUNT + 1))
+                # perla -M leaves .pm.o / .pm.so next to the .pm source.
+                # Capture whatever showed up.
+                local_rel="${module//:://}.pm"
+                for ext in ".pm.o" ".pm.so"; do
+                    p="$LIB_ABS/${module//:://}$ext"
+                    [ -f "$p" ] && INSTALLED_FILES+=("$p")
+                done
+            else
+                log "warning: perla -M failed for $module"
+                if [ "$VERBOSE" = 1 ]; then
+                    cat /tmp/perla-cpan-M-$$.log >&2
+                fi
+                PRECOMP_FAILED=$((PRECOMP_FAILED + 1))
+            fi
+            rm -f /tmp/perla-cpan-M-$$.log
+        done
+    fi
+fi
+
+# --- optional: install t/ tests -----------------------------------
+
+TEST_COUNT=0
+if [ "$WITH_TESTS" = 1 ] && [ -d "$SRC/t" ]; then
+    local_dest="$PREFIX/var/perla/cpan-tests/$DISTNAME"
+    vlog "install tests → $local_dest"
+    run mkdir -p "$local_dest"
+    while IFS= read -r -d '' f; do
+        rel="${f#$SRC/t/}"
+        dest="$local_dest/$rel"
+        run mkdir -p "$(dirname "$dest")"
+        run cp "$f" "$dest"
+        INSTALLED_FILES+=("$dest")
+        TEST_COUNT=$((TEST_COUNT + 1))
+    done < <(find "$SRC/t" -type f -print0)
+fi
+
+# --- write manifest -----------------------------------------------
+
+if [ -z "$MANIFEST" ]; then
+    MANIFEST="$PREFIX/var/perla/cpan/$DISTNAME.manifest"
+fi
+MANIFEST_DIR="$(dirname "$MANIFEST")"
+if [ "$DRY_RUN" = 0 ] && [ "${#INSTALLED_FILES[@]}" -gt 0 ]; then
+    mkdir -p "$MANIFEST_DIR"
+    {
+        echo "# perla-cpan manifest"
+        echo "# distribution: $DISTNAME"
+        echo "# source: $SOURCE"
+        echo "# prefix: $PREFIX"
+        echo "# installed: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        printf '%s\n' "${INSTALLED_FILES[@]}"
+    } > "$MANIFEST"
+fi
+
+# --- dependency resolution ----------------------------------------
+
+DEPS_INSTALLED=0
+DEPS_SKIPPED=0
+DEPS_FAILED=0
+
+# Core/pragma modules that are always-available, stubbed by Perla, or
+# provided by the Perl interpreter itself. Matches the skip-list in the
+# older perla-cpan.strada so we don't chase shim modules.
+is_core_module() {
+    case "$1" in
+        perl|strict|warnings|base|parent|vars|constant|integer|overload \
+        |Carp|Carp::Heavy|Exporter|Exporter::Heavy \
+        |File::Spec|File::Spec::Unix|File::Path|File::Basename|File::Copy \
+        |File::Find|File::Glob|File::Temp \
+        |Scalar::Util|List::Util|List::Util::XS|Sub::Util \
+        |POSIX|Encode|utf8|bytes|charnames \
+        |Storable|Data::Dumper|Fcntl|IO::File|IO::Handle|IO::Select \
+        |Time::HiRes|Time::Local|Time::localtime|Time::gmtime \
+        |XSLoader|DynaLoader|Config \
+        |Errno|Socket|Symbol|SelectSaver|FileHandle \
+        |lib|if|feature|mro|warnings::register|diagnostics \
+        |JSON::PP|JSON::PP::Boolean \
+        |Test|Test::More|Test::Simple|Test::Builder \
+        |Pod::Usage|Pod::Find|Pod::Text|Pod::Html \
+        |Getopt::Long|Getopt::Std \
+        |Digest::MD5|Digest::SHA|Digest::base \
+        |Cwd|Text::ParseWords|Text::Tabs|Text::Wrap \
+        |HTTP::Tiny|Net::Ping|Net::Cmd \
+        |File::Compare|File::stat|File::Find|File::Spec::Functions \
+        |overloading|open|sort|re|strict::vars) return 0 ;;
+    esac
+    return 1
+}
+
+# Parse META.json prereqs.runtime.requires into a newline-delimited list
+# of module names. Prefers python3 for real JSON parsing; falls back to
+# jq, then to a best-effort regex grep.
+parse_meta_runtime_requires() {
+    local meta="$1"
+    [ -f "$meta" ] || return 0
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$meta" <<'PY' 2>/dev/null
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+req = d.get('prereqs', {}).get('runtime', {}).get('requires', {})
+for m in req:
+    print(m)
+PY
+    elif command -v jq >/dev/null 2>&1; then
+        jq -r '.prereqs.runtime.requires // {} | keys[]' "$meta" 2>/dev/null
+    else
+        # Fragile fallback — only triggers if neither python3 nor jq is
+        # installed. Works for the common shape where prereqs appears
+        # once with runtime/requires as a nested object.
+        awk '/"runtime"/,/^[[:space:]]*}/' "$meta" \
+            | grep -oE '"[A-Za-z_][A-Za-z0-9_:]*"[[:space:]]*:' \
+            | grep -vE '"(requires|recommends|suggests|conflicts|runtime|build|configure|test|develop)"' \
+            | sed -E 's/^"([^"]+)".*/\1/' 2>/dev/null
+    fi
+}
+
+if [ "$DEPS" = on ] && [ "$DRY_RUN" = 0 ]; then
+    META_JSON=""
+    if [ -f "$SRC/META.json" ]; then
+        META_JSON="$SRC/META.json"
+    fi
+    if [ -n "$META_JSON" ]; then
+        # visited-set passed via env so recursive invocations share state
+        export PERLA_CPAN_VISITED="${PERLA_CPAN_VISITED}:${DISTNAME}"
+
+        mapfile -t RUNTIME_DEPS < <(parse_meta_runtime_requires "$META_JSON" | sort -u)
+        if [ "${#RUNTIME_DEPS[@]}" -gt 0 ]; then
+            log "resolving ${#RUNTIME_DEPS[@]} runtime dep(s) from META.json"
+            for dep in "${RUNTIME_DEPS[@]}"; do
+                [ -z "$dep" ] && continue
+                if is_core_module "$dep"; then
+                    vlog "dep $dep: core/stubbed — skip"
+                    DEPS_SKIPPED=$((DEPS_SKIPPED + 1))
+                    continue
+                fi
+                # Already visited in this install chain?
+                case ":$PERLA_CPAN_VISITED:" in
+                    *":${dep//:://-}:"*|*":$dep:"*)
+                        vlog "dep $dep: already visited — skip"
+                        DEPS_SKIPPED=$((DEPS_SKIPPED + 1))
+                        continue
+                        ;;
+                esac
+                # Already installed at this prefix?
+                local_rel="${dep//:://}"
+                if [ -f "$LIB_ABS/$local_rel.pm" ]; then
+                    vlog "dep $dep: already at $LIB_ABS/$local_rel.pm — skip"
+                    DEPS_SKIPPED=$((DEPS_SKIPPED + 1))
+                    continue
+                fi
+
+                log "installing dep: $dep"
+                export PERLA_CPAN_VISITED="${PERLA_CPAN_VISITED}:$dep"
+                # Recurse. Inherit all our flags except --from-cpan (we
+                # don't need to force; a bare Module::Name resolves to
+                # CPAN automatically). --no-xs/--precompile/--xs-static
+                # pass through via flags.
+                local_args=(--prefix="$PREFIX" --lib-subdir="$LIB_SUBDIR")
+                [ "$NO_XS" = 1 ] && local_args+=(--no-xs)
+                [ "$XS_STATIC" = 1 ] && local_args+=(--xs-static)
+                [ "$PRECOMPILE" = 1 ] && local_args+=(--precompile)
+                [ "$VERBOSE" = 1 ] && local_args+=(--verbose)
+                if "$0" "${local_args[@]}" "$dep" >/dev/null 2>&1; then
+                    DEPS_INSTALLED=$((DEPS_INSTALLED + 1))
+                else
+                    log "warning: dep install failed: $dep"
+                    DEPS_FAILED=$((DEPS_FAILED + 1))
+                fi
+            done
+        fi
+    fi
+fi
+
+# --- summary -------------------------------------------------------
+
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log "$DISTNAME → $PREFIX"
+log "  .pm installed: $PM_COUNT"
+if [ "$NO_XS" = 0 ]; then
+    log "  .xs compiled: $XS_COUNT (failed: $XS_FAILED)"
+fi
+if [ "$PRECOMPILE" = 1 ]; then
+    log "  precompiled:  $PRECOMP_COUNT (failed: $PRECOMP_FAILED)"
+fi
+if [ "$WITH_TESTS" = 1 ]; then
+    log "  tests:        $TEST_COUNT"
+fi
+if [ "$DEPS" = on ]; then
+    log "  deps:         $DEPS_INSTALLED installed, $DEPS_SKIPPED skipped, $DEPS_FAILED failed"
+fi
+if [ "$DRY_RUN" = 1 ]; then
+    log "(dry-run — nothing actually installed)"
+else
+    log "  manifest:     $MANIFEST"
+    log ""
+    log "To use: export PERLA_LIB=\"$LIB_ABS\""
+fi
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+# Non-zero exit if anything critical failed.
+if [ "$XS_FAILED" -gt 0 ] || [ "$PRECOMP_FAILED" -gt 0 ]; then
+    exit 1
+fi
+exit 0

@@ -1,0 +1,125 @@
+# Perla AST Node Types
+# Each node is a hash with a "type" key and type-specific fields.
+
+package Perla::AST;
+
+# --- Node type constants ---
+func N_PROGRAM() int { return 1; }
+func N_SUB() int { return 2; }
+func N_BLOCK() int { return 3; }
+func N_MY() int { return 4; }           # my $x, my @a, my %h
+func N_OUR() int { return 5; }          # our $x
+func N_LOCAL() int { return 6; }        # local $x
+func N_ASSIGN() int { return 7; }
+func N_BINOP() int { return 8; }
+func N_UNOP() int { return 9; }
+func N_INT_LIT() int { return 10; }
+func N_NUM_LIT() int { return 11; }
+func N_STR_LIT() int { return 12; }
+func N_INTERP_STR() int { return 13; }  # "Hello, $name!"
+func N_SCALAR_VAR() int { return 14; }  # $x
+func N_ARRAY_VAR() int { return 15; }   # @arr
+func N_HASH_VAR() int { return 16; }    # %hash
+func N_ARRAY_ELEM() int { return 17; }  # $arr[i]
+func N_HASH_ELEM() int { return 18; }   # $hash{k}
+func N_ARRAY_SLICE() int { return 19; } # @arr[0,2]
+func N_HASH_SLICE() int { return 20; }  # @hash{qw(a b)}
+func N_CALL() int { return 21; }        # func(args)
+func N_METHOD() int { return 22; }      # $obj->method(args)
+func N_IF() int { return 23; }
+func N_UNLESS() int { return 24; }
+func N_WHILE() int { return 25; }
+func N_UNTIL() int { return 26; }
+func N_FOR_C() int { return 27; }       # C-style for
+func N_FOREACH() int { return 28; }
+func N_DO_WHILE() int { return 29; }
+func N_RETURN() int { return 30; }
+func N_LAST() int { return 31; }
+func N_NEXT() int { return 32; }
+func N_REDO() int { return 33; }
+func N_LABEL() int { return 34; }
+func N_UNDEF() int { return 35; }
+func N_REF() int { return 36; }         # \$x, \@a, \%h, \&f
+func N_DEREF_SCALAR() int { return 37; } # $$ref
+func N_DEREF_ARRAY() int { return 38; }  # @$ref
+func N_DEREF_HASH() int { return 39; }   # %$ref
+func N_ARROW_ARRAY() int { return 40; }  # $ref->[i]
+func N_ARROW_HASH() int { return 41; }   # $ref->{k}
+func N_ARROW_METHOD() int { return 42; } # $ref->method()
+func N_ANON_ARRAY() int { return 43; }   # [1,2,3]
+func N_ANON_HASH() int { return 44; }    # {a => 1}
+func N_ANON_SUB() int { return 45; }     # sub { }
+func N_REGEX() int { return 46; }        # /pattern/
+func N_REGEX_MATCH() int { return 47; }  # $x =~ /pat/
+func N_SUBST() int { return 48; }        # $x =~ s/a/b/
+func N_TR() int { return 49; }           # $x =~ tr/a/b/
+func N_TERNARY() int { return 50; }      # $x ? $y : $z
+func N_PACKAGE() int { return 51; }
+func N_USE() int { return 52; }
+func N_NO() int { return 53; }
+func N_REQUIRE() int { return 54; }
+func N_BEGIN() int { return 55; }
+func N_END() int { return 56; }
+func N_PRINT() int { return 57; }        # print/say
+func N_DIE() int { return 58; }
+func N_EVAL_BLOCK() int { return 59; }   # eval { }
+func N_EVAL_STRING() int { return 60; }  # eval "..."
+func N_TRY() int { return 61; }          # (desugared eval { })
+func N_QWORD() int { return 62; }        # qw(a b c)
+func N_HEREDOC() int { return 63; }
+func N_RANGE() int { return 64; }        # 1..10
+func N_GLOB_ACCESS() int { return 65; }  # *foo
+func N_GLOB_ASSIGN() int { return 66; }  # *foo = \&bar
+func N_WANTARRAY() int { return 67; }
+func N_CALLER() int { return 68; }
+func N_SPECIAL_VAR() int { return 69; }  # $_, $!, $@, etc.
+func N_BLESS() int { return 70; }
+func N_MAP() int { return 71; }
+func N_GREP() int { return 72; }
+func N_SORT() int { return 73; }
+func N_CHOMP() int { return 74; }
+func N_DEFINED() int { return 75; }
+func N_EXISTS() int { return 76; }
+func N_DELETE() int { return 77; }
+func N_PUSH() int { return 78; }
+func N_POP() int { return 79; }
+func N_SHIFT() int { return 80; }
+func N_UNSHIFT() int { return 81; }
+func N_SPLICE() int { return 82; }
+func N_KEYS() int { return 83; }
+func N_VALUES() int { return 84; }
+func N_EACH() int { return 85; }
+func N_OPEN() int { return 86; }
+func N_CLOSE() int { return 87; }
+func N_READLINE() int { return 88; }     # <$fh>
+func N_POSTFIX_IF() int { return 89; }   # expr if cond
+func N_POSTFIX_UNLESS() int { return 90; }
+func N_POSTFIX_WHILE() int { return 91; }
+func N_POSTFIX_UNTIL() int { return 92; }
+func N_POSTFIX_FOR() int { return 93; }
+func N_C_BLOCK() int { return 94; }     # __C__ { raw C code }
+func N_STRADA_BLOCK() int { return 95; } # __STRADA__ { Strada code }
+func N_STATE() int { return 96; }       # state $var = expr
+func N_PRECOMPILED_MOD() int { return 97; }  # Precompiled module (.pm.o)
+func N_GOTO_SUB() int { return 98; }     # goto &EXPR — replace current frame with tail call
+func N_DO_FILE_EXPR() int { return 99; } # do $expr / do { } — runtime-evaluated filename
+func N_GOTO_LABEL() int { return 100; }  # goto LABEL — bareword label jump
+func N_LABEL_STMT() int { return 101; }  # bare LABEL: (free-standing label, not on a loop)
+func N_FORMAT() int { return 102; }      # format NAME = ... . — Perl text-template definition
+func N_WRITE() int { return 103; }       # write [FILEHANDLE] — emit using current format
+func N_CHAIN_CMP() int { return 104; }    # 1 < 2 < 3 — chained comparison (perl 5.32+)
+func N_RAW_C() int { return 105; }        # raw C expression (codegen-internal placeholder)
+
+# --- Constructor helpers ---
+func node(int $type) scalar {
+    my hash %n = ();
+    $n{"type"} = $type;
+    return \%n;
+}
+
+func node_with(int $type, str $key, scalar $val) scalar {
+    my hash %n = ();
+    $n{"type"} = $type;
+    $n{$key} = $val;
+    return \%n;
+}

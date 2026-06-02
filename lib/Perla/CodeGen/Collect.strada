@@ -1,0 +1,1092 @@
+# Perla::CodeGen::Collect - Pre-codegen AST analysis passes.
+#
+# Walks the Perl-side AST before any C code is emitted to populate
+# $cg->{subs}, $cg->{sub_params}, $cg->{our_vars}, $cg->{file_scope_vars},
+# and to rename block-local `my` collisions with file-scope statics.
+#
+# None of these emit C; they only mutate the analysis state on $cg.
+# That's what makes them safe to live in a separate module — they don't
+# need to call _emit/_ind/_gen_* in the main CodeGen package.
+#
+# Extracted from Perla::CodeGen so the bulk of CodeGen.strada can shrink.
+# Functions previously named `_foo` are renamed to `foo` and exported under
+# this package's name (e.g. `Perla::CodeGen::Collect::collect_subs`).
+#
+# NOTE: `_collect_sigil_collisions` and `_collect_sigil_collisions_stmts`
+# stay in Perla::CodeGen because they call back into `_gen_our` and the
+# `_perla_*` mangle helpers. Splitting them would force renaming those.
+
+use Perla::AST;
+
+package Perla::CodeGen::Collect;
+
+# Predicate: looks like a Perl identifier (letter/underscore start, alnum body).
+# Allowed in body so package-qualified names like `Foo::bar` match too.
+func is_ident_like(str $name) int {
+    my int $len = length($name);
+    if ($len == 0) { return 0; }
+    my str $c0 = substr($name, 0, 1);
+    if (!(($c0 ge "a" && $c0 le "z") || ($c0 ge "A" && $c0 le "Z") || $c0 eq "_")) {
+        return 0;
+    }
+    my int $ii = 1;
+    while ($ii < $len) {
+        my str $c = substr($name, $ii, 1);
+        if (!(($c ge "a" && $c le "z") || ($c ge "A" && $c le "Z") || ($c ge "0" && $c le "9") || $c eq "_" || $c eq ":")) {
+            return 0;
+        }
+        $ii++;
+    }
+    return 1;
+}
+
+# Pre-populate known module function prototypes so the call-site
+# auto-ref logic in _gen_call sees \\@ / \\% / \\$ / \\& on built-in
+# module calls like Hash::Util::lock_keys, Scalar::Util::weaken, etc.
+# User code can't declare these prototypes (they're imported from
+# already-compiled modules), but they still need the same call-site
+# arg-reshaping that user-declared prototypes get.
+func register_builtin_protos(scalar $cg) void {
+    if (!defined($cg->{"sub_protos"})) { $cg->{"sub_protos"} = {}; }
+    # Hash::Util — most take a hash ref + optional slurpy. Register
+    # under both the qualified name (for `Hash::Util::lock_keys(...)`)
+    # AND the short name in main:: (for `use Hash::Util qw(lock_keys);
+    # lock_keys(...)`). The proto-driven auto-ref runs at call-site
+    # using whatever name the caller wrote.
+    my array @hu_lockkeys_at = ("Hash::Util::lock_keys", "main::lock_keys");
+    my int $__hi = 0;
+    while ($__hi < scalar(@hu_lockkeys_at)) {
+        $cg->{"sub_protos"}->{$hu_lockkeys_at[$__hi]} = "\\%@";
+        $__hi = $__hi + 1;
+    }
+    my array @hu_unlockkeys = ("Hash::Util::unlock_keys", "main::unlock_keys");
+    $__hi = 0;
+    while ($__hi < scalar(@hu_unlockkeys)) {
+        $cg->{"sub_protos"}->{$hu_unlockkeys[$__hi]} = "\\%";
+        $__hi = $__hi + 1;
+    }
+    my array @hu_lockhash = ("Hash::Util::lock_hash", "main::lock_hash",
+                             "Hash::Util::unlock_hash", "main::unlock_hash",
+                             "Hash::Util::hash_locked", "main::hash_locked",
+                             "Hash::Util::hash_unlocked", "main::hash_unlocked",
+                             "Hash::Util::legal_keys", "main::legal_keys");
+    $__hi = 0;
+    while ($__hi < scalar(@hu_lockhash)) {
+        $cg->{"sub_protos"}->{$hu_lockhash[$__hi]} = "\\%";
+        $__hi = $__hi + 1;
+    }
+    my array @hu_lockkeysplus = ("Hash::Util::lock_keys_plus", "main::lock_keys_plus");
+    $__hi = 0;
+    while ($__hi < scalar(@hu_lockkeysplus)) {
+        $cg->{"sub_protos"}->{$hu_lockkeysplus[$__hi]} = "\\%@";
+        $__hi = $__hi + 1;
+    }
+    # Scalar::Util — weaken/unweaken: NO proto registration. perla's
+    # inline codegen for `weaken($var)` / `weaken($h{k})` / `weaken($arr[i])`
+    # already emits `strada_weaken(&slot)` directly. Registering the `\$`
+    # proto here causes the proto-walker (CodeGen.strada:14893) to wrap
+    # the arg in N_REF before the inline codegen runs — none of the inline
+    # branches match N_REF, and the call falls through to perla_call_code
+    # which has no implementation registered, so weaken silently no-ops.
+    # Surfaced via Scalar::Util::weaken($strong_alias) + isweak() showing 0
+    # afterward despite the weakening request.
+}
+
+# --- Collect sub names for forward declarations ---
+# Tracks package context so each sub gets its proper qualified name
+func collect_subs_from_stmts(scalar $cg, scalar $stmts, str $pkg) str {
+    my int $i = 0;
+    while ($i < scalar(@{$stmts})) {
+        my scalar $s = $stmts->[$i];
+        if (defined($s)) {
+            if ($s->{"type"} == Perla::AST::N_PACKAGE()) {
+                $pkg = $s->{"name"};
+            }
+            if ($s->{"type"} == Perla::AST::N_SUB() && defined($s->{"name"})) {
+                # `sub Pkg::name { ... }` — register in Pkg, not in the
+                # currently-active package. Without this, `sub Foo::greet`
+                # got qname "main::Foo::greet" and method dispatch via
+                # `$obj->greet` (which looks up Foo::greet) failed.
+                my str $sname = $s->{"name"};
+                my str $eff_pkg = $pkg;
+                my str $eff_short = $sname;
+                if (index($sname, "::") > 0) {
+                    my int $li = -1;
+                    my int $sii = 0;
+                    while ($sii < length($sname) - 1) {
+                        if (substr($sname, $sii, 2) eq "::") { $li = $sii; }
+                        $sii++;
+                    }
+                    if ($li > 0) {
+                        $eff_pkg = substr($sname, 0, $li);
+                        $eff_short = substr($sname, $li + 2, length($sname) - $li - 2);
+                        $s->{"name"} = $eff_short;
+                    }
+                }
+                my str $qname = $eff_pkg . "::" . $eff_short;
+                $cg->{"subs"}->{$qname} = 1;
+                $s->{"package"} = $eff_pkg;
+                # Stash prototype string (if any) for runtime
+                # prototype("Pkg::name") lookup. perla_set_prototype
+                # is called at module init for each known proto.
+                if (defined($s->{"prototype"})) {
+                    if (!defined($cg->{"sub_protos"})) { $cg->{"sub_protos"} = {}; }
+                    $cg->{"sub_protos"}->{$qname} = "" . $s->{"prototype"};
+                } elsif (defined($s->{"empty_proto"}) && $s->{"empty_proto"} == 1) {
+                    if (!defined($cg->{"sub_protos"})) { $cg->{"sub_protos"} = {}; }
+                    $cg->{"sub_protos"}->{$qname} = "";
+                }
+                if (defined($s->{"attrs"})) {
+                    if (!defined($cg->{"sub_attrs"})) { $cg->{"sub_attrs"} = {}; }
+                    $cg->{"sub_attrs"}->{$qname} = $s->{"attrs"};
+                }
+                analyze_sub_params($cg, $qname, $s);
+                # Recurse into the sub body to find nested named subs.
+                # Perl: `sub outer { sub inner {...} }` registers inner
+                # in the enclosing package too. Required by eval STRING
+                # of `sub NAME { ... }`, which wraps user code in a body
+                # sub — the user's sub would be invisible without this
+                # recursion. Surfaced via namespace::clean's
+                # `eval "sub stash_for (\$) { ... }"` BEGIN-time setup;
+                # without recursion, stash_for stayed undefined, then
+                # `$stash->has_symbol(...)` died inside `import`.
+                if (defined($s->{"body"}) && defined($s->{"body"}->{"stmts"})) {
+                    # Eval-body wrapper marker — when the enclosing sub
+                    # is `__perla_eval_body_*`, hand off to the eb variant
+                    # which also recurses into `my $rv = do { ... }` init
+                    # blocks AND restricts the hoist to empty-prototype
+                    # subs (HTTP::Status RC_* constants).
+                    my str $sname = $s->{"name"};
+                    my int $is_eb = 0;
+                    if (length($sname) > 18 && substr($sname, 0, 18) eq "__perla_eval_body_") {
+                        $is_eb = 1;
+                    }
+                    collect_subs_from_stmts_eb($cg, $s->{"body"}->{"stmts"}, $pkg, $is_eb);
+                }
+            }
+            # Recurse into blocks (bare { ... } scopes)
+            if ($s->{"type"} == Perla::AST::N_BLOCK() && defined($s->{"stmts"})) {
+                $pkg = collect_subs_from_stmts($cg, $s->{"stmts"}, $pkg);
+            }
+            # Recurse into BEGIN/END blocks too — Perl semantics: a
+            # `sub NAME { ... }` inside `BEGIN { ... }` registers in the
+            # enclosing package at compile time. Required by
+            # Exception::Class::Base whose `sub Fields { () }` and
+            # `sub NoRefs { ... }` are nested inside its BEGIN block.
+            # Without the recursion, dispatching `$obj->Fields` on any
+            # Exception::Class subclass dies with "Can't locate
+            # method", killing the death-message chain.
+            if (($s->{"type"} == Perla::AST::N_BEGIN() || $s->{"type"} == Perla::AST::N_END())
+                && defined($s->{"body"}) && defined($s->{"body"}->{"stmts"})) {
+                collect_subs_from_stmts($cg, $s->{"body"}->{"stmts"}, $pkg);
+            }
+            # Recurse into eval { BLOCK } too — Perl semantics: a
+            # `sub NAME { ... }` inside `eval { ... }` registers in the
+            # enclosing package (compile-time hoist). Without recursion,
+            # `eval { sub foo { die "x" } foo() }` left foo undefined,
+            # so foo() ran as a no-op (no body), die never fired, and $@
+            # came out empty. Same for `eval { sub foo {...} }; foo()`
+            # after the eval — perl would have foo defined.
+            if ($s->{"type"} == Perla::AST::N_EVAL_BLOCK()
+                && defined($s->{"body"}) && defined($s->{"body"}->{"stmts"})) {
+                collect_subs_from_stmts($cg, $s->{"body"}->{"stmts"}, $pkg);
+            }
+            # Recurse into if/unless/while/until/foreach/for_c bodies —
+            # Perl semantics: named subs declared inside conditional/loop
+            # blocks are compile-time-hoisted into the enclosing package.
+            # `if (1) { sub from_if {...} }` and `while (cond) { sub X {...} }`
+            # leave the subs callable from outside the block. Without this,
+            # the named sub gets emitted as an anon-style block-local def
+            # that never reaches the file-level fn table.
+            if (($s->{"type"} == Perla::AST::N_IF() || $s->{"type"} == Perla::AST::N_UNLESS())) {
+                if (defined($s->{"then"}) && defined($s->{"then"}->{"stmts"})) {
+                    $pkg = collect_subs_from_stmts($cg, $s->{"then"}->{"stmts"}, $pkg);
+                }
+                if (defined($s->{"else"}) && defined($s->{"else"}->{"stmts"})) {
+                    $pkg = collect_subs_from_stmts($cg, $s->{"else"}->{"stmts"}, $pkg);
+                }
+            }
+            if (($s->{"type"} == Perla::AST::N_WHILE() || $s->{"type"} == Perla::AST::N_UNTIL()
+                 || $s->{"type"} == Perla::AST::N_FOREACH() || $s->{"type"} == Perla::AST::N_FOR_C())
+                && defined($s->{"body"}) && defined($s->{"body"}->{"stmts"})) {
+                $pkg = collect_subs_from_stmts($cg, $s->{"body"}->{"stmts"}, $pkg);
+            }
+            # Recurse into `my $x = do { ... }` / `our $x = do { ... }` init
+            # blocks so named subs declared at the top of the do-block hoist
+            # into the enclosing package — matches Perl compile-time hoist
+            # semantics. Without this, the canonical Perl idiom
+            #   my $r = do { sub helper { ... } helper(7); };
+            # left helper undefined: the call to helper() returned undef and
+            # $r was empty. The earlier eval-body-only gating was set to
+            # avoid an old multi-module collision (bizowie), but that
+            # scenario is now handled by per-file scope; the regular hoist
+            # path is the right Perl semantic.
+            if (($s->{"type"} == Perla::AST::N_MY() || $s->{"type"} == Perla::AST::N_OUR())
+                && defined($s->{"init"})) {
+                my scalar $init = $s->{"init"};
+                if (defined($init) && $init->{"type"} == Perla::AST::N_BLOCK()
+                    && defined($init->{"stmts"})) {
+                    collect_subs_from_stmts($cg, $init->{"stmts"}, $pkg);
+                }
+            }
+        }
+        $i++;
+    }
+    return $pkg;
+}
+
+# Variant: eval-body-aware. When `$is_eb` is set, recurses into
+# N_MY/N_OUR init blocks (perla's eval wrapping is
+# `my $rv = do { USER_CODE };`, so USER_CODE's nested `sub X () { N }`
+# defs end up as N_SUB statements inside an init-position N_BLOCK).
+# HTTP::Status's `eval $mnemonicCode` was the canonical case where
+# this matters: without the recursion all the `sub HTTP_X () { N }`
+# constants stayed unregistered.
+#
+# Outside the eval-body context, recursion is identical to the
+# normal collect_subs_from_stmts — `my X = do { sub Y { ... } }` at
+# file scope of a regular .pm should NOT hoist Y (would clobber
+# file-scope subs with the same name in other modules; bizowie regressed
+# when this was unconditional). Gating on `__perla_eval_body_*` keeps
+# the change tightly scoped to perla's own eval wrappers.
+func collect_subs_from_stmts_eb(scalar $cg, scalar $stmts, str $pkg, int $is_eb) str {
+    my int $i = 0;
+    while ($i < scalar(@{$stmts})) {
+        my scalar $s = $stmts->[$i];
+        if (defined($s)) {
+            if ($s->{"type"} == Perla::AST::N_PACKAGE()) {
+                $pkg = $s->{"name"};
+            }
+            # In eval-body context: hoist subs declared at the
+            # top level of the eval'd code so the user's
+            # \`eval 'sub xyz { ... }'\` makes xyz visible to the
+            # caller's package. Two cases:
+            #   - `sub NAME () { N }` (empty proto, constant-style)
+            #     — always hoist (HTTP::Status RC_* pattern).
+            #   - `sub NAME { ... }` (no prototype declared at all)
+            #     — also hoist; matches Perl semantics where
+            #     eval-STRING'd subs are immediately visible.
+            #   - `sub NAME (PROTO) { ... }` with non-empty PROTO —
+            #     skip to avoid the bizowie regression where
+            #     activating Role::Tiny's prototyped utility subs
+            #     uncovered a downstream Drogo::detach path. Users
+            #     who declare explicit non-empty protos inside eval
+            #     STRING are rare; skipping is the safe default.
+            my int $hoist_ok = 1;
+            # Hoist all sub forms from eval-body contexts (empty-proto,
+            # no-proto, AND non-empty proto). The earlier gate skipped
+            # non-empty-proto subs to dodge a Role::Tiny → Drogo::detach
+            # regression; that path is no longer affected and matching
+            # perl's "eval STRING defs are immediately visible" wins.
+            if ($s->{"type"} == Perla::AST::N_SUB() && defined($s->{"name"}) && $hoist_ok == 1) {
+                my str $qname = $pkg . "::" . $s->{"name"};
+                $cg->{"subs"}->{$qname} = 1;
+                $s->{"package"} = $pkg;
+                if (defined($s->{"prototype"})) {
+                    if (!defined($cg->{"sub_protos"})) { $cg->{"sub_protos"} = {}; }
+                    $cg->{"sub_protos"}->{$qname} = "" . $s->{"prototype"};
+                } elsif (defined($s->{"empty_proto"}) && $s->{"empty_proto"} == 1) {
+                    if (!defined($cg->{"sub_protos"})) { $cg->{"sub_protos"} = {}; }
+                    $cg->{"sub_protos"}->{$qname} = "";
+                }
+                if (defined($s->{"attrs"})) {
+                    if (!defined($cg->{"sub_attrs"})) { $cg->{"sub_attrs"} = {}; }
+                    $cg->{"sub_attrs"}->{$qname} = $s->{"attrs"};
+                }
+                analyze_sub_params($cg, $qname, $s);
+                if (defined($s->{"body"}) && defined($s->{"body"}->{"stmts"})) {
+                    collect_subs_from_stmts($cg, $s->{"body"}->{"stmts"}, $pkg);
+                }
+            }
+            if ($s->{"type"} == Perla::AST::N_BLOCK() && defined($s->{"stmts"})) {
+                $pkg = collect_subs_from_stmts_eb($cg, $s->{"stmts"}, $pkg, $is_eb);
+            }
+            if (($s->{"type"} == Perla::AST::N_BEGIN() || $s->{"type"} == Perla::AST::N_END())
+                && defined($s->{"body"}) && defined($s->{"body"}->{"stmts"})) {
+                collect_subs_from_stmts($cg, $s->{"body"}->{"stmts"}, $pkg);
+            }
+            if ($is_eb == 1
+                && ($s->{"type"} == Perla::AST::N_MY() || $s->{"type"} == Perla::AST::N_OUR())
+                && defined($s->{"init"})) {
+                my scalar $init = $s->{"init"};
+                if (defined($init) && $init->{"type"} == Perla::AST::N_BLOCK()
+                    && defined($init->{"stmts"})) {
+                    $pkg = collect_subs_from_stmts_eb($cg, $init->{"stmts"}, $pkg, $is_eb);
+                }
+            }
+            # In eval-body context only, descend into if/unless branches
+            # and loop bodies so user code like
+            # \`eval 'if (\$x) { sub foo { ... } } else { sub foo { ... } }'\`
+            # makes foo visible to the caller. Perla's eval wrapper inserts
+            # an outer if/then/else around the user's do-block depending on
+            # wantarray context; without descending, the nested sub never
+            # gets hoisted.
+            if ($is_eb == 1
+                && ($s->{"type"} == Perla::AST::N_IF() || $s->{"type"} == Perla::AST::N_UNLESS())) {
+                if (defined($s->{"then"}) && defined($s->{"then"}->{"stmts"})) {
+                    $pkg = collect_subs_from_stmts_eb($cg, $s->{"then"}->{"stmts"}, $pkg, $is_eb);
+                }
+                if (defined($s->{"else"}) && defined($s->{"else"}->{"stmts"})) {
+                    $pkg = collect_subs_from_stmts_eb($cg, $s->{"else"}->{"stmts"}, $pkg, $is_eb);
+                }
+            }
+            if ($is_eb == 1
+                && ($s->{"type"} == Perla::AST::N_WHILE() || $s->{"type"} == Perla::AST::N_UNTIL()
+                    || $s->{"type"} == Perla::AST::N_FOREACH() || $s->{"type"} == Perla::AST::N_FOR_C())
+                && defined($s->{"body"}) && defined($s->{"body"}->{"stmts"})) {
+                $pkg = collect_subs_from_stmts_eb($cg, $s->{"body"}->{"stmts"}, $pkg, $is_eb);
+            }
+        }
+        $i++;
+    }
+    return $pkg;
+}
+
+func collect_subs(scalar $cg, scalar $ast) void {
+    $cg->{"sub_params"} = {};
+    collect_subs_from_stmts($cg, $ast->{"stmts"}, "main");
+}
+
+func count_subs_from_stmts(scalar $totals, scalar $stmts) void {
+    my int $i = 0;
+    while ($i < scalar(@{$stmts})) {
+        my scalar $stmt = $stmts->[$i];
+        if (defined($stmt)) {
+            if ($stmt->{"type"} == Perla::AST::N_SUB() && defined($stmt->{"name"})) {
+                my str $sn = $stmt->{"name"};
+                my str $sp = $stmt->{"package"};
+                if (!defined($sp)) { $sp = "main"; }
+                my str $qn = $sp . "::" . $sn;
+                my int $prev = 0;
+                if (exists($totals->{$qn})) { $prev = 0 + $totals->{$qn}; }
+                $totals->{$qn} = $prev + 1;
+                # Recurse into the body so nested named subs get counted.
+                if (defined($stmt->{"body"}) && defined($stmt->{"body"}->{"stmts"})) {
+                    my str $sname = $stmt->{"name"};
+                    my int $is_eb = 0;
+                    if (length($sname) > 18 && substr($sname, 0, 18) eq "__perla_eval_body_") {
+                        $is_eb = 1;
+                    }
+                    count_subs_from_stmts_eb($totals, $stmt->{"body"}->{"stmts"}, $is_eb);
+                }
+            }
+            if ($stmt->{"type"} == Perla::AST::N_BLOCK() && defined($stmt->{"stmts"})) {
+                count_subs_from_stmts($totals, $stmt->{"stmts"});
+            }
+            # Recurse into BEGIN/END blocks too (see collect_subs_from_stmts).
+            if (($stmt->{"type"} == Perla::AST::N_BEGIN() || $stmt->{"type"} == Perla::AST::N_END())
+                && defined($stmt->{"body"}) && defined($stmt->{"body"}->{"stmts"})) {
+                count_subs_from_stmts($totals, $stmt->{"body"}->{"stmts"});
+            }
+            # Recurse into eval { BLOCK } (see collect_subs_from_stmts).
+            if ($stmt->{"type"} == Perla::AST::N_EVAL_BLOCK()
+                && defined($stmt->{"body"}) && defined($stmt->{"body"}->{"stmts"})) {
+                count_subs_from_stmts($totals, $stmt->{"body"}->{"stmts"});
+            }
+            # Recurse into if/unless/while/until/foreach/for_c bodies
+            # so subs declared inside these get counted (see collect).
+            if (($stmt->{"type"} == Perla::AST::N_IF() || $stmt->{"type"} == Perla::AST::N_UNLESS())) {
+                if (defined($stmt->{"then"}) && defined($stmt->{"then"}->{"stmts"})) {
+                    count_subs_from_stmts($totals, $stmt->{"then"}->{"stmts"});
+                }
+                if (defined($stmt->{"else"}) && defined($stmt->{"else"}->{"stmts"})) {
+                    count_subs_from_stmts($totals, $stmt->{"else"}->{"stmts"});
+                }
+            }
+            if (($stmt->{"type"} == Perla::AST::N_WHILE() || $stmt->{"type"} == Perla::AST::N_UNTIL()
+                 || $stmt->{"type"} == Perla::AST::N_FOREACH() || $stmt->{"type"} == Perla::AST::N_FOR_C())
+                && defined($stmt->{"body"}) && defined($stmt->{"body"}->{"stmts"})) {
+                count_subs_from_stmts($totals, $stmt->{"body"}->{"stmts"});
+            }
+            # Recurse into `my $x = do { ... }` / `our $x = do { ... }` init.
+            if (($stmt->{"type"} == Perla::AST::N_MY() || $stmt->{"type"} == Perla::AST::N_OUR())
+                && defined($stmt->{"init"})) {
+                my scalar $init = $stmt->{"init"};
+                if (defined($init) && $init->{"type"} == Perla::AST::N_BLOCK()
+                    && defined($init->{"stmts"})) {
+                    count_subs_from_stmts($totals, $init->{"stmts"});
+                }
+            }
+        }
+        $i++;
+    }
+}
+
+# Eval-body-aware variant of count_subs_from_stmts.
+func count_subs_from_stmts_eb(scalar $totals, scalar $stmts, int $is_eb) void {
+    my int $i = 0;
+    while ($i < scalar(@{$stmts})) {
+        my scalar $stmt = $stmts->[$i];
+        if (defined($stmt)) {
+            # Hoist all sub forms (matches collect / gen relaxation).
+            my int $hoist_ok = 1;
+            if ($stmt->{"type"} == Perla::AST::N_SUB() && defined($stmt->{"name"}) && $hoist_ok == 1) {
+                my str $sn = $stmt->{"name"};
+                my str $sp = $stmt->{"package"};
+                if (!defined($sp)) { $sp = "main"; }
+                my str $qn = $sp . "::" . $sn;
+                my int $prev = 0;
+                if (exists($totals->{$qn})) { $prev = 0 + $totals->{$qn}; }
+                $totals->{$qn} = $prev + 1;
+                if (defined($stmt->{"body"}) && defined($stmt->{"body"}->{"stmts"})) {
+                    count_subs_from_stmts($totals, $stmt->{"body"}->{"stmts"});
+                }
+            }
+            if ($stmt->{"type"} == Perla::AST::N_BLOCK() && defined($stmt->{"stmts"})) {
+                count_subs_from_stmts_eb($totals, $stmt->{"stmts"}, $is_eb);
+            }
+            if (($stmt->{"type"} == Perla::AST::N_BEGIN() || $stmt->{"type"} == Perla::AST::N_END())
+                && defined($stmt->{"body"}) && defined($stmt->{"body"}->{"stmts"})) {
+                count_subs_from_stmts($totals, $stmt->{"body"}->{"stmts"});
+            }
+            if ($is_eb == 1
+                && ($stmt->{"type"} == Perla::AST::N_MY() || $stmt->{"type"} == Perla::AST::N_OUR())
+                && defined($stmt->{"init"})) {
+                my scalar $init = $stmt->{"init"};
+                if (defined($init) && $init->{"type"} == Perla::AST::N_BLOCK()
+                    && defined($init->{"stmts"})) {
+                    count_subs_from_stmts_eb($totals, $init->{"stmts"}, $is_eb);
+                }
+            }
+            # Descend into if/loops to count subs nested in branches.
+            if ($is_eb == 1
+                && ($stmt->{"type"} == Perla::AST::N_IF() || $stmt->{"type"} == Perla::AST::N_UNLESS())) {
+                if (defined($stmt->{"then"}) && defined($stmt->{"then"}->{"stmts"})) {
+                    count_subs_from_stmts_eb($totals, $stmt->{"then"}->{"stmts"}, $is_eb);
+                }
+                if (defined($stmt->{"else"}) && defined($stmt->{"else"}->{"stmts"})) {
+                    count_subs_from_stmts_eb($totals, $stmt->{"else"}->{"stmts"}, $is_eb);
+                }
+            }
+            if ($is_eb == 1
+                && ($stmt->{"type"} == Perla::AST::N_WHILE() || $stmt->{"type"} == Perla::AST::N_UNTIL()
+                    || $stmt->{"type"} == Perla::AST::N_FOREACH() || $stmt->{"type"} == Perla::AST::N_FOR_C())
+                && defined($stmt->{"body"}) && defined($stmt->{"body"}->{"stmts"})) {
+                count_subs_from_stmts_eb($totals, $stmt->{"body"}->{"stmts"}, $is_eb);
+            }
+        }
+        $i++;
+    }
+}
+
+# Analyze a sub's first statement(s) to determine direct-call params
+func analyze_sub_params(scalar $cg, str $qname, scalar $sub) void {
+    if (!defined($sub->{"body"})) { return; }
+    my scalar $stmts = $sub->{"body"}->{"stmts"};
+    if (!defined($stmts) || scalar(@{$stmts}) == 0) { return; }
+    my scalar $first = $stmts->[0];
+    if (!defined($first)) { return; }
+    # Pattern: my ($a, $b, ...) = @_;
+    if ($first->{"type"} == Perla::AST::N_MY() && defined($first->{"vars"}) && defined($first->{"init"})) {
+        my scalar $init = $first->{"init"};
+        if (defined($init) && $init->{"type"} == Perla::AST::N_ARRAY_VAR() && $init->{"name"} eq "_") {
+            my scalar $vars = $first->{"vars"};
+            my int $nv = scalar(@{$vars});
+            # Check all vars are scalar (no @arr/%hash slurp)
+            my int $all_scalar = 1;
+            my int $vi = 0;
+            while ($vi < $nv) {
+                my str $vt = $vars->[$vi]->{"type"};
+                if ($vt ne "SCALAR_VAR") { $all_scalar = 0; }
+                $vi++;
+            }
+            if ($all_scalar == 1 && $nv > 0) {
+                my scalar $info = {};
+                $info->{"arity"} = $nv;
+                my scalar $names = [];
+                $vi = 0;
+                while ($vi < $nv) {
+                    push(@{$names}, $vars->[$vi]->{"value"});
+                    $vi++;
+                }
+                $info->{"names"} = $names;
+                # One param-bind statement (`my (...) = @_`); the __direct
+                # body skips it. @_ rebuilt from the params equals the real
+                # @_, so no further restriction is needed.
+                $info->{"bind_stmts"} = 1;
+                $cg->{"sub_params"}->{$qname} = $info;
+            }
+        }
+        return;
+    }
+    # Pattern: a leading run of `my $x = shift;` / `my $x = shift @_;`
+    # (the other ubiquitous simple signature — e.g. fib's `my $n = shift`).
+    # Eligible only if the statements AFTER the run never observe @_ (whole
+    # array, $_[N], bare shift/pop, goto, …): __direct binds the params
+    # positionally and skips these statements, rebuilding @_ from the params
+    # — which only matches the real post-shift @_ when @_ is never read.
+    my scalar $snames = [];
+    my int $nbind = 0;
+    my int $ns = scalar(@{$stmts});
+    my int $si = 0;
+    while ($si < $ns) {
+        my scalar $st = $stmts->[$si];
+        if (!defined($st) || $st->{"type"} != Perla::AST::N_MY()
+            || !defined($st->{"var"}) || !defined($st->{"init"})) { last; }
+        my scalar $v = $st->{"var"};
+        if (!defined($v) || $v->{"type"} ne "SCALAR_VAR") { last; }
+        my scalar $ini = $st->{"init"};
+        if (!defined($ini) || $ini->{"type"} != Perla::AST::N_CALL()
+            || !defined($ini->{"name"}) || $ini->{"name"} ne "shift") { last; }
+        # Bare `shift` (defaults to @_) or `shift @_` only — not `shift @other`.
+        my int $sac = 0;
+        if (defined($ini->{"args"})) { $sac = scalar(@{$ini->{"args"}}); }
+        if ($sac > 0) {
+            if ($sac != 1) { last; }
+            my scalar $a0 = $ini->{"args"}->[0];
+            if (!defined($a0) || $a0->{"type"} != Perla::AST::N_ARRAY_VAR()
+                || !defined($a0->{"name"}) || $a0->{"name"} ne "_") { last; }
+        }
+        push(@{$snames}, $v->{"value"});
+        $nbind = $nbind + 1;
+        $si = $si + 1;
+    }
+    # Require at least one real body statement after the binds, and that
+    # none of them observe @_.
+    if ($nbind > 0 && $nbind < $ns) {
+        my int $uses_at = 0;
+        my int $ri = $nbind;
+        while ($ri < $ns) {
+            if (Perla::CodeGen::Subs::body_uses_at_underscore($stmts->[$ri]) == 1) { $uses_at = 1; }
+            $ri = $ri + 1;
+        }
+        if ($uses_at == 0) {
+            my scalar $info = {};
+            $info->{"arity"} = $nbind;
+            $info->{"names"} = $snames;
+            $info->{"bind_stmts"} = $nbind;
+            $cg->{"sub_params"}->{$qname} = $info;
+        }
+    }
+}
+
+# --- Collect our (global) variable names ---
+func collect_our_vars(scalar $cg, scalar $ast) void {
+    collect_our_vars_from_stmts($cg, $ast->{"stmts"});
+}
+
+func collect_our_vars_from_stmts(scalar $cg, scalar $stmts) void {
+    my int $i = 0;
+    while ($i < scalar(@{$stmts})) {
+        my scalar $s = $stmts->[$i];
+        if (defined($s)) {
+            if ($s->{"type"} == Perla::AST::N_OUR()) {
+                if (defined($s->{"var"})) {
+                    $cg->{"our_vars"}->{$s->{"var"}->{"value"}} = $s->{"var"}->{"type"};
+                }
+                # `our (%X, $Y, @Z)` parses as a vars list, not a single var.
+                # Without this both Date::Manip::Lang::index's `our (%Lang)`
+                # (later assigned via `%Lang = qw(...)`) and Drogo's bare
+                # `our ($foo, $bar)` lost their stash mirroring.
+                if (defined($s->{"vars"})) {
+                    my int $vi = 0;
+                    while ($vi < scalar(@{$s->{"vars"}})) {
+                        $cg->{"our_vars"}->{$s->{"vars"}->[$vi]->{"value"}} = $s->{"vars"}->[$vi]->{"type"};
+                        $vi++;
+                    }
+                }
+                # Chained `our @A = our @B = ...` (e.g. Exporter's
+                # `our @EXPORT = our @EXPORT_OK = qw(...)`): the inner `our`
+                # declarations live in the init expression, so register them
+                # too — otherwise strict 'vars' fires on @EXPORT_OK in module
+                # mode. Walk the whole init chain for arbitrary depth.
+                my scalar $iv = $s->{"init"};
+                while (defined($iv) && $iv->{"type"} == Perla::AST::N_OUR()) {
+                    if (defined($iv->{"var"})) {
+                        $cg->{"our_vars"}->{$iv->{"var"}->{"value"}} = $iv->{"var"}->{"type"};
+                    }
+                    if (defined($iv->{"vars"})) {
+                        my int $vk = 0;
+                        while ($vk < scalar(@{$iv->{"vars"}})) {
+                            $cg->{"our_vars"}->{$iv->{"vars"}->[$vk]->{"value"}} = $iv->{"vars"}->[$vk]->{"type"};
+                            $vk++;
+                        }
+                    }
+                    $iv = $iv->{"init"};
+                }
+            }
+            # Recurse into blocks
+            if ($s->{"type"} == Perla::AST::N_BLOCK() && defined($s->{"stmts"})) {
+                collect_our_vars_from_stmts($cg, $s->{"stmts"});
+            }
+            # Recurse into sub bodies — `our $x = N` inside a sub
+            # declares a package var visible to the rest of the file.
+            # Without this, perla's strict check fired on subsequent
+            # uses of $x both inside and outside the sub.
+            if ($s->{"type"} == Perla::AST::N_SUB() && defined($s->{"body"})
+                && defined($s->{"body"}->{"stmts"})) {
+                collect_our_vars_from_stmts($cg, $s->{"body"}->{"stmts"});
+            }
+            # Recurse into if / else / elsif branches.
+            if ($s->{"type"} == Perla::AST::N_IF() || $s->{"type"} == Perla::AST::N_UNLESS()) {
+                if (defined($s->{"then"}) && defined($s->{"then"}->{"stmts"})) {
+                    collect_our_vars_from_stmts($cg, $s->{"then"}->{"stmts"});
+                }
+                if (defined($s->{"else"}) && defined($s->{"else"}->{"stmts"})) {
+                    collect_our_vars_from_stmts($cg, $s->{"else"}->{"stmts"});
+                }
+            }
+            # Recurse into loops.
+            if (($s->{"type"} == Perla::AST::N_WHILE() || $s->{"type"} == Perla::AST::N_UNTIL()
+                 || $s->{"type"} == Perla::AST::N_FOREACH() || $s->{"type"} == Perla::AST::N_FOR_C())
+                && defined($s->{"body"}) && defined($s->{"body"}->{"stmts"})) {
+                collect_our_vars_from_stmts($cg, $s->{"body"}->{"stmts"});
+            }
+            # Recurse into BEGIN/END/eval blocks.
+            if (($s->{"type"} == Perla::AST::N_BEGIN() || $s->{"type"} == Perla::AST::N_END()
+                 || $s->{"type"} == Perla::AST::N_EVAL_BLOCK())
+                && defined($s->{"body"}) && defined($s->{"body"}->{"stmts"})) {
+                collect_our_vars_from_stmts($cg, $s->{"body"}->{"stmts"});
+            }
+        }
+        $i++;
+    }
+}
+
+# --- Collect file-scope my variables (hoisted to static for sub access) ---
+func collect_file_scope_vars(scalar $cg, scalar $ast) void {
+    # Pre-scan for `use warnings;` so the rename-collision pass below can
+    # gate its "my X masks earlier declaration" warning the same way the
+    # codegen pass does. Without this, the flag is still 0 at collect time
+    # (only set when the codegen pass processes N_USE) and the bare-block
+    # mask case stays silent. We scan the top-level stmts and any bare
+    # blocks at top level — same shape Collect itself walks.
+    if (defined($ast->{"stmts"})) {
+        _prescan_use_warnings($cg, $ast->{"stmts"});
+    }
+    collect_file_scope_vars_from_stmts($cg, $ast->{"stmts"});
+}
+
+func _prescan_use_warnings(scalar $cg, scalar $stmts) void {
+    if (!defined($stmts)) { return; }
+    my int $i = 0;
+    while ($i < scalar(@{$stmts})) {
+        my scalar $s = $stmts->[$i];
+        if (defined($s) && $s->{"type"} == Perla::AST::N_USE()) {
+            my str $m = "" . $s->{"module"};
+            if ($m eq "warnings") {
+                if (defined($s->{"is_no"}) && $s->{"is_no"} == 1) {
+                    $cg->{"use_warnings"} = 0;
+                } else {
+                    $cg->{"use_warnings"} = 1;
+                }
+            }
+        }
+        if (defined($s) && $s->{"type"} == Perla::AST::N_BLOCK() && defined($s->{"stmts"})) {
+            _prescan_use_warnings($cg, $s->{"stmts"});
+        }
+        $i++;
+    }
+}
+
+# Record the `my` declaration(s) in a file-scope statement. The declaration
+# may be the statement itself (`my $x = E;`) or buried at the left of a binop
+# wrapper: `( my $x = E ) =~ s///` (N_BINOP op "=~"), `my $x = E or die`
+# (N_BINOP op "or" from _parse_my's low-prec wrap), etc. In every such shape
+# the N_MY is the leftmost operand of the binop spine, so walk `left` down to
+# it. Without this, a sub later referencing $x trips strict 'vars' because the
+# var was never added to file_scope_vars. (Surfaced by Abe::Rust's
+# `( my $root_path = __FILE__ ) =~ s{...}{...}` referenced inside sub bind.)
+func _record_file_scope_my(scalar $cg, scalar $node) void {
+    my scalar $n = $node;
+    while (defined($n) && $n->{"type"} == Perla::AST::N_BINOP() && defined($n->{"left"})) {
+        $n = $n->{"left"};
+    }
+    if (defined($n) && $n->{"type"} == Perla::AST::N_MY()) {
+        if (defined($n->{"vars"})) {
+            my int $vi = 0;
+            while ($vi < scalar(@{$n->{"vars"}})) {
+                $cg->{"file_scope_vars"}->{$n->{"vars"}->[$vi]->{"value"}} = $n->{"vars"}->[$vi]->{"type"};
+                $vi++;
+            }
+        } elsif (defined($n->{"var"})) {
+            $cg->{"file_scope_vars"}->{$n->{"var"}->{"value"}} = $n->{"var"}->{"type"};
+        }
+    }
+}
+
+func collect_file_scope_vars_from_stmts(scalar $cg, scalar $stmts) void {
+    my int $i = 0;
+    while ($i < scalar(@{$stmts})) {
+        my scalar $s = $stmts->[$i];
+        if (defined($s) && ($s->{"type"} == Perla::AST::N_MY() || $s->{"type"} == Perla::AST::N_BINOP())) {
+            _record_file_scope_my($cg, $s);
+        }
+        # Also track undeclared assignments to file-scope identifiers.
+        # Under `no strict`, `@f = qw[...]` at top level is an implicit
+        # package global (auto-declared as a static). A nested closure
+        # that references `@f` should read the global at call time, not
+        # capture its (NULL) value at closure-creation time — YAML::Mo's
+        # `@f=qw[builder default import]` appears *after* the closure that
+        # references it, so a by-value capture froze `@f` as NULL.
+        #
+        # Only alphanumeric names: Perl special scalars like `$,`, `$!`,
+        # `$/` are per-process specials with custom runtime-side handling.
+        # We never want to auto-declare them as C statics (the C
+        # identifier would be invalid) and they never need closure-capture
+        # plumbing.
+        if (defined($s) && $s->{"type"} == Perla::AST::N_ASSIGN()) {
+            my scalar $as_t = $s->{"target"};
+            if (defined($as_t)) {
+                my int $as_ty = $as_t->{"type"};
+                if ($as_ty == Perla::AST::N_SCALAR_VAR() || $as_ty == Perla::AST::N_ARRAY_VAR() || $as_ty == Perla::AST::N_HASH_VAR()) {
+                    my str $as_n = "" . $as_t->{"name"};
+                    if (length($as_n) > 0 && is_ident_like($as_n) == 1
+                        && !defined($cg->{"file_scope_vars"}->{$as_n})) {
+                        $cg->{"file_scope_vars"}->{$as_n} = "IMPLICIT_GLOBAL";
+                    }
+                }
+            }
+        }
+        # Recurse into blocks. Each `{ ... }` is its own lexical scope,
+        # so we rename any `my $X` whose name is already file-scope (or
+        # already renamed in a sibling block) to a unique synthetic name
+        # — both the decl AND any nested references — so two adjacent
+        # `{ my $validator = ...; sub a {...$validator...} }` blocks each
+        # get their own static instead of fighting over the same v_validator
+        # slot. Surfaced by DateTime::TimeZone whose new() and _init()
+        # validators silently overwrote each other (the second one's
+        # `_check_init_params` clobbered v_validator just before runtime,
+        # so DateTime::TimeZone->new(name => 'UTC') threw "Invalid offset:"
+        # — TimeZone::new's validator returned the WRONG validator's
+        # extras-checking output, forcing the eval'd shape elsewhere).
+        if (defined($s) && $s->{"type"} == Perla::AST::N_BLOCK() && defined($s->{"stmts"})) {
+            rename_block_collisions_and_collect($cg, $s->{"stmts"});
+        }
+        # BEGIN/END (and INIT/CHECK, which share N_BEGIN) blocks are their own
+        # lexical scope too: a `my $X` inside one, captured by a named sub also
+        # inside it, must be collected so the sub's reference doesn't trip
+        # strict 'vars'. Same treatment as a bare block. Surfaced by
+        # File::Basename, which wraps `my @Types` + `sub fileparse_set_fstype`
+        # (which reads @Types) in a single `BEGIN { ... }`.
+        if (defined($s) && ($s->{"type"} == Perla::AST::N_BEGIN() || $s->{"type"} == Perla::AST::N_END())
+            && defined($s->{"body"}) && defined($s->{"body"}->{"stmts"})) {
+            rename_block_collisions_and_collect($cg, $s->{"body"}->{"stmts"});
+        }
+        $i++;
+    }
+}
+
+# For a block's stmts: any `my $X` that collides with an existing
+# file-scope name gets renamed (decl + nested references) to a unique
+# `<name>__blkN` synthetic. Then collect the (possibly renamed) names
+# into file_scope_vars so subs nested in this block reference the
+# right static.
+func rename_block_collisions_and_collect(scalar $cg, scalar $stmts) void {
+    if (!defined($stmts)) { return; }
+    if (!defined($cg->{"_blk_rename_counter"})) { $cg->{"_blk_rename_counter"} = 0; }
+    my hash %local_renames = ();
+    # Rename EVERY `my X` in a bare block (not just collisions) so the
+    # var is uniquely scoped to this block. Combined with the bare-block
+    # codegen's decref-at-exit emit, this makes DESTROY fire when a
+    # blessed obj goes out of block scope (matches Perl's per-block
+    # refcount semantics for `{ my $o = Obj->new; }`).
+    my int $i = 0;
+    while ($i < scalar(@{$stmts})) {
+        my scalar $s = $stmts->[$i];
+        if (defined($s) && $s->{"type"} == Perla::AST::N_MY()) {
+            if (defined($s->{"vars"})) {
+                my int $vi = 0;
+                while ($vi < scalar(@{$s->{"vars"}})) {
+                    my str $vn = $s->{"vars"}->[$vi]->{"value"};
+                    # use-warnings: `my X` whose name already has a rename
+                    # in this block IS the "masks earlier declaration" case.
+                    if (defined($local_renames{$vn})
+                        && defined($cg->{"use_warnings"}) && $cg->{"use_warnings"} == 1) {
+                        my str $__mm_s = "\$";
+                        my str $__mm_vt = "" . $s->{"vars"}->[$vi]->{"type"};
+                        if ($__mm_vt eq "ARRAY_VAR") { $__mm_s = "@"; }
+                        elsif ($__mm_vt eq "HASH_VAR") { $__mm_s = "%"; }
+                        my int $__mm_l = 0;
+                        if (defined($s->{"line"})) { $__mm_l = $s->{"line"} + 0; }
+                        my str $__mm_f = "" . $cg->{"filename"};
+                        if (length($__mm_f) == 0) { $__mm_f = "-"; }
+                        say(STDERR, "\"my\" variable " . $__mm_s . $vn . " masks earlier declaration in same scope at " . $__mm_f . " line " . $__mm_l . ".");
+                    }
+                    $cg->{"_blk_rename_counter"} = $cg->{"_blk_rename_counter"} + 1;
+                    my str $rn = $vn . "__blk" . $cg->{"_blk_rename_counter"};
+                    $local_renames{$vn} = $rn;
+                    $s->{"vars"}->[$vi]->{"value"} = $rn;
+                    $vi++;
+                }
+            } elsif (defined($s->{"var"})) {
+                my str $vn = $s->{"var"}->{"value"};
+                if (defined($local_renames{$vn})
+                    && defined($cg->{"use_warnings"}) && $cg->{"use_warnings"} == 1) {
+                    my str $__mm_s = "\$";
+                    my str $__mm_vt = "" . $s->{"var"}->{"type"};
+                    if ($__mm_vt eq "ARRAY_VAR") { $__mm_s = "@"; }
+                    elsif ($__mm_vt eq "HASH_VAR") { $__mm_s = "%"; }
+                    my int $__mm_l = 0;
+                    if (defined($s->{"line"})) { $__mm_l = $s->{"line"} + 0; }
+                    my str $__mm_f = "" . $cg->{"filename"};
+                    if (length($__mm_f) == 0) { $__mm_f = "-"; }
+                    say(STDERR, "\"my\" variable " . $__mm_s . $vn . " masks earlier declaration in same scope at " . $__mm_f . " line " . $__mm_l . ".");
+                }
+                $cg->{"_blk_rename_counter"} = $cg->{"_blk_rename_counter"} + 1;
+                my str $rn = $vn . "__blk" . $cg->{"_blk_rename_counter"};
+                $local_renames{$vn} = $rn;
+                $s->{"var"}->{"value"} = $rn;
+            }
+        }
+        $i++;
+    }
+    # Rewrite references to renamed vars within the block.
+    if (scalar(keys(%local_renames)) > 0) {
+        rewrite_var_refs_stmts($stmts, \%local_renames);
+    }
+    # Now record the (renamed) names as file-scope so the codegen treats
+    # them as statics, just like the original logic intended.
+    collect_file_scope_vars_from_stmts($cg, $stmts);
+}
+
+# Recursively rewrite N_SCALAR_VAR / N_ARRAY_VAR / N_HASH_VAR references
+# whose name matches a key in $renames to use the renamed value. Walks
+# stmts, expressions, and sub bodies.
+func rewrite_var_refs_stmts(scalar $stmts, scalar $renames) void {
+    if (!defined($stmts)) { return; }
+    my int $i = 0;
+    while ($i < scalar(@{$stmts})) {
+        rewrite_var_refs($stmts->[$i], $renames);
+        $i++;
+    }
+}
+
+# Textual rewrite of $NAME, ${NAME}, @NAME, @{NAME} references inside a
+# double-quoted string (or regex pattern) for each NAME in $renames.
+# Stops at non-ident char boundary so $xy doesn't match a rename of "x".
+# Skips backslash-escaped sigils.
+func rewrite_interp_var_refs(str $raw, scalar $renames) str {
+    my int $len = length($raw);
+    if ($len == 0) { return $raw; }
+    my str $out = "";
+    my int $i = 0;
+    while ($i < $len) {
+        my str $ch = substr($raw, $i, 1);
+        if ($ch eq "\\" && $i + 1 < $len) {
+            # Preserve backslash escape verbatim.
+            $out = $out . $ch . substr($raw, $i + 1, 1);
+            $i = $i + 2;
+            next;
+        }
+        if (($ch eq "$" || $ch eq "@") && $i + 1 < $len) {
+            my str $nc = substr($raw, $i + 1, 1);
+            # `${NAME}` / `@{NAME}` braced form.
+            if ($nc eq "{") {
+                my int $j = $i + 2;
+                my int $e = $j;
+                while ($e < $len) {
+                    my str $ec = substr($raw, $e, 1);
+                    if (($ec ge "a" && $ec le "z") || ($ec ge "A" && $ec le "Z") || ($ec ge "0" && $ec le "9") || $ec eq "_") {
+                        $e = $e + 1;
+                    } else { last; }
+                }
+                if ($e > $j && $e < $len && substr($raw, $e, 1) eq "}") {
+                    my str $name = substr($raw, $j, $e - $j);
+                    if (defined($renames->{$name})) {
+                        $out = $out . $ch . "{" . $renames->{$name} . "}";
+                        $i = $e + 1;
+                        next;
+                    }
+                }
+            } elsif (($nc ge "a" && $nc le "z") || ($nc ge "A" && $nc le "Z") || $nc eq "_") {
+                # Bare `$NAME` / `@NAME`. Consume max-munch identifier.
+                my int $e2 = $i + 1;
+                while ($e2 < $len) {
+                    my str $ec = substr($raw, $e2, 1);
+                    if (($ec ge "a" && $ec le "z") || ($ec ge "A" && $ec le "Z") || ($ec ge "0" && $ec le "9") || $ec eq "_") {
+                        $e2 = $e2 + 1;
+                    } else { last; }
+                }
+                my str $name2 = substr($raw, $i + 1, $e2 - ($i + 1));
+                if (defined($renames->{$name2})) {
+                    $out = $out . $ch . $renames->{$name2};
+                    $i = $e2;
+                    next;
+                }
+            }
+        }
+        $out = $out . $ch;
+        $i = $i + 1;
+    }
+    return $out;
+}
+
+func rewrite_var_refs(scalar $node, scalar $renames) void {
+    if (!defined($node)) { return; }
+    if (!defined($node->{"type"})) { return; }
+    my int $t = $node->{"type"};
+    # An inner block that itself declares `my $X` shadows the outer `X`.
+    # Strip $X from the renames hash for the duration of this subtree
+    # so we don't textually rewrite the inner block's references to its
+    # own shadowed var (which would later collide when that inner block
+    # gets its own rename in collect_file_scope_vars_from_stmts).
+    my scalar $effective_renames = $renames;
+    if ($t == Perla::AST::N_BLOCK() && defined($node->{"stmts"})) {
+        my scalar $blk_stmts = $node->{"stmts"};
+        my int $bsi = 0;
+        my int $needs_filter = 0;
+        while ($bsi < scalar(@{$blk_stmts})) {
+            my scalar $bs = $blk_stmts->[$bsi];
+            if (defined($bs) && $bs->{"type"} == Perla::AST::N_MY()) {
+                if (defined($bs->{"vars"})) {
+                    my int $bvi = 0;
+                    while ($bvi < scalar(@{$bs->{"vars"}})) {
+                        if (defined($renames->{$bs->{"vars"}->[$bvi]->{"value"}})) {
+                            $needs_filter = 1;
+                        }
+                        $bvi++;
+                    }
+                } elsif (defined($bs->{"var"})) {
+                    if (defined($renames->{$bs->{"var"}->{"value"}})) {
+                        $needs_filter = 1;
+                    }
+                }
+            }
+            $bsi++;
+        }
+        if ($needs_filter == 1) {
+            # Collect the set of names this inner block shadows.
+            my scalar $shadowed = {};
+            $bsi = 0;
+            while ($bsi < scalar(@{$blk_stmts})) {
+                my scalar $bs2 = $blk_stmts->[$bsi];
+                if (defined($bs2) && $bs2->{"type"} == Perla::AST::N_MY()) {
+                    if (defined($bs2->{"vars"})) {
+                        my int $bvi2 = 0;
+                        while ($bvi2 < scalar(@{$bs2->{"vars"}})) {
+                            $shadowed->{$bs2->{"vars"}->[$bvi2]->{"value"}} = 1;
+                            $bvi2++;
+                        }
+                    } elsif (defined($bs2->{"var"})) {
+                        $shadowed->{$bs2->{"var"}->{"value"}} = 1;
+                    }
+                }
+                $bsi++;
+            }
+            # Build a fresh renames hash without shadowed keys.
+            $effective_renames = {};
+            my array @rk = keys($renames);
+            my int $rki = 0;
+            while ($rki < scalar(@rk)) {
+                if (!defined($shadowed->{$rk[$rki]})) {
+                    $effective_renames->{$rk[$rki]} = $renames->{$rk[$rki]};
+                }
+                $rki++;
+            }
+        }
+    }
+    # Var-reference nodes: rename `name` field if it matches.
+    if ($t == Perla::AST::N_SCALAR_VAR() || $t == Perla::AST::N_ARRAY_VAR()
+        || $t == Perla::AST::N_HASH_VAR()) {
+        if (defined($node->{"name"}) && defined($effective_renames->{$node->{"name"}})) {
+            $node->{"name"} = $effective_renames->{$node->{"name"}};
+        }
+    }
+    # N_ARRAY_SLICE: `array` field is a NAME STRING (not an AST node) for
+    # the sigil form `@arr[1,2]`. Rename it directly here so the slice
+    # reads the renamed C var. The deref form `@$ref[...]` has `array`
+    # as an AST node which the generic walk handles via "array" key.
+    if ($t == Perla::AST::N_ARRAY_SLICE()
+        && defined($node->{"array"}) && ref($node->{"array"}) ne "HASH"
+        && defined($effective_renames->{$node->{"array"}})) {
+        $node->{"array"} = $effective_renames->{$node->{"array"}};
+    }
+    # N_HASH_SLICE same idea — `hash` may be a name string or AST node.
+    if ($t == Perla::AST::N_HASH_SLICE()
+        && defined($node->{"hash"}) && ref($node->{"hash"}) ne "HASH"
+        && defined($effective_renames->{$node->{"hash"}})) {
+        $node->{"hash"} = $effective_renames->{$node->{"hash"}};
+    }
+    # N_INTERP_STR stores the raw double-quoted text; variable references
+    # inside (e.g., `"$x"`, `"${x}"`, `"@arr"`) are not separate AST nodes
+    # and won't be visited by the AST walk below. Without a textual
+    # rewrite, an outer `my $x = 1;` followed by `{ my $x = 2; print "$x"; }`
+    # left the print's "$x" reading v_x (outer) while the decl wrote to
+    # v_x__blk1, so the inner shadow had no visible effect.
+    if ($t == Perla::AST::N_INTERP_STR() && defined($node->{"value"})) {
+        $node->{"value"} = rewrite_interp_var_refs("" . $node->{"value"}, $effective_renames);
+    }
+    if ($t == Perla::AST::N_REGEX() && defined($node->{"pattern"})) {
+        $node->{"pattern"} = rewrite_interp_var_refs("" . $node->{"pattern"}, $effective_renames);
+    }
+    if ($t == Perla::AST::N_SUBST()) {
+        if (defined($node->{"pattern"})) {
+            $node->{"pattern"} = rewrite_interp_var_refs("" . $node->{"pattern"}, $effective_renames);
+        }
+        if (defined($node->{"replacement"})) {
+            $node->{"replacement"} = rewrite_interp_var_refs("" . $node->{"replacement"}, $effective_renames);
+        }
+    }
+    # N_FORMAT bodies are raw text; their value lines reference vars
+    # textually. Without rewriting, a `my $x` shadowed by a bare-block
+    # rename leaves the format reading the outer (un-renamed) v_x.
+    if ($t == Perla::AST::N_FORMAT() && defined($node->{"body"})) {
+        $node->{"body"} = rewrite_interp_var_refs("" . $node->{"body"}, $effective_renames);
+    }
+    # Walk every common child field. We don't care about exact structure
+    # here, just need to descend into anything that might contain a var
+    # reference. Skip non-AST scalars / hashes whose keys aren't AST.
+    my array @walk_keys = ("init", "value", "expr", "left", "right", "cond",
+                           "then", "else", "body", "var", "vars", "stmts",
+                           "args", "key", "index", "hash", "array", "callee",
+                           "object", "method", "target", "list", "block",
+                           "coderef", "operand", "lhs", "rhs", "items",
+                           "elements", "elems", "pairs", "keys_list",
+                           "indices",
+                           # `operands` holds the flattened operand list of
+                           # an N_CHAIN_CMP (Perl 5.32 chained comparison).
+                           # Without it, a block-scoped `my $n` used inside
+                           # `1 <= $n <= 10` was left unrenamed, so strict-mode
+                           # resolution couldn't match it to its (renamed)
+                           # declaration: "Global symbol $n requires explicit
+                           # package name".
+                           "operands",
+                           "init_block", "update", "test", "iter",
+                           "filter", "branches", "cases", "when", "default",
+                           "captures", "step",
+                           "fh_expr",
+                           # `fh` holds the filehandle expression for
+                           # `print $fh LIST` / `say $fh LIST` / `printf $fh`.
+                           # Without descending into it, a block-renamed
+                           # `my $fh` (→ `fh__blkN`) left the print's fh ref
+                           # pointing at the unrenamed file-scope slot, so
+                           # `print $fh ...` inside a block wrote to a stale
+                           # (empty) handle — File::Temp OO writes silently
+                           # produced a zero-byte file.
+                           "fh",
+                           # `comparator_expr` holds the scalar coderef of a
+                           # `sort $cmp LIST`. Without descending into it, a
+                           # block-scoped `my $cmp` (→ `cmp__blkN`) left the
+                           # sort's comparator ref pointing at the unrenamed
+                           # file-scope slot, so strict-mode resolution failed:
+                           # "Global symbol $cmp requires explicit package name".
+                           "comparator_expr",
+                           # `ref` holds the inner expression for N_DEREF_SCALAR /
+                           # N_DEREF_ARRAY / N_DEREF_HASH. Without descending into
+                           # it, `${$j}` inside a block whose declaration `my $j`
+                           # was renamed to `j__blk1` still read the outer (file-
+                           # scope) v_j slot — surface: symbolic capture-var
+                           # access `${$j}` returned undef in blocks even though
+                           # `my $v = $j` (which goes through value) worked.
+                           "ref");
+    my int $ki = 0;
+    while ($ki < scalar(@walk_keys)) {
+        my str $k = $walk_keys[$ki];
+        if (defined($node->{$k})) {
+            my scalar $v = $node->{$k};
+            if (ref($v) eq "ARRAY") {
+                my int $vj = 0;
+                while ($vj < scalar(@{$v})) {
+                    if (defined($v->[$vj]) && ref($v->[$vj]) eq "HASH") {
+                        rewrite_var_refs($v->[$vj], $effective_renames);
+                    }
+                    $vj++;
+                }
+            } elsif (ref($v) eq "HASH") {
+                rewrite_var_refs($v, $effective_renames);
+            }
+        }
+        $ki++;
+    }
+}

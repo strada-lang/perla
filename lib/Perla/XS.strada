@@ -1,0 +1,379 @@
+# Perla XS Support
+# Parses .xs files and generates wrapper code for Perla
+#
+# For compiled mode: emits C wrapper functions
+# For VM/Strada mode: emits __C__ blocks
+
+package Perla::XS;
+
+# Parse an XS file into a list of function descriptors
+func parse_xs(str $source) scalar {
+    my array @functions = ();
+    my str $module = "";
+    my str $package = "";
+    my array @lines = split("\n", $source);
+    my int $i = 0;
+    my int $len = scalar(@lines);
+
+    while ($i < $len) {
+        my str $line = $lines[$i];
+
+        # Skip preprocessor directives and blank lines
+        if (length($line) == 0 || substr($line, 0, 1) eq "#") {
+            $i = $i + 1;
+            next;
+        }
+
+        # MODULE = Name  PACKAGE = Name
+        if (index($line, "MODULE") == 0 && index($line, "PACKAGE") >= 0) {
+            # Extract module and package names
+            my str $rest = $line;
+            $rest =~ s/^MODULE\s*=\s*//;
+            my int $pkg_pos = index($rest, "PACKAGE");
+            if ($pkg_pos >= 0) {
+                $module = substr($rest, 0, $pkg_pos);
+                $module =~ s/\s+$//;
+                my str $pkg_part = substr($rest, $pkg_pos, length($rest) - $pkg_pos);
+                $pkg_part =~ s/^PACKAGE\s*=\s*//;
+                $pkg_part =~ s/\s+$//;
+                $package = $pkg_part;
+            }
+            $i = $i + 1;
+            next;
+        }
+
+        # Function declaration: return_type\nname(params)\n  type param\n...
+        # Look for a type on a line by itself (return type)
+        if ($line =~ /^(int|double|float|void|char\s*\*|const\s+char\s*\*|SV\s*\*|long|unsigned|size_t|bool)\s*$/) {
+            my str $ret_type = $line;
+            $ret_type =~ s/^\s+//;
+            $ret_type =~ s/\s+$//;
+            $i = $i + 1;
+
+            # Next line: function_name(param_names)
+            if ($i < $len) {
+                my str $sig_line = $lines[$i];
+                $sig_line =~ s/^\s+//;
+                $sig_line =~ s/\s+$//;
+                my int $paren = index($sig_line, "(");
+                if ($paren >= 0) {
+                    my str $func_name = substr($sig_line, 0, $paren);
+                    my int $rparen = index($sig_line, ")");
+                    my str $param_names_str = "";
+                    if ($rparen > $paren + 1) {
+                        $param_names_str = substr($sig_line, $paren + 1, $rparen - $paren - 1);
+                    }
+                    $i = $i + 1;
+
+                    # Parse parameter type declarations
+                    my array @params = ();
+                    my array @param_names = split(",", $param_names_str);
+                    # Trim param names
+                    my int $pi = 0;
+                    while ($pi < scalar(@param_names)) {
+                        my str $pn = $param_names[$pi];
+                        $pn =~ s/^\s+//;
+                        $pn =~ s/\s+$//;
+                        $pi = $pi + 1;
+                    }
+
+                    # Read indented type lines
+                    while ($i < $len) {
+                        my str $pline = $lines[$i];
+                        if (length($pline) == 0) { $i = $i + 1; last; }
+                        if (substr($pline, 0, 4) ne "    " && substr($pline, 0, 1) ne "\t") { last; }
+                        $pline =~ s/^\s+//;
+                        $pline =~ s/\s+$//;
+                        if ($pline eq "CODE:" || $pline eq "OUTPUT:" || $pline eq "INIT:" || $pline eq "PREINIT:" || $pline eq "CLEANUP:") { last; }
+                        # "int a" or "char *name"
+                        my int $sp = rindex($pline, " ");
+                        if ($sp > 0) {
+                            my str $ptype = substr($pline, 0, $sp);
+                            my str $pname = substr($pline, $sp + 1, length($pline) - $sp - 1);
+                            $ptype =~ s/^\s+//;
+                            $ptype =~ s/\s+$//;
+                            $pname =~ s/^\s+//;
+                            $pname =~ s/\s+$//;
+                            push(@params, { name => $pname, type => $ptype });
+                        }
+                        $i = $i + 1;
+                    }
+
+                    # Read CODE: block (stop at OUTPUT: or next function)
+                    my str $code = "";
+                    if ($i < $len) {
+                        my str $section = $lines[$i];
+                        $section =~ s/^\s+//;
+                        if ($section eq "CODE:") {
+                            $i = $i + 1;
+                            while ($i < $len) {
+                                my str $cline = $lines[$i];
+                                my str $trimmed = $cline;
+                                $trimmed =~ s/^\s+//;
+                                # Stop at OUTPUT:, next function, or blank line between functions
+                                if ($trimmed eq "OUTPUT:" || $trimmed eq "CLEANUP:" || $trimmed eq "INIT:") {
+                                    # Skip this section and its contents
+                                    $i = $i + 1;
+                                    while ($i < $len) {
+                                        my str $oline = $lines[$i];
+                                        my str $otrim = $oline;
+                                        $otrim =~ s/^\s+//;
+                                        if (length($otrim) == 0) { $i = $i + 1; last; }
+                                        if ($otrim eq "RETVAL" || substr($oline, 0, 4) eq "    " || substr($oline, 0, 1) eq "\t") {
+                                            $i = $i + 1;
+                                        } else {
+                                            last;
+                                        }
+                                    }
+                                    last;
+                                }
+                                if (length($trimmed) == 0) { $i = $i + 1; last; }
+                                if (length($code) > 0) { $code = $code . "\n"; }
+                                $code = $code . $trimmed;
+                                $i = $i + 1;
+                            }
+                        }
+                    }
+
+                    push(@functions, {
+                        name     => $func_name,
+                        ret_type => $ret_type,
+                        params   => \@params,
+                        code     => $code,
+                        pkg      => $package,
+                        module   => $module,
+                    });
+                    next;
+                }
+            }
+        }
+
+        $i = $i + 1;
+    }
+
+    my hash %result = ();
+    $result{"module"} = $module;
+    $result{"pkg"} = $package;
+    $result{"functions"} = \@functions;
+    return \%result;
+}
+
+# Map C types to Strada types
+func c_to_strada_type(str $ctype) str {
+    if ($ctype eq "int" || $ctype eq "long" || $ctype eq "unsigned" || $ctype eq "size_t" || $ctype eq "bool") {
+        return "int";
+    }
+    if ($ctype eq "double" || $ctype eq "float") {
+        return "num";
+    }
+    if ($ctype eq "char *" || $ctype eq "const char *") {
+        return "str";
+    }
+    if ($ctype eq "void") {
+        return "void";
+    }
+    return "scalar";
+}
+
+# Generate C wrapper code for compiled mode
+func gen_c_wrappers(scalar $xs_data) str {
+    my scalar $sb = sb_new(4096);
+    my scalar $funcs = $xs_data->{"functions"};
+    my str $pkg = $xs_data->{"pkg"};
+    my int $i = 0;
+
+    while ($i < scalar(@{$funcs})) {
+        my scalar $fn = $funcs->[$i];
+        my str $name = $fn->{"name"};
+        my str $ret = $fn->{"ret_type"};
+        my scalar $params = $fn->{"params"};
+        my str $code = $fn->{"code"};
+
+        # Emit the raw C function
+        sb_append($sb, "/* XS: " . $pkg . "::" . $name . " */\n");
+        sb_append($sb, "static " . $ret . " __xs_" . $name . "(");
+        my int $pi = 0;
+        while ($pi < scalar(@{$params})) {
+            if ($pi > 0) { sb_append($sb, ", "); }
+            sb_append($sb, $params->[$pi]->{"type"} . " " . $params->[$pi]->{"name"});
+            $pi = $pi + 1;
+        }
+        sb_append($sb, ") {\n");
+        if ($ret ne "void") {
+            sb_append($sb, "    " . $ret . " RETVAL;\n");
+        }
+        sb_append($sb, "    " . $code . "\n");
+        if ($ret ne "void") {
+            sb_append($sb, "    return RETVAL;\n");
+        }
+        sb_append($sb, "}\n\n");
+
+        # Emit Perla wrapper (StradaValue* in/out)
+        my str $wrapper_name = "perla_xs_" . replace_all($pkg, "::", "_") . "_" . $name;
+        sb_append($sb, "StradaValue* " . $wrapper_name . "(StradaValue *perla_args) {\n");
+        sb_append($sb, "    StradaValue *perla_at_ = perla_args ? perla_args : strada_new_array();\n");
+
+        # Extract and convert params
+        $pi = 0;
+        while ($pi < scalar(@{$params})) {
+            my str $ptype = $params->[$pi]->{"type"};
+            my str $pname = $params->[$pi]->{"name"};
+            sb_append($sb, "    ");
+            if ($ptype eq "int" || $ptype eq "long" || $ptype eq "unsigned" || $ptype eq "size_t") {
+                sb_append($sb, $ptype . " " . $pname . " = (int)strada_to_int(strada_array_get(strada_deref_array(perla_at_), " . $pi . "));\n");
+            } elsif ($ptype eq "double" || $ptype eq "float") {
+                sb_append($sb, $ptype . " " . $pname . " = (" . $ptype . ")strada_to_num(strada_array_get(strada_deref_array(perla_at_), " . $pi . "));\n");
+            } elsif ($ptype eq "char *" || $ptype eq "const char *") {
+                sb_append($sb, "char *" . $pname . " = strada_to_str(strada_array_get(strada_deref_array(perla_at_), " . $pi . "));\n");
+            } else {
+                sb_append($sb, "StradaValue *" . $pname . " = strada_array_get(strada_deref_array(perla_at_), " . $pi . ");\n");
+            }
+            $pi = $pi + 1;
+        }
+
+        # Call and return
+        if ($ret eq "void") {
+            sb_append($sb, "    __xs_" . $name . "(");
+        } else {
+            sb_append($sb, "    " . $ret . " __retval = __xs_" . $name . "(");
+        }
+        $pi = 0;
+        while ($pi < scalar(@{$params})) {
+            if ($pi > 0) { sb_append($sb, ", "); }
+            sb_append($sb, $params->[$pi]->{"name"});
+            $pi = $pi + 1;
+        }
+        sb_append($sb, ");\n");
+
+        # Free string params
+        $pi = 0;
+        while ($pi < scalar(@{$params})) {
+            my str $ptype = $params->[$pi]->{"type"};
+            if ($ptype eq "char *" || $ptype eq "const char *") {
+                sb_append($sb, "    free(" . $params->[$pi]->{"name"} . ");\n");
+            }
+            $pi = $pi + 1;
+        }
+
+        # Convert return
+        if ($ret eq "void") {
+            sb_append($sb, "    return strada_new_undef();\n");
+        } elsif ($ret eq "int" || $ret eq "long" || $ret eq "unsigned") {
+            sb_append($sb, "    return strada_new_int((int64_t)__retval);\n");
+        } elsif ($ret eq "double" || $ret eq "float") {
+            sb_append($sb, "    return strada_new_num((double)__retval);\n");
+        } elsif ($ret eq "char *" || $ret eq "const char *") {
+            sb_append($sb, "    StradaValue *__r = strada_new_str(__retval);\n");
+            sb_append($sb, "    return __r;\n");
+        } else {
+            sb_append($sb, "    return strada_new_undef();\n");
+        }
+        sb_append($sb, "}\n\n");
+
+        $i = $i + 1;
+    }
+
+    return sb_to_string($sb);
+}
+
+# Generate Strada code with __C__ blocks for VM mode
+func gen_strada_wrappers(scalar $xs_data) str {
+    my scalar $sb = sb_new(4096);
+    my scalar $funcs = $xs_data->{"functions"};
+    my str $pkg = $xs_data->{"pkg"};
+
+    if (length($pkg) > 0 && $pkg ne "main") {
+        sb_append($sb, "package " . $pkg . ";\n\n");
+    }
+
+    my int $i = 0;
+    while ($i < scalar(@{$funcs})) {
+        my scalar $fn = $funcs->[$i];
+        my str $name = $fn->{"name"};
+        my str $ret = $fn->{"ret_type"};
+        my scalar $params = $fn->{"params"};
+        my str $code = $fn->{"code"};
+        my str $strada_ret = c_to_strada_type($ret);
+
+        # Emit Strada function with __C__ block
+        sb_append($sb, "func " . $name . "(");
+        my int $pi = 0;
+        while ($pi < scalar(@{$params})) {
+            if ($pi > 0) { sb_append($sb, ", "); }
+            my str $stype = c_to_strada_type($params->[$pi]->{"type"});
+            sb_append($sb, $stype . " $" . $params->[$pi]->{"name"});
+            $pi = $pi + 1;
+        }
+        sb_append($sb, ") " . $strada_ret . " {\n");
+
+        if ($ret ne "void") {
+            sb_append($sb, "    my " . $strada_ret . " $result = 0;\n");
+        }
+
+        sb_append($sb, "    __C__ {\n");
+
+        # Convert params and call
+        if ($ret ne "void") {
+            sb_append($sb, "        " . $ret . " RETVAL;\n");
+        }
+
+        # Emit params (already available as Strada vars = C StradaValue*)
+        $pi = 0;
+        while ($pi < scalar(@{$params})) {
+            my str $ptype = $params->[$pi]->{"type"};
+            my str $pname = $params->[$pi]->{"name"};
+            if ($ptype eq "int" || $ptype eq "long") {
+                sb_append($sb, "        " . $ptype . " __c_" . $pname . " = (int)strada_to_int(" . $pname . ");\n");
+            } elsif ($ptype eq "double" || $ptype eq "float") {
+                sb_append($sb, "        " . $ptype . " __c_" . $pname . " = (" . $ptype . ")strada_to_num(" . $pname . ");\n");
+            } elsif ($ptype eq "char *" || $ptype eq "const char *") {
+                sb_append($sb, "        char *__c_" . $pname . " = strada_to_str(" . $pname . ");\n");
+            }
+            $pi = $pi + 1;
+        }
+
+        # Emit code with renamed params
+        my str $modified_code = $code;
+        $pi = 0;
+        while ($pi < scalar(@{$params})) {
+            my str $pname = $params->[$pi]->{"name"};
+            $modified_code = replace_all($modified_code, $pname, "__c_" . $pname);
+            $pi = $pi + 1;
+        }
+        sb_append($sb, "        " . $modified_code . "\n");
+
+        # Convert result back
+        if ($ret ne "void") {
+            if ($ret eq "int" || $ret eq "long") {
+                sb_append($sb, "        strada_decref(result);\n");
+                sb_append($sb, "        result = strada_new_int((int64_t)RETVAL);\n");
+            } elsif ($ret eq "double" || $ret eq "float") {
+                sb_append($sb, "        strada_decref(result);\n");
+                sb_append($sb, "        result = strada_new_num((double)RETVAL);\n");
+            }
+        }
+
+        # Free string params
+        $pi = 0;
+        while ($pi < scalar(@{$params})) {
+            if ($params->[$pi]->{"type"} eq "char *" || $params->[$pi]->{"type"} eq "const char *") {
+                sb_append($sb, "        free(__c_" . $params->[$pi]->{"name"} . ");\n");
+            }
+            $pi = $pi + 1;
+        }
+
+        sb_append($sb, "    }\n");
+        if ($ret ne "void") {
+            sb_append($sb, "    return $result;\n");
+        }
+        sb_append($sb, "}\n\n");
+
+        $i = $i + 1;
+    }
+
+    if (length($pkg) > 0 && $pkg ne "main") {
+        sb_append($sb, "package main;\n");
+    }
+
+    return sb_to_string($sb);
+}

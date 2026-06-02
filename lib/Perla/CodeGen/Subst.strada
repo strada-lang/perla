@@ -1,0 +1,189 @@
+# Perla::CodeGen::Subst - Codegen for =~ s/// and tr/// LHS writeback.
+#
+# Two helpers used by the regex-substitution and transliteration codegen
+# to push the new value back into the LHS target. The simple case
+# `$var =~ s/...//` is a plain `decref(L); L = __nv;`, but s/// and tr///
+# can also target hash elements, hash-deref elements, array elements,
+# deref-scalars, and unhappy lvalues — each needs its own write-back
+# shape, and the dispatch is non-trivial.
+#
+#   emit_subst_writeback($cg, $target, $src_c)
+#     Emit the writeback C for $target with the new value held in $src_c.
+#     Dispatches on $target's AST node type to one of: hash-element store,
+#     array-element store, scalar-deref assign, param-aware writeback
+#     (avoids double-decref on @_ params via cleanup_push), or plain
+#     decref+reassign.
+#
+#   gen_subst_store_hash($cg, $target)
+#     Inner helper for the hash-element case. Assumes the incoming value
+#     is named `__nv` in the surrounding C scope (the s/// codegen sets
+#     this up); emits a `{ char *__sk = ...; strada_hv_store(...); }`
+#     block. Reused by both s/// and tr/// when their target is
+#     N_ARROW_HASH or N_HASH_ELEM.
+#
+# Uses only public helpers (emit, gen_expr, c_var_a) from main
+# Perla::CodeGen plus Perla::CodeGen::Escape — no Parser/Lexer
+# cross-module calls.
+
+use Perla::AST;
+use Perla::CodeGen::Escape;
+
+package Perla::CodeGen::Subst;
+
+# Cross-module forward decls for Perla::CodeGen helpers. See the matching
+# block in Perla::CodeGen::Interp for the rationale (use-cycle, native
+# body-less qualified `extern func` -> registered with proper return type).
+extern func Perla::CodeGen::emit(scalar $cg, str $s) void;
+extern func Perla::CodeGen::gen_expr(scalar $cg, scalar $node) void;
+extern func Perla::CodeGen::c_var(str $name) str;
+extern func Perla::CodeGen::c_var_a(str $name) str;
+extern func Perla::CodeGen::c_var_h(str $name) str;
+extern func Perla::CodeGen::has_perl_var(str $s) int;
+
+func emit_subst_writeback(scalar $cg, scalar $target, str $src_c) void {
+    my int $ttype = $target->{"type"};
+    if ($ttype == Perla::AST::N_ARROW_HASH() || $ttype == Perla::AST::N_HASH_ELEM()) {
+        # The existing helper assumes the incoming value is named __nv.
+        if ($src_c eq "__nv") {
+            gen_subst_store_hash($cg, $target);
+        } else {
+            Perla::CodeGen::emit($cg, "{ StradaValue *__nv = " . $src_c . "; ");
+            gen_subst_store_hash($cg, $target);
+            Perla::CodeGen::emit($cg, "} ");
+        }
+        return;
+    }
+    if ($ttype == Perla::AST::N_DEREF_SCALAR()) {
+        Perla::CodeGen::emit($cg, "perla_scalar_deref_assign(");
+        Perla::CodeGen::gen_expr($cg, $target->{"ref"});
+        Perla::CodeGen::emit($cg, ", " . $src_c . "); ");
+        return;
+    }
+    if ($ttype == Perla::AST::N_ARRAY_ELEM() || $ttype == Perla::AST::N_ARROW_ARRAY()) {
+        Perla::CodeGen::emit($cg, "{ StradaArray *__wb_av = strada_deref_array(");
+        # Mirror the read path for both N_ARRAY_ELEM ($arr[N]) and
+        # N_ARROW_ARRAY which the parser also uses for bare `$arr[N]`
+        # (the implicit subscript-on-sigil-$) — special-casing $_[N]
+        # so it indexes @_, not $_, and bare $foo[N] so it indexes @foo.
+        my scalar $wb_arr = $target->{"array"};
+        my int $wb_is_arrow = 0;
+        if ($ttype == Perla::AST::N_ARROW_ARRAY()) {
+            $wb_arr = $target->{"object"};
+            if (defined($target->{"is_explicit_arrow"}) && $target->{"is_explicit_arrow"} == 1) {
+                $wb_is_arrow = 1;
+            }
+        }
+        if ($wb_is_arrow == 0 && defined($wb_arr) && $wb_arr->{"type"} == Perla::AST::N_SCALAR_VAR() && $wb_arr->{"name"} eq "_") {
+            Perla::CodeGen::emit($cg, "perla_at_");
+        } elsif ($wb_is_arrow == 0 && defined($wb_arr) && $wb_arr->{"type"} == Perla::AST::N_SCALAR_VAR() && index($wb_arr->{"name"}, "::") < 0) {
+            Perla::CodeGen::emit($cg, Perla::CodeGen::c_var_a($wb_arr->{"name"}));
+        } else {
+            Perla::CodeGen::gen_expr($cg, $wb_arr);
+        }
+        Perla::CodeGen::emit($cg, "); int __wb_idx = (int)strada_to_int(");
+        Perla::CodeGen::gen_expr($cg, $target->{"index"});
+        Perla::CodeGen::emit($cg, "); if (__wb_idx < 0 && __wb_av) __wb_idx += strada_array_length(__wb_av); strada_array_set(__wb_av, __wb_idx, " . $src_c . "); } ");
+        return;
+    }
+    # Only emit a decref+reassign when target is a plain variable lvalue that
+    # gen_expr produces as a real C lvalue. For anything else, fall back to a
+    # TODO — better than emitting malformed C.
+    if ($ttype == Perla::AST::N_SCALAR_VAR() || $ttype == Perla::AST::N_ARRAY_VAR() || $ttype == Perla::AST::N_HASH_VAR()) {
+        # Regex capture vars ($1-$9) and other read-only specials (like $&,
+        # $`, $', $+) aren't C lvalues — gen_expr emits them as function
+        # calls (strada_capture_var(N)). Perl treats assignment to them as
+        # a no-op / dies; for =~ tr/s writeback we just drop src_c. Seen
+        # with `$1 =~ y/\n//` in Template::Parser — counts newlines without
+        # mutating.
+        if ($ttype == Perla::AST::N_SCALAR_VAR()) {
+            my str $tvname = $target->{"name"};
+            my int $is_ro = 0;
+            if (length($tvname) == 1) {
+                my int $c0 = char_at($tvname, 0);
+                if ($c0 >= 49 && $c0 <= 57) { $is_ro = 1; }  # '1'..'9'
+                if ($tvname eq "&" || $tvname eq "`" || $tvname eq "'" || $tvname eq "+") { $is_ro = 1; }
+            }
+            if ($is_ro == 1) {
+                Perla::CodeGen::emit($cg, "strada_decref(" . $src_c . "); ");
+                return;
+            }
+            # $AUTOLOAD is read via a function call (perla_get_autoload_var())
+            # which is not a C lvalue. Use the setter helper instead.
+            if ($tvname eq "AUTOLOAD") {
+                Perla::CodeGen::emit($cg, "perla_set_autoload_var_sv(" . $src_c . "); ");
+                return;
+            }
+            # Package-qualified scalar ($Pkg::NAME): gen_expr emits
+            # perla_scalar_get(pkg, short) — a function call, not a C lvalue —
+            # so `gen_expr(target) = src` fails to compile ("lvalue required").
+            # Write via the setter (which also syncs the v_ static mirror and
+            # the stash). perla_scalar_set increfs its value, so decref src_c
+            # (fresh, refcount 1) afterward to avoid a leak. Surfaced by
+            # Type::Tiny's `$Type::Tiny::VERSION =~ tr/_//d;`.
+            if (index($tvname, "::") >= 0) {
+                my int $wsep = -1;
+                my int $wgi = length($tvname) - 1;
+                while ($wgi >= 0) {
+                    if ($wgi > 0 && substr($tvname, $wgi - 1, 2) eq "::") { $wsep = $wgi - 1; last; }
+                    $wgi = $wgi - 1;
+                }
+                my str $wpkg = "" . $cg->{"pkg"};
+                my str $wshort = $tvname;
+                if ($wsep >= 0) {
+                    $wpkg = substr($tvname, 0, $wsep);
+                    $wshort = substr($tvname, $wsep + 2, length($tvname) - $wsep - 2);
+                }
+                Perla::CodeGen::emit($cg, "perla_scalar_set(\"" . $wpkg . "\", \"" . $wshort . "\", " . $src_c . "); strada_decref(" . $src_c . "); ");
+                return;
+            }
+            # Parameter writeback: the param was incref'd + cleanup_push'd
+            # at function entry. If we decref the old value here, then
+            # cleanup_drain at function exit will decref it AGAIN via the
+            # stale stack entry — corrupting caller's variable. Instead,
+            # push the new value to the cleanup stack and let drain decref
+            # it; leave the old entry alone (drain will handle that too).
+            if (defined($cg->{"param_vars"}) && defined($cg->{"param_vars"}->{$tvname})) {
+                Perla::CodeGen::emit($cg, "strada_cleanup_push(" . $src_c . "); ");
+                Perla::CodeGen::gen_expr($cg, $target);
+                Perla::CodeGen::emit($cg, " = " . $src_c . "; ");
+                return;
+            }
+        }
+        Perla::CodeGen::emit($cg, "strada_decref(");
+        Perla::CodeGen::gen_expr($cg, $target);
+        Perla::CodeGen::emit($cg, "); ");
+        Perla::CodeGen::gen_expr($cg, $target);
+        Perla::CodeGen::emit($cg, " = " . $src_c . "; ");
+        return;
+    }
+    Perla::CodeGen::emit($cg, "/* TODO writeback for node type " . $ttype . " */ strada_decref(" . $src_c . "); ");
+}
+
+# Store __nv back into a hash-element target for s///.
+func gen_subst_store_hash(scalar $cg, scalar $target) void {
+    my int $ttype = $target->{"type"};
+    if ($ttype == Perla::AST::N_ARROW_HASH()) {
+        my scalar $tkey = $target->{"key"};
+        Perla::CodeGen::emit($cg, "{ char *__sk = ");
+        if (defined($tkey) && $tkey->{"type"} == Perla::AST::N_STR_LIT()) {
+            Perla::CodeGen::emit($cg, "strdup(\"" . Perla::CodeGen::Escape::escape_c_str($tkey->{"value"}) . "\")");
+        } elsif (defined($tkey) && $tkey->{"type"} == Perla::AST::N_INTERP_STR() && Perla::CodeGen::has_perl_var($tkey->{"value"}) == 0) {
+            # Perl escape (\n, \t, etc.) → C escape so hash key contains
+            # the actual byte. Mirror the hash-assign codegen above.
+            Perla::CodeGen::emit($cg, "strdup(\"" . Perla::CodeGen::Escape::perl_interp_literal_to_c($tkey->{"value"}) . "\")");
+        } else {
+            Perla::CodeGen::emit($cg, "strada_to_str(");
+            if (defined($tkey)) { Perla::CodeGen::gen_expr($cg, $tkey); } else { Perla::CodeGen::emit($cg, "perla_dollar_underscore"); }
+            Perla::CodeGen::emit($cg, ")");
+        }
+        Perla::CodeGen::emit($cg, "; strada_hv_store(");
+        Perla::CodeGen::gen_expr($cg, $target->{"object"});
+        Perla::CodeGen::emit($cg, ", __sk, __nv); free(__sk); } ");
+    } elsif ($ttype == Perla::AST::N_HASH_ELEM()) {
+        Perla::CodeGen::emit($cg, "{ char *__sk = strada_to_str(");
+        Perla::CodeGen::gen_expr($cg, $target->{"key"});
+        Perla::CodeGen::emit($cg, "); strada_hv_store(");
+        Perla::CodeGen::gen_expr($cg, $target->{"hash"});
+        Perla::CodeGen::emit($cg, ", __sk, __nv); free(__sk); } ");
+    }
+}

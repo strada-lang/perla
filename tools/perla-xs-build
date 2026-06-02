@@ -1,0 +1,281 @@
+#!/usr/bin/env bash
+#
+# perla-xs-build — compile an XS module against Perla's perl.h shim
+#
+# Usage:
+#   perla-xs-build [options] foo.xs       # xsubpp + cc → foo.o
+#   perla-xs-build [options] foo.c        # cc only (pre-xsubpp'd) → foo.o
+#
+# Produces a .o (default) or .so (with --shared) that you link into a
+# Perla-compiled program, either by pasting it into the gcc line printed
+# by `perla --debug [cc]`, or by feeding the path into PERLA_LINK_OBJECTS.
+#
+# What it does:
+#   1. If the input is .xs, runs xsubpp to generate .xs.c (uses the
+#      system's xsubpp + default typemap; override with --xsubpp and
+#      --typemap).
+#   2. Compiles the .c with -I pointing at Perla's runtime/ and
+#      perla/runtime/ dirs. That's where Perla's perl.h shim lives
+#      (which routes all Perl XS macros through perla_perl_compat.h).
+#   3. Reports exported symbols so you know what to call from your
+#      Perla program.
+#
+# Exits non-zero on any compile error. Prints `[xs-build]` progress to
+# stderr; resulting .o path to stdout on success.
+#
+# Part of https://github.com/strada-lang/perla — see docs/
+
+set -e -o pipefail
+
+# --- defaults --------------------------------------------------------
+
+PERLA_XS_BUILD_VERSION="0.1"
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Locate Strada's runtime dir (strada_runtime.h). Priority:
+#   1. $STRADA_DIR/runtime          (explicit dev tree)
+#   2. <prefix>/lib/strada/runtime  (system install, via `strada` on PATH)
+#   3. /usr/local/lib/strada/runtime
+resolve_strada_runtime() {
+    if [ -n "${STRADA_DIR:-}" ] && [ -f "$STRADA_DIR/runtime/strada_runtime.h" ]; then
+        echo "$STRADA_DIR/runtime"; return
+    fi
+    local sb; sb="$(command -v strada 2>/dev/null || true)"
+    if [ -n "$sb" ]; then
+        local cand; cand="$(cd "$(dirname "$sb")/.." && pwd)/lib/strada/runtime"
+        if [ -f "$cand/strada_runtime.h" ]; then echo "$cand"; return; fi
+    fi
+    if [ -f /usr/local/lib/strada/runtime/strada_runtime.h ]; then
+        echo /usr/local/lib/strada/runtime; return
+    fi
+    echo "error: can't locate Strada runtime; set STRADA_DIR=..." >&2
+    exit 1
+}
+
+# Locate Perla's own runtime dir (perla_stash.c / perla_perl_compat.h). Priority:
+#   1. $PERLA_RUNTIME_DIR
+#   2. <perla>/runtime              (this script is <perla>/tools/perla-xs-build)
+#   3. <prefix>/lib/perla/runtime   (installed, via `perla` on PATH)
+resolve_perla_runtime() {
+    if [ -n "${PERLA_RUNTIME_DIR:-}" ] && [ -d "$PERLA_RUNTIME_DIR" ]; then
+        echo "$PERLA_RUNTIME_DIR"; return
+    fi
+    local maybe="$SCRIPT_DIR/../runtime"
+    if [ -f "$maybe/perla_stash.c" ]; then (cd "$maybe" && pwd); return; fi
+    local pb; pb="$(command -v perla 2>/dev/null || true)"
+    if [ -n "$pb" ]; then
+        local cand; cand="$(cd "$(dirname "$pb")/.." && pwd)/lib/perla/runtime"
+        if [ -d "$cand" ]; then echo "$cand"; return; fi
+    fi
+    echo "error: can't locate Perla runtime; set PERLA_RUNTIME_DIR=..." >&2
+    exit 1
+}
+
+RUNTIME_DIR="$(resolve_strada_runtime)"
+PERLA_RT_DIR="$(resolve_perla_runtime)"
+
+CC="${PERLA_CC:-gcc}"
+OPT="-O2"
+SHARED=0
+OUTPUT=""
+MODULE=""
+XSUBPP=""
+TYPEMAP=""
+EXTRA_INCLUDES=()
+EXTRA_DEFINES=()
+EXTRA_LIBS=()
+KEEP_C=0
+VERBOSE=0
+
+usage() {
+    cat <<EOF
+perla-xs-build $PERLA_XS_BUILD_VERSION — compile XS modules against Perla's perl.h shim
+
+Usage: perla-xs-build [options] INPUT
+
+Input:
+  foo.xs          Run xsubpp then compile
+  foo.c           Skip xsubpp, compile directly (already xsubpp'd)
+
+Options:
+  -o FILE         Output path (default: INPUT with .o / .so extension)
+  --shared        Build a .so (for dlopen) instead of a .o (for static link)
+  --module NAME   Module name used in diagnostics (default: derived from path)
+  --xsubpp PATH   xsubpp to use (default: \$(which xsubpp))
+  --typemap FILE  Extra typemap passed to xsubpp (can repeat)
+  --cc BIN        C compiler (default: gcc; honors \$PERLA_CC)
+  -O LEVEL        Optimization flag (default: -O2)
+  -I PATH         Extra include path (can repeat)
+  -D DEF          Extra -D define (can repeat)
+  -l LIB          Link against library, e.g. -lz (can repeat; --shared only)
+  --keep-c        Keep the intermediate .xs.c after build
+  -v, --verbose   Print all invoked commands
+  -h, --help      Show this help
+
+Environment:
+  STRADA_DIR      Path to Strada tree (default: auto-detected)
+  PERLA_CC        Default C compiler
+
+Example:
+  # Build Foo.o from Foo.xs
+  perla-xs-build Foo.xs
+
+  # Build a .so you'll dlopen at runtime, with zlib linked in
+  perla-xs-build --shared -lz Foo.xs
+
+  # Compile a pre-xsubpp'd CPAN module .c directly
+  perla-xs-build -o Bar.o /tmp/CPAN-Bar/Bar.c
+
+  # Link the resulting Foo.o into a Perla program:
+  #   1. Build your program: perla --keep -o prog prog.pl
+  #   2. Grab the gcc line printed under --debug [cc]
+  #   3. Add Foo.o to that command and rerun.
+EOF
+}
+
+# --- argument parsing ------------------------------------------------
+
+INPUT=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o)         OUTPUT="$2";              shift 2 ;;
+        --shared)   SHARED=1;                  shift ;;
+        --module)   MODULE="$2";               shift 2 ;;
+        --xsubpp)   XSUBPP="$2";               shift 2 ;;
+        --typemap)  TYPEMAP="$TYPEMAP -typemap $2"; shift 2 ;;
+        --cc)       CC="$2";                   shift 2 ;;
+        -O*)        OPT="$1";                  shift ;;
+        -I)         EXTRA_INCLUDES+=("-I$2");  shift 2 ;;
+        -I*)        EXTRA_INCLUDES+=("$1");    shift ;;
+        -D)         EXTRA_DEFINES+=("-D$2");   shift 2 ;;
+        -D*)        EXTRA_DEFINES+=("$1");     shift ;;
+        -l)         EXTRA_LIBS+=("-l$2");      shift 2 ;;
+        -l*)        EXTRA_LIBS+=("$1");        shift ;;
+        --keep-c)   KEEP_C=1;                  shift ;;
+        -v|--verbose) VERBOSE=1;               shift ;;
+        -h|--help)  usage; exit 0 ;;
+        --version)  echo "perla-xs-build $PERLA_XS_BUILD_VERSION"; exit 0 ;;
+        -*)         echo "unknown flag: $1" >&2; usage >&2; exit 2 ;;
+        *)
+            if [ -n "$INPUT" ]; then
+                echo "error: only one input file supported (got $INPUT and $1)" >&2
+                exit 2
+            fi
+            INPUT="$1"
+            shift
+            ;;
+    esac
+done
+
+if [ -z "$INPUT" ]; then
+    echo "error: no input file" >&2
+    usage >&2
+    exit 2
+fi
+if [ ! -f "$INPUT" ]; then
+    echo "error: $INPUT: no such file" >&2
+    exit 1
+fi
+
+# --- derive paths ----------------------------------------------------
+
+INPUT_DIR="$(cd "$(dirname "$INPUT")" && pwd)"
+INPUT_BASE="$(basename "$INPUT")"
+INPUT_STEM="${INPUT_BASE%.*}"
+INPUT_EXT="${INPUT_BASE##*.}"
+
+if [ -z "$MODULE" ]; then
+    MODULE="$INPUT_STEM"
+fi
+
+if [ -z "$OUTPUT" ]; then
+    if [ "$SHARED" = 1 ]; then
+        OUTPUT="$INPUT_DIR/$INPUT_STEM.so"
+    else
+        OUTPUT="$INPUT_DIR/$INPUT_STEM.o"
+    fi
+fi
+
+# --- logging helpers -------------------------------------------------
+
+log()  { echo "[xs-build] $*" >&2; }
+run()  { [ "$VERBOSE" = 1 ] && echo "+ $*" >&2; "$@"; }
+
+log "module=$MODULE strada_rt=$RUNTIME_DIR perla_rt=$PERLA_RT_DIR out=$OUTPUT"
+
+# --- step 1: xsubpp (if input is .xs) --------------------------------
+
+C_FILE=""
+C_FILE_IS_TEMP=0
+
+if [ "$INPUT_EXT" = "xs" ]; then
+    if [ -z "$XSUBPP" ]; then
+        XSUBPP="$(command -v xsubpp 2>/dev/null || true)"
+    fi
+    if [ -z "$XSUBPP" ] || [ ! -x "$XSUBPP" ]; then
+        echo "error: xsubpp not found (tried \$PATH); pass --xsubpp PATH" >&2
+        exit 1
+    fi
+    C_FILE="$INPUT_DIR/$INPUT_STEM.xs.c"
+    C_FILE_IS_TEMP=1
+    [ "$KEEP_C" = 1 ] && C_FILE_IS_TEMP=0
+
+    log "xsubpp $INPUT_BASE → $(basename "$C_FILE")"
+    run "$XSUBPP" $TYPEMAP "$INPUT" > "$C_FILE"
+elif [ "$INPUT_EXT" = "c" ]; then
+    C_FILE="$INPUT"
+else
+    echo "error: input must be .xs or .c (got .$INPUT_EXT)" >&2
+    exit 2
+fi
+
+# --- step 2: cc ------------------------------------------------------
+
+# Perla's perl.h shim lives in perla/runtime/. strada_runtime.h lives in
+# runtime/. Put perla/runtime/ first so `#include <perl.h>` finds our
+# shim rather than the system Perl's perl.h (if that's on the include
+# path transitively).
+CFLAGS=(
+    -fPIC
+    "$OPT"
+    -w
+    -I"$PERLA_RT_DIR"
+    -I"$RUNTIME_DIR"
+    "${EXTRA_INCLUDES[@]}"
+    "${EXTRA_DEFINES[@]}"
+)
+
+if [ "$SHARED" = 1 ]; then
+    log "cc --shared $C_FILE → $OUTPUT"
+    run "$CC" "${CFLAGS[@]}" -shared -o "$OUTPUT" "$C_FILE" "${EXTRA_LIBS[@]}"
+else
+    log "cc -c $C_FILE → $OUTPUT"
+    run "$CC" "${CFLAGS[@]}" -c -o "$OUTPUT" "$C_FILE"
+fi
+
+# --- step 3: cleanup + report ---------------------------------------
+
+if [ "$C_FILE_IS_TEMP" = 1 ] && [ -n "$C_FILE" ] && [ -f "$C_FILE" ]; then
+    rm -f "$C_FILE"
+fi
+
+if [ ! -f "$OUTPUT" ]; then
+    echo "error: expected output $OUTPUT not produced" >&2
+    exit 1
+fi
+
+log "ok: $OUTPUT ($(stat -c%s "$OUTPUT" 2>/dev/null || stat -f%z "$OUTPUT" 2>/dev/null) bytes)"
+
+# Show exported symbols (the ones you'd call from Perla). Filter to
+# likely XS entrypoints so the output stays readable.
+if command -v nm >/dev/null 2>&1; then
+    SYMS=$(nm "$OUTPUT" 2>/dev/null | awk '$2 == "T" { print $3 }' | \
+        grep -E '^(XS_|boot_|perla_xs_)' || true)
+    if [ -n "$SYMS" ]; then
+        log "exported XS entrypoints:"
+        echo "$SYMS" | sed 's/^/[xs-build]   /' >&2
+    fi
+fi
+
+echo "$OUTPUT"

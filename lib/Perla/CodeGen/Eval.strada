@@ -1,0 +1,206 @@
+# Perla::CodeGen::Eval - Codegen for `eval STRING` with lexical capture.
+#
+# emit_eval_string_with_caps($cg, $node, $is_expr) compiles `eval EXPR`
+# with full support for capturing in-scope `my $x` scalars: it mirrors
+# them into a hash that the eval body reads at entry and writes at exit,
+# then reads them back into the surrounding C locals — so Sub::Quote /
+# Eval::Closure can build real closures over the captured lexicals.
+# Wraps the eval in setjmp so a die inside the eval'd code sets $@
+# instead of propagating up the C stack.
+#
+# $is_expr = 1 emits an expression form `({ ... __eval_rv; })`;
+# $is_expr = 0 emits a statement form `{ ... }` that discards the rv.
+#
+# Uses only the public emit/ind/gen_expr helpers from main Perla::CodeGen —
+# no Parser/Lexer cross-module calls (which is what made an earlier
+# attempt that also moved gen_eval_replacement crash inside Parser_parse).
+
+use Perla::AST;
+use Perla::Lexer;
+use Perla::Parser;
+
+package Perla::CodeGen::Eval;
+
+# Generate the /e replacement expression inline.
+# A multi-statement /e block like `s/.../$x++; "[$1]"/ge` evaluates ALL
+# statements in order and yields the value of the LAST one (Perl
+# semantics). Previously perla took only the first statement, dropping
+# side effects in earlier ones AND returning the wrong value.
+func gen_eval_replacement(scalar $cg, str $repl) void {
+    # Parse the replacement as Perl tokens and generate expression.
+    my array @tokens = Perla::Lexer::lex($repl);
+    my scalar $ast = Perla::Parser::parse(@tokens);
+    my scalar $stmts = $ast->{"stmts"};
+    my int $nstmts = 0;
+    if (defined($stmts)) { $nstmts = scalar(@{$stmts}); }
+    if ($nstmts == 0) {
+        Perla::CodeGen::emit($cg, "strada_new_str(\"\")");
+        return;
+    }
+    if ($nstmts == 1) {
+        my scalar $stmt = $stmts->[0];
+        my int $stype = $stmt->{"type"};
+        if ($stype == Perla::AST::N_CALL() || $stype == Perla::AST::N_BINOP() || $stype == Perla::AST::N_UNOP() || $stype == Perla::AST::N_SCALAR_VAR() || $stype == Perla::AST::N_INT_LIT() || $stype == Perla::AST::N_STR_LIT() || $stype == Perla::AST::N_INTERP_STR()) {
+            Perla::CodeGen::gen_expr($cg, $stmt);
+        } elsif (defined($stmt->{"expr"})) {
+            Perla::CodeGen::gen_expr($cg, $stmt->{"expr"});
+        } else {
+            Perla::CodeGen::gen_expr($cg, $stmt);
+        }
+        return;
+    }
+    # Multiple statements: emit as `({ stmt1; stmt2; ...; LAST_EXPR; })`.
+    # The C statement expression yields its last value. Earlier statements
+    # are emitted via gen_stmt (their side effects run); the last is an
+    # expression we emit inline so its value is the result.
+    Perla::CodeGen::emit($cg, "({ ");
+    my int $si = 0;
+    while ($si < $nstmts - 1) {
+        Perla::CodeGen::gen_stmt($cg, $stmts->[$si]);
+        $si++;
+    }
+    my scalar $last_stmt = $stmts->[$nstmts - 1];
+    my int $lstype = $last_stmt->{"type"};
+    if ($lstype == Perla::AST::N_CALL() || $lstype == Perla::AST::N_BINOP() || $lstype == Perla::AST::N_UNOP() || $lstype == Perla::AST::N_SCALAR_VAR() || $lstype == Perla::AST::N_INT_LIT() || $lstype == Perla::AST::N_STR_LIT() || $lstype == Perla::AST::N_INTERP_STR()) {
+        Perla::CodeGen::gen_expr($cg, $last_stmt);
+    } elsif (defined($last_stmt->{"expr"})) {
+        Perla::CodeGen::gen_expr($cg, $last_stmt->{"expr"});
+    } else {
+        Perla::CodeGen::gen_expr($cg, $last_stmt);
+    }
+    Perla::CodeGen::emit($cg, "; })");
+}
+
+func emit_eval_string_with_caps(scalar $cg, scalar $node, int $is_expr) void {
+    my scalar $lex = $cg->{"my_lexicals"};
+    my int $nl = 0;
+    if (defined($lex)) { $nl = scalar(@{$lex}); }
+
+    if ($nl == 0) {
+        # No lexicals in scope. Wrap in setjmp so a `die` inside the eval'd
+        # code is caught (sets \$@) instead of propagating. Without this,
+        # `eval "die 'x'"` either crashed or skipped the rest of the
+        # caller's statements.
+        # Snapshot perla_call_depth before the eval body runs so a die
+        # inside (which longjmps over the body's emitted perla_call_pop)
+        # doesn't leak a frame. Without restore, a subsequent top-level
+        # die reads the dangling eval-body frame's file (a freed temp
+        # .pm path or NULL) and reports "(unknown) line N".
+        if ($is_expr == 1) {
+            # Clear $@ at entry to match Perl: each eval starts fresh,
+            # then either succeeds (perla_eval_string clears on its way
+            # out) or dies (the catch below sets to the current
+            # exception). The previous "if empty" guard in the catch
+            # was incorrect — it let a prior eval's $@ leak through and
+            # mask the current die's message.
+            Perla::CodeGen::emit($cg, "({ if (perla_eval_error) strada_decref(perla_eval_error); perla_eval_error = strada_new_str(\"\"); ");
+            Perla::CodeGen::emit($cg, "StradaValue *__esr = NULL; int __es_sav_wl = __perla_want_list; int __es_sav_cd = perla_call_depth; int __es_sav_rcd = perla_real_call_depth; jmp_buf *__esjb = STRADA_TRY_PUSH(); ");
+            Perla::CodeGen::emit($cg, "if (__esjb && setjmp(*__esjb) == 0) { __esr = perla_eval_string_with_args(");
+            Perla::CodeGen::gen_expr($cg, $node->{"expr"});
+            Perla::CodeGen::emit($cg, ", \"" . $cg->{"pkg"} . "\", perla_at_); STRADA_TRY_POP(); } ");
+            Perla::CodeGen::emit($cg, "else { STRADA_TRY_POP(); __perla_want_list = __es_sav_wl; ");
+            Perla::CodeGen::emit($cg, "if (perla_call_depth > __es_sav_cd) perla_call_depth = __es_sav_cd; ");
+            Perla::CodeGen::emit($cg, "if (perla_real_call_depth > __es_sav_rcd) perla_real_call_depth = __es_sav_rcd; ");
+            # Always overwrite $@ from the current exception. perl semantic.
+            Perla::CodeGen::emit($cg, "if (perla_eval_error) strada_decref(perla_eval_error); ");
+            Perla::CodeGen::emit($cg, "if (strada_exception_value) { perla_eval_error = strada_exception_value; strada_incref(perla_eval_error); } ");
+            Perla::CodeGen::emit($cg, "else { perla_eval_error = strada_exception_msg ? strada_new_str(strada_exception_msg) : strada_new_str(\"Unknown error\"); } ");
+            Perla::CodeGen::emit($cg, "__esr = strada_new_undef(); } __esr; })");
+        } else {
+            Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "{ if (perla_eval_error) strada_decref(perla_eval_error); perla_eval_error = strada_new_str(\"\"); int __es_sav_wl = __perla_want_list; int __es_sav_cd = perla_call_depth; int __es_sav_rcd = perla_real_call_depth; jmp_buf *__esjb = STRADA_TRY_PUSH(); ");
+            Perla::CodeGen::emit($cg, "if (__esjb && setjmp(*__esjb) == 0) { perla_eval_string_with_args(");
+            Perla::CodeGen::gen_expr($cg, $node->{"expr"});
+            Perla::CodeGen::emit($cg, ", \"" . $cg->{"pkg"} . "\", perla_at_); STRADA_TRY_POP(); } ");
+            Perla::CodeGen::emit($cg, "else { STRADA_TRY_POP(); __perla_want_list = __es_sav_wl; ");
+            Perla::CodeGen::emit($cg, "if (perla_call_depth > __es_sav_cd) perla_call_depth = __es_sav_cd; ");
+            Perla::CodeGen::emit($cg, "if (perla_real_call_depth > __es_sav_rcd) perla_real_call_depth = __es_sav_rcd; ");
+            Perla::CodeGen::emit($cg, "if (perla_eval_error) strada_decref(perla_eval_error); ");
+            Perla::CodeGen::emit($cg, "if (strada_exception_value) { perla_eval_error = strada_exception_value; strada_incref(perla_eval_error); } ");
+            Perla::CodeGen::emit($cg, "else { perla_eval_error = strada_exception_msg ? strada_new_str(strada_exception_msg) : strada_new_str(\"Unknown error\"); } } }\n");
+        }
+        return;
+    }
+
+    # Dedupe by Perl-name (last-wins so an inner shadow keeps its entry).
+    # In perla's codegen all `my $x` in the same sub share one C variable,
+    # so we only need to emit each name once.
+    my hash %seen = ();
+    my scalar $names = [];
+    my int $li = 0;
+    while ($li < $nl) {
+        my scalar $entry = $lex->[$li];
+        my str $en = $entry->{"name"};
+        if (!exists($seen{$en})) {
+            $seen{$en} = 1;
+            push(@{$names}, $entry);
+        }
+        $li++;
+    }
+    my int $un = scalar(@{$names});
+
+    if ($is_expr == 1) {
+        Perla::CodeGen::emit($cg, "({ ");
+    } else {
+        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "{ ");
+    }
+    Perla::CodeGen::emit($cg, "StradaValue *__caps_h = strada_new_hash(); ");
+
+    # Populate caps from in-scope my-vars (incref each; _take avoids
+    # double-incref). For NULL/undef C vars, store strada_new_undef().
+    my int $i = 0;
+    while ($i < $un) {
+        my scalar $e = $names->[$i];
+        my str $en = $e->{"name"};
+        my str $cn = $e->{"c_name"};
+        Perla::CodeGen::emit($cg, "if (" . $cn . ") { strada_incref(" . $cn . "); strada_hv_store_take(__caps_h, \"" . $en . "\", " . $cn . "); } ");
+        Perla::CodeGen::emit($cg, "else { strada_hv_store_take(__caps_h, \"" . $en . "\", strada_new_undef()); } ");
+        $i++;
+    }
+
+    # Wrap in setjmp so a die inside the eval'd code sets \$@ instead of
+    # propagating up the C stack. Save want_list before setjmp; die's longjmp
+    # bypasses inner per-statement save/restore so void context (-1) would
+    # otherwise leak out and corrupt later list-vs-scalar dispatch.
+    # Snapshot perla_call_depth so die-inside-eval doesn't leak a dangling
+    # frame whose file points at a freed temp .pm path (later top-level
+    # dies would otherwise report "(unknown) line N").
+    # Clear $@ at entry (Perl semantic) and always overwrite from
+    # current exception in the catch — see Eval.strada's expr/stmt
+    # branches above for the rationale.
+    Perla::CodeGen::emit($cg, "if (perla_eval_error) strada_decref(perla_eval_error); perla_eval_error = strada_new_str(\"\"); ");
+    Perla::CodeGen::emit($cg, "StradaValue *__eval_rv = NULL; int __es_sav_wl = __perla_want_list; int __es_sav_cd = perla_call_depth; int __es_sav_rcd = perla_real_call_depth; jmp_buf *__esjb = STRADA_TRY_PUSH(); ");
+    Perla::CodeGen::emit($cg, "if (__esjb && setjmp(*__esjb) == 0) { __eval_rv = perla_eval_string_with_lexicals(");
+    Perla::CodeGen::gen_expr($cg, $node->{"expr"});
+    Perla::CodeGen::emit($cg, ", \"" . $cg->{"pkg"} . "\", perla_at_, __caps_h); STRADA_TRY_POP(); } ");
+    Perla::CodeGen::emit($cg, "else { STRADA_TRY_POP(); __perla_want_list = __es_sav_wl; ");
+    Perla::CodeGen::emit($cg, "if (perla_call_depth > __es_sav_cd) perla_call_depth = __es_sav_cd; ");
+    Perla::CodeGen::emit($cg, "if (perla_real_call_depth > __es_sav_rcd) perla_real_call_depth = __es_sav_rcd; ");
+    Perla::CodeGen::emit($cg, "if (perla_eval_error) strada_decref(perla_eval_error); ");
+    Perla::CodeGen::emit($cg, "if (strada_exception_value) { perla_eval_error = strada_exception_value; strada_incref(perla_eval_error); } ");
+    Perla::CodeGen::emit($cg, "else { perla_eval_error = strada_exception_msg ? strada_new_str(strada_exception_msg) : strada_new_str(\"Unknown error\"); } ");
+    Perla::CodeGen::emit($cg, "__eval_rv = strada_new_undef(); } ");
+
+    # Readback: pull each capture back into its C var (the eval body
+    # writes caps->{name} = $name at exit). If the value didn't change,
+    # __nv aliases the same object as the local — just drop the extra
+    # ref. Otherwise the local owned the old value (decref) and now
+    # owns __nv (from strada_hv_fetch_owned's incref).
+    $i = 0;
+    while ($i < $un) {
+        my scalar $e = $names->[$i];
+        my str $en = $e->{"name"};
+        my str $cn = $e->{"c_name"};
+        Perla::CodeGen::emit($cg, "{ StradaValue *__nv = strada_hv_fetch_owned(__caps_h, \"" . $en . "\"); ");
+        Perla::CodeGen::emit($cg, "if (__nv != " . $cn . ") { strada_decref(" . $cn . "); " . $cn . " = __nv; } ");
+        Perla::CodeGen::emit($cg, "else if (__nv) strada_decref(__nv); } ");
+        $i++;
+    }
+
+    Perla::CodeGen::emit($cg, "strada_decref(__caps_h); ");
+
+    if ($is_expr == 1) {
+        Perla::CodeGen::emit($cg, "__eval_rv; })");
+    } else {
+        Perla::CodeGen::emit($cg, "if (__eval_rv) strada_decref(__eval_rv); }\n");
+    }
+}

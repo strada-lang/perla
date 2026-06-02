@@ -1,0 +1,2110 @@
+# Perla StradaGen - Generates Strada source from the Perl 5 AST
+#
+# This backend emits Strada code that can be run by:
+#   - strada-interp (tree-walking interpreter)
+#   - strada -r (compiled and run)
+#   - strada (compiled to native)
+#
+# Since Strada is Perl-inspired, most constructs map directly.
+
+use Perla::AST;
+
+package Perla::StradaGen;
+
+func generate(scalar $ast) str {
+    my scalar $sb = sb_new(65536);
+    my hash %sg = ();
+    $sg{"sb"} = $sb;
+    $sg{"indent"} = 0;
+    $sg{"pkg"} = "main";
+    $sg{"emit_pkg"} = "main";
+    $sg{"subs"} = {};
+    $sg{"constants"} = {};
+
+    # Collect subs and detect inheritance from constructor patterns
+    _collect_subs(\%sg, $ast);
+    _detect_inheritance(\%sg, $ast);
+
+    # Emit Perl special variables
+    _emit(\%sg, "our $__perla_eval_err = undef;\n\n");
+
+    # Emit helper functions
+    _emit(\%sg, "# Hash flatten helper: converts %hash to flat (key, val, ...) array ref\n");
+    _emit(\%sg, "func pl_hash_flatten(scalar $href) scalar {\n");
+    _emit(\%sg, "    my array @result = ();\n");
+    _emit(\%sg, "    my array @k = keys(%{$href});\n");
+    _emit(\%sg, "    my int $i = 0;\n");
+    _emit(\%sg, "    while ($i < scalar(@k)) {\n");
+    _emit(\%sg, "        push(@result, $k[$i]);\n");
+    _emit(\%sg, "        push(@result, $href->{$k[$i]});\n");
+    _emit(\%sg, "        $i = $i + 1;\n");
+    _emit(\%sg, "    }\n");
+    _emit(\%sg, "    return \\@result;\n");
+    _emit(\%sg, "}\n\n");
+
+    _emit(\%sg, "# Perl int() truncation helper\n");
+    _emit(\%sg, "func pl_int(scalar $x) scalar {\n");
+    _emit(\%sg, "    if ($x >= 0) { return math::floor($x); }\n");
+    _emit(\%sg, "    return math::ceil($x);\n");
+    _emit(\%sg, "}\n\n");
+
+    _emit(\%sg, "# Perl regex replace_all helper (for s/$var/$val/g)\n");
+    _emit(\%sg, "func pl_regex_replace_all(str $input, str $pat, str $repl) str {\n");
+    _emit(\%sg, "    my str $result = $input;\n");
+    _emit(\%sg, "    my str $prev = \"\";\n");
+    _emit(\%sg, "    while ($result ne $prev) {\n");
+    _emit(\%sg, "        $prev = $result;\n");
+    _emit(\%sg, "        $result = replace($result, $pat, $repl);\n");
+    _emit(\%sg, "    }\n");
+    _emit(\%sg, "    return $result;\n");
+    _emit(\%sg, "}\n\n");
+
+    _emit(\%sg, "# Perl hex() helper\n");
+    _emit(\%sg, "func hex(str $s) int {\n");
+    _emit(\%sg, "    my int $result = 0;\n");
+    _emit(\%sg, "    my str $cleaned = $s;\n");
+    _emit(\%sg, "    if (substr($cleaned, 0, 2) eq \"0x\" || substr($cleaned, 0, 2) eq \"0X\") {\n");
+    _emit(\%sg, "        $cleaned = substr($cleaned, 2, length($cleaned) - 2);\n");
+    _emit(\%sg, "    }\n");
+    _emit(\%sg, "    my int $i = 0;\n");
+    _emit(\%sg, "    while ($i < length($cleaned)) {\n");
+    _emit(\%sg, "        my str $ch = substr($cleaned, $i, 1);\n");
+    _emit(\%sg, "        my int $val = 0;\n");
+    _emit(\%sg, "        if ($ch ge \"0\" && $ch le \"9\") { $val = ord($ch) - ord(\"0\"); }\n");
+    _emit(\%sg, "        elsif ($ch ge \"a\" && $ch le \"f\") { $val = ord($ch) - ord(\"a\") + 10; }\n");
+    _emit(\%sg, "        elsif ($ch ge \"A\" && $ch le \"F\") { $val = ord($ch) - ord(\"A\") + 10; }\n");
+    _emit(\%sg, "        $result = $result * 16 + $val;\n");
+    _emit(\%sg, "        $i = $i + 1;\n");
+    _emit(\%sg, "    }\n");
+    _emit(\%sg, "    return $result;\n");
+    _emit(\%sg, "}\n\n");
+
+    _emit(\%sg, "# Perl oct() helper\n");
+    _emit(\%sg, "func oct(str $s) int {\n");
+    _emit(\%sg, "    if (substr($s, 0, 2) eq \"0x\" || substr($s, 0, 2) eq \"0X\") { return hex(substr($s, 2, length($s) - 2)); }\n");
+    _emit(\%sg, "    if (substr($s, 0, 2) eq \"0b\" || substr($s, 0, 2) eq \"0B\") {\n");
+    _emit(\%sg, "        my int $r = 0; my int $i = 2;\n");
+    _emit(\%sg, "        while ($i < length($s)) { $r = $r * 2 + ord(substr($s, $i, 1)) - ord(\"0\"); $i = $i + 1; }\n");
+    _emit(\%sg, "        return $r;\n");
+    _emit(\%sg, "    }\n");
+    _emit(\%sg, "    my int $r = 0; my int $i = 0;\n");
+    _emit(\%sg, "    if (substr($s, 0, 1) eq \"0\") { $i = 1; }\n");
+    _emit(\%sg, "    while ($i < length($s)) { $r = $r * 8 + ord(substr($s, $i, 1)) - ord(\"0\"); $i = $i + 1; }\n");
+    _emit(\%sg, "    return $r;\n");
+    _emit(\%sg, "}\n\n");
+
+    # Emit perla dispatch helpers if precompiled modules are present
+    # These use __C__ blocks to call into perla's stash-based method dispatch
+    my int $has_precompiled_mods = 0;
+    my scalar $stmts_pre_check = $ast->{"stmts"};
+    my int $pci_check = 0;
+    while ($pci_check < scalar(@{$stmts_pre_check})) {
+        my scalar $pc_s = $stmts_pre_check->[$pci_check];
+        if (defined($pc_s) && $pc_s->{"type"} == Perla::AST::N_PRECOMPILED_MOD()) {
+            $has_precompiled_mods = 1;
+            last;
+        }
+        $pci_check++;
+    }
+    if ($has_precompiled_mods == 1) {
+        _emit(\%sg, "# Perla stash dispatch for precompiled modules\n");
+        _emit(\%sg, "__C__ {\n");
+        _emit(\%sg, "#include \"perla_stash.h\"\n");
+        _emit(\%sg, "}\n\n");
+        _emit(\%sg, "func __perla_class_dispatch(str $class, str $method, ...@args) scalar {\n");
+        _emit(\%sg, "    my scalar $result = undef;\n");
+        _emit(\%sg, "    __C__ {\n");
+        _emit(\%sg, "        StradaValue *__a = strada_new_array();\n");
+        _emit(\%sg, "        strada_array_push(strada_deref_array(__a), class);\n");
+        _emit(\%sg, "        StradaArray *__vargs = strada_deref_array(args);\n");
+        _emit(\%sg, "        if (__vargs) { int __vi = 0; int __vlen = strada_array_length(__vargs);\n");
+        _emit(\%sg, "            while (__vi < __vlen) { strada_array_push(strada_deref_array(__a), strada_array_get(__vargs, __vi)); __vi++; } }\n");
+        _emit(\%sg, "        char *__m = strada_to_str(method);\n");
+        _emit(\%sg, "        strada_decref(result);\n");
+        _emit(\%sg, "        result = perla_method_dispatch(class, __m, __a);\n");
+        _emit(\%sg, "        strada_incref(result);\n");
+        _emit(\%sg, "        free(__m); strada_decref(__a);\n");
+        _emit(\%sg, "    }\n");
+        _emit(\%sg, "    return $result;\n");
+        _emit(\%sg, "}\n\n");
+        _emit(\%sg, "func __perla_obj_dispatch(scalar $obj, str $method, ...@args) scalar {\n");
+        _emit(\%sg, "    my scalar $result = undef;\n");
+        _emit(\%sg, "    __C__ {\n");
+        _emit(\%sg, "        StradaValue *__a = strada_new_array();\n");
+        _emit(\%sg, "        strada_array_push(strada_deref_array(__a), obj);\n");
+        _emit(\%sg, "        StradaArray *__vargs = strada_deref_array(args);\n");
+        _emit(\%sg, "        if (__vargs) { int __vi = 0; int __vlen = strada_array_length(__vargs);\n");
+        _emit(\%sg, "            while (__vi < __vlen) { strada_array_push(strada_deref_array(__a), strada_array_get(__vargs, __vi)); __vi++; } }\n");
+        _emit(\%sg, "        char *__m = strada_to_str(method);\n");
+        _emit(\%sg, "        strada_decref(result);\n");
+        _emit(\%sg, "        result = perla_method_dispatch(obj, __m, __a);\n");
+        _emit(\%sg, "        strada_incref(result);\n");
+        _emit(\%sg, "        free(__m); strada_decref(__a);\n");
+        _emit(\%sg, "    }\n");
+        _emit(\%sg, "    return $result;\n");
+        _emit(\%sg, "}\n\n");
+    }
+
+    # Generate top-level code inside main()
+    my scalar $stmts = $ast->{"stmts"};
+
+    # Collect file-scope my SCALAR variables and promote to our (so subs can access them)
+    # Only promote scalars — hash/array my declarations with inline init don't work
+    # as bare assignments in the VM parser.
+    my hash %file_scope_vars = ();
+    my int $fsi = 0;
+    while ($fsi < scalar(@{$stmts})) {
+        my scalar $fs = $stmts->[$fsi];
+        if (defined($fs) && $fs->{"type"} == Perla::AST::N_MY()) {
+            if (defined($fs->{"var"})) {
+                my str $vt = $fs->{"var"}->{"type"};
+                if ($vt eq "SCALAR_VAR") {
+                    $file_scope_vars{$fs->{"var"}->{"value"}} = $vt;
+                }
+            }
+        }
+        $fsi++;
+    }
+    $sg{"file_scope_vars"} = \%file_scope_vars;
+
+    # Collect precompiled module names (for runtime dispatch of class method calls)
+    my hash %precompiled_mods = ();
+    my int $pci = 0;
+    while ($pci < scalar(@{$stmts})) {
+        my scalar $pcs = $stmts->[$pci];
+        if (defined($pcs) && $pcs->{"type"} == Perla::AST::N_PRECOMPILED_MOD()) {
+            $precompiled_mods{$pcs->{"module"}} = 1;
+        }
+        $pci++;
+    }
+    $sg{"precompiled_mods"} = \%precompiled_mods;
+
+    # Emit package declarations, our vars, and subs first (outside main)
+    my int $i = 0;
+    while ($i < scalar(@{$stmts})) {
+        my scalar $s = $stmts->[$i];
+        if (defined($s)) {
+            if ($s->{"type"} == Perla::AST::N_PACKAGE()) {
+                $sg{"pkg"} = $s->{"name"};
+            } elsif ($s->{"type"} == Perla::AST::N_OUR()) {
+                _gen_our(\%sg, $s);
+            } elsif ($s->{"type"} == Perla::AST::N_USE()) {
+                _gen_use(\%sg, $s);
+            }
+        }
+        $i++;
+    }
+
+    # Emit file-scope my variables as our declarations (before subs, outside main)
+    my array @fs_keys = keys(%file_scope_vars);
+    my int $fsk = 0;
+    while ($fsk < scalar(@fs_keys)) {
+        my str $fsn = $fs_keys[$fsk];
+        my str $fst = $file_scope_vars{$fsn};
+        my str $sigil = "$";
+        if ($fst eq "ARRAY_VAR") { $sigil = "@"; }
+        elsif ($fst eq "HASH_VAR") { $sigil = "%"; }
+        _emit(\%sg, "our " . $sigil . _mangle($fsn));
+        if ($sigil eq "@") { _emit(\%sg, " = ()"); }
+        elsif ($sigil eq "%") { _emit(\%sg, " = ()"); }
+        else { _emit(\%sg, " = undef"); }
+        _emit(\%sg, ";\n");
+        $fsk++;
+    }
+
+    # Reset package, emit subs
+    $sg{"pkg"} = "main";
+    $i = 0;
+    while ($i < scalar(@{$stmts})) {
+        my scalar $s = $stmts->[$i];
+        if (defined($s)) {
+            if ($s->{"type"} == Perla::AST::N_PACKAGE()) {
+                $sg{"pkg"} = $s->{"name"};
+            } elsif ($s->{"type"} == Perla::AST::N_SUB() && defined($s->{"name"})) {
+                _gen_sub(\%sg, $s);
+            }
+        }
+        $i++;
+    }
+
+    # Emit main function with top-level statements
+    if ($sg{"emit_pkg"} ne "main") {
+        _emit(\%sg, "package main;\n");
+        $sg{"emit_pkg"} = "main";
+    }
+    _emit(\%sg, "\nfunc main() int {\n");
+    $sg{"indent"} = 1;
+    $sg{"pkg"} = "main";
+    $sg{"in_main"} = 1;
+
+    $i = 0;
+    while ($i < scalar(@{$stmts})) {
+        my scalar $s = $stmts->[$i];
+        if (defined($s)) {
+            my int $t = $s->{"type"};
+            # Skip package, sub, use, and our declarations (already emitted)
+            if ($t != Perla::AST::N_PACKAGE() && $t != Perla::AST::N_USE() &&
+                !($t == Perla::AST::N_SUB() && defined($s->{"name"})) &&
+                $t != Perla::AST::N_OUR()) {
+                _gen_stmt(\%sg, $s);
+            }
+            if ($t == Perla::AST::N_PACKAGE()) {
+                $sg{"pkg"} = $s->{"name"};
+            }
+        }
+        $i++;
+    }
+
+    _ind(\%sg); _emit(\%sg, "return 0;\n");
+    _emit(\%sg, "}\n");
+
+    return sb_to_string($sb);
+}
+
+# --- Collect sub names ---
+func _collect_subs(scalar $sg, scalar $ast) void {
+    my scalar $stmts = $ast->{"stmts"};
+    my int $i = 0;
+    my str $pkg = "main";
+    while ($i < scalar(@{$stmts})) {
+        my scalar $s = $stmts->[$i];
+        if (defined($s)) {
+            if ($s->{"type"} == Perla::AST::N_PACKAGE()) { $pkg = $s->{"name"}; }
+            if ($s->{"type"} == Perla::AST::N_SUB() && defined($s->{"name"})) {
+                $sg->{"subs"}->{$pkg . "::" . $s->{"name"}} = 1;
+                $s->{"package"} = $pkg;
+            }
+        }
+        $i++;
+    }
+}
+
+# --- Emit helpers ---
+func _emit(scalar $sg, str $s) void { sb_append($sg->{"sb"}, $s); }
+func _ind(scalar $sg) void {
+    my int $i = 0;
+    while ($i < $sg->{"indent"}) { sb_append($sg->{"sb"}, "    "); $i++; }
+}
+
+# --- Name mangling for Strada/C reserved words ---
+func _mangle(str $name) str {
+    if ($name eq "register") { return "pl_register"; }
+    if ($name eq "version") { return "pl_version"; }
+    if ($name eq "int") { return "pl_int"; }
+    if ($name eq "char") { return "pl_char"; }
+    if ($name eq "float") { return "pl_float"; }
+    if ($name eq "double") { return "pl_double"; }
+    if ($name eq "void") { return "pl_void"; }
+    if ($name eq "long") { return "pl_long"; }
+    if ($name eq "short") { return "pl_short"; }
+    if ($name eq "unsigned") { return "pl_unsigned"; }
+    if ($name eq "signed") { return "pl_signed"; }
+    if ($name eq "const") { return "pl_const"; }
+    if ($name eq "static") { return "pl_static"; }
+    if ($name eq "extern") { return "pl_extern"; }
+    if ($name eq "volatile") { return "pl_volatile"; }
+    if ($name eq "auto") { return "pl_auto"; }
+    if ($name eq "union") { return "pl_union"; }
+    if ($name eq "enum") { return "pl_enum"; }
+    if ($name eq "typedef") { return "pl_typedef"; }
+    if ($name eq "sizeof") { return "pl_sizeof"; }
+    if ($name eq "inline") { return "pl_inline"; }
+    if ($name eq "restrict") { return "pl_restrict"; }
+    if ($name eq "try") { return "pl_try"; }
+    if ($name eq "catch") { return "pl_catch"; }
+    if ($name eq "throw") { return "pl_throw"; }
+    if ($name eq "new") { return "create"; }
+    return $name;
+}
+
+# Mangle a qualified name (Pkg::func) — only mangles the last component
+func _mangle_qualified(str $name) str {
+    # Strip main:: prefix — main package functions have no prefix in Strada
+    if (length($name) > 6 && substr($name, 0, 6) eq "main::") {
+        return _mangle(substr($name, 6, length($name) - 6));
+    }
+    my int $i = length($name) - 3;
+    while ($i >= 0) {
+        if (substr($name, $i, 2) eq "::") {
+            my str $prefix = substr($name, 0, $i + 2);
+            my str $suffix = substr($name, $i + 2, length($name) - $i - 2);
+            return $prefix . _mangle($suffix);
+        }
+        $i = $i - 1;
+    }
+    return _mangle($name);
+}
+
+# --- Detect inheritance from constructor call patterns ---
+func _detect_inheritance(scalar $sg, scalar $ast) void {
+    $sg->{"extends"} = {};
+    my scalar $stmts = $ast->{"stmts"};
+    my int $i = 0;
+    my str $pkg = "main";
+    while ($i < scalar(@{$stmts})) {
+        my scalar $s = $stmts->[$i];
+        if (defined($s)) {
+            if ($s->{"type"} == Perla::AST::N_PACKAGE()) { $pkg = $s->{"name"}; }
+            if ($s->{"type"} == Perla::AST::N_SUB() && defined($s->{"name"}) && $s->{"name"} eq "new") {
+                my str $sub_pkg = $s->{"package"};
+                if (!defined($sub_pkg)) { $sub_pkg = $pkg; }
+                if (defined($s->{"body"}) && defined($s->{"body"}->{"stmts"})) {
+                    my str $parent = _find_parent_new($s->{"body"}->{"stmts"}, $sub_pkg);
+                    if (length($parent) > 0) {
+                        $sg->{"extends"}->{$sub_pkg} = $parent;
+                    }
+                }
+            }
+        }
+        $i++;
+    }
+}
+
+func _find_parent_new(scalar $stmts, str $own_pkg) str {
+    my int $i = 0;
+    while ($i < scalar(@{$stmts})) {
+        my scalar $s = $stmts->[$i];
+        if (defined($s)) {
+            my str $found = _scan_for_parent_new($s, $own_pkg);
+            if (length($found) > 0) { return $found; }
+        }
+        $i++;
+    }
+    return "";
+}
+
+func _scan_for_parent_new(scalar $node, str $own_pkg) str {
+    if (!defined($node)) { return ""; }
+    my int $type = $node->{"type"};
+    if ($type == Perla::AST::N_CALL()) {
+        my str $name = $node->{"name"};
+        if (length($name) > 5) {
+            my int $nlen = length($name);
+            if (substr($name, $nlen - 5, 5) eq "::new") {
+                my str $parent = substr($name, 0, $nlen - 5);
+                if ($parent ne $own_pkg && $parent ne "main") {
+                    return $parent;
+                }
+            }
+        }
+    }
+    if ($type == Perla::AST::N_ASSIGN() && defined($node->{"value"})) {
+        return _scan_for_parent_new($node->{"value"}, $own_pkg);
+    }
+    if ($type == Perla::AST::N_RETURN() && defined($node->{"value"})) {
+        return _scan_for_parent_new($node->{"value"}, $own_pkg);
+    }
+    if ($type == Perla::AST::N_MY() && defined($node->{"init"})) {
+        return _scan_for_parent_new($node->{"init"}, $own_pkg);
+    }
+    return "";
+}
+
+# --- Check if name is all uppercase (constant-like) ---
+func _is_upper(str $name) int {
+    my int $i = 0;
+    while ($i < length($name)) {
+        my str $ch = substr($name, $i, 1);
+        if (!(($ch ge "A" && $ch le "Z") || $ch eq "_" || ($ch ge "0" && $ch le "9"))) { return 0; }
+        $i = $i + 1;
+    }
+    return 1;
+}
+
+# --- Escape double quotes in string literals ---
+func _escape_str(str $s) str {
+    my str $out = "";
+    my int $i = 0;
+    my int $len = length($s);
+    while ($i < $len) {
+        my str $ch = substr($s, $i, 1);
+        if ($ch eq "\"") {
+            $out = $out . "\\\"";
+        } elsif ($ch eq "\\") {
+            # Keep existing escapes as-is
+            if ($i + 1 < $len) {
+                my str $next = substr($s, $i + 1, 1);
+                $out = $out . "\\" . $next;
+                $i = $i + 1;
+            } else {
+                $out = $out . "\\";
+            }
+        } else {
+            $out = $out . $ch;
+        }
+        $i = $i + 1;
+    }
+    return $out;
+}
+
+# --- Use statement ---
+func _gen_use(scalar $sg, scalar $node) void {
+    my str $mod = $node->{"module"};
+    if (defined($mod) && $mod eq "__isa__") {
+        my str $pkg = $node->{"pkg"};
+        my str $parent = $node->{"parent"};
+        if (defined($pkg) && defined($parent)) {
+            _emit($sg, "package " . $pkg . ";\n");
+            _emit($sg, "extends " . $parent . ";\n\n");
+            $sg->{"emit_pkg"} = $pkg;
+        }
+    }
+}
+
+# --- Sub definition ---
+func _gen_sub(scalar $sg, scalar $node) void {
+    my str $name = $node->{"name"};
+    my str $pkg = $node->{"package"};
+    if (!defined($pkg)) { $pkg = $sg->{"pkg"}; }
+
+    # Emit package declaration if different from current
+    if ($pkg ne $sg->{"emit_pkg"}) {
+        _emit($sg, "package " . $pkg . ";\n");
+        # Emit extends if we detected an inheritance relationship
+        if (defined($sg->{"extends"}) && defined($sg->{"extends"}->{$pkg})) {
+            _emit($sg, "extends " . $sg->{"extends"}->{$pkg} . ";\n");
+        }
+        $sg->{"emit_pkg"} = $pkg;
+    }
+
+    _emit($sg, "func " . _mangle($name) . " {\n");
+    $sg->{"indent"} = 1;
+
+    # Save hash_vars and start with a copy of globals (our %hash vars visible inside functions)
+    my scalar $saved_hash_vars = $sg->{"hash_vars"};
+    my hash %new_hash_vars = ();
+    if (defined($saved_hash_vars)) {
+        my array @hk = keys(%{$saved_hash_vars});
+        my int $hki = 0;
+        while ($hki < scalar(@hk)) {
+            $new_hash_vars{$hk[$hki]} = 1;
+            $hki++;
+        }
+    }
+    $sg->{"hash_vars"} = \%new_hash_vars;
+
+    # Body
+    if (defined($node->{"body"})) {
+        _gen_block_stmts($sg, $node->{"body"});
+    }
+
+    $sg->{"hash_vars"} = $saved_hash_vars;
+    $sg->{"indent"} = 0;
+    _emit($sg, "}\n\n");
+}
+
+# --- Block ---
+func _gen_block_stmts(scalar $sg, scalar $node) void {
+    my scalar $stmts = $node->{"stmts"};
+    if (!defined($stmts)) { return; }
+    my int $i = 0;
+    while ($i < scalar(@{$stmts})) {
+        my scalar $s = $stmts->[$i];
+        if (defined($s)) { _gen_stmt($sg, $s); }
+        $i++;
+    }
+}
+
+# --- Statement generation ---
+func _gen_stmt(scalar $sg, scalar $node) void {
+    my int $type = $node->{"type"};
+
+    if ($type == Perla::AST::N_MY()) { _gen_my($sg, $node); return; }
+    if ($type == Perla::AST::N_OUR()) { _gen_our($sg, $node); return; }
+    if ($type == Perla::AST::N_LOCAL()) {
+        # local $var = expr — dynamic scoping
+        if (defined($node->{"var"})) {
+            my str $vname = _mangle($node->{"var"}->{"value"});
+            _ind($sg); _emit($sg, "local $" . $vname);
+            if (defined($node->{"init"})) {
+                _emit($sg, " = ");
+                _gen_expr($sg, $node->{"init"});
+            }
+            _emit($sg, ";\n");
+        }
+        return;
+    }
+
+    if ($type == Perla::AST::N_IF() || $type == Perla::AST::N_UNLESS()) {
+        _gen_if($sg, $node); return;
+    }
+    if ($type == Perla::AST::N_WHILE() || $type == Perla::AST::N_UNTIL()) {
+        _gen_while($sg, $node); return;
+    }
+    if ($type == Perla::AST::N_FOREACH()) { _gen_foreach($sg, $node); return; }
+    if ($type == Perla::AST::N_FOR_C()) { _gen_for_c($sg, $node); return; }
+    if ($type == Perla::AST::N_DO_WHILE()) {
+        _ind($sg); _emit($sg, "do {\n");
+        $sg->{"indent"} = $sg->{"indent"} + 1;
+        _gen_block_stmts($sg, $node->{"body"});
+        $sg->{"indent"} = $sg->{"indent"} - 1;
+        _ind($sg); _emit($sg, "} while (");
+        _gen_expr($sg, $node->{"cond"});
+        _emit($sg, ");\n");
+        return;
+    }
+
+    if ($type == Perla::AST::N_RETURN()) {
+        if (defined($node->{"value"})) {
+            _emit_hash_flatten_temps($sg, $node->{"value"});
+        }
+        _ind($sg); _emit($sg, "return ");
+        if (defined($node->{"value"})) { _gen_expr($sg, $node->{"value"}); }
+        else { _emit($sg, "undef"); }
+        _emit($sg, ";\n");
+        return;
+    }
+    if ($type == Perla::AST::N_LAST()) {
+        _ind($sg);
+        if (defined($node->{"label"})) { _emit($sg, "last " . $node->{"label"} . ";\n"); }
+        else { _emit($sg, "last;\n"); }
+        return;
+    }
+    if ($type == Perla::AST::N_NEXT()) {
+        _ind($sg);
+        if (defined($node->{"label"})) { _emit($sg, "next " . $node->{"label"} . ";\n"); }
+        else { _emit($sg, "next;\n"); }
+        return;
+    }
+    if ($type == Perla::AST::N_REDO()) {
+        _ind($sg); _emit($sg, "redo;\n"); return;
+    }
+
+    if ($type == Perla::AST::N_PACKAGE()) {
+        $sg->{"pkg"} = $node->{"name"};
+        return;
+    }
+    if ($type == Perla::AST::N_USE()) {
+        # Most use statements are handled at top level
+        return;
+    }
+    if ($type == Perla::AST::N_PRECOMPILED_MOD()) {
+        my str $mod = $node->{"module"};
+        my str $init_func = $node->{"init_func"};
+        my str $o_path = $node->{"o_path"};
+        my str $so_path = replace_all($o_path, ".pm.o", ".pm.so");
+        my str $deps_path = replace_all($o_path, ".pm.o", ".pm.deps");
+        _ind($sg); _emit($sg, "# precompiled module: " . $mod . "\n");
+
+        # Load dependency .so files first (read from .deps file)
+        if (core::file_exists($deps_path) == 1) {
+            my str $deps_content = trim(core::slurp($deps_path));
+            if (length($deps_content) > 0) {
+                my array @dep_objs = split(" ", $deps_content);
+                my int $di = 0;
+                while ($di < scalar(@dep_objs)) {
+                    my str $dep_o = trim($dep_objs[$di]);
+                    if (length($dep_o) > 0) {
+                        my str $dep_so = replace_all($dep_o, ".pm.o", ".pm.so");
+                        # Derive init func name from .o path
+                        my str $dep_base = $dep_o;
+                        # Strip path prefix up to lib/
+                        my int $lib_idx = index($dep_base, "/lib/");
+                        if ($lib_idx >= 0) {
+                            $dep_base = substr($dep_base, $lib_idx + 5, length($dep_base) - $lib_idx - 5);
+                        } else {
+                            # Strip leading dirs
+                            my int $last_s = -1;
+                            my int $si2 = 0;
+                            while ($si2 < length($dep_base)) {
+                                if (substr($dep_base, $si2, 1) eq "/") { $last_s = $si2; }
+                                $si2++;
+                            }
+                            if ($last_s >= 0) { $dep_base = substr($dep_base, $last_s + 1, length($dep_base) - $last_s - 1); }
+                        }
+                        $dep_base = replace_all($dep_base, ".pm.o", "");
+                        $dep_base = replace_all($dep_base, "/", "_");
+                        my str $dep_init = "perla_mod_init_" . $dep_base;
+                        _ind($sg); _emit($sg, "__C__ {\n");
+                        _emit($sg, "    void *__dh = dlopen(\"" . $dep_so . "\", RTLD_NOW | RTLD_GLOBAL);\n");
+                        _emit($sg, "    if (__dh) { void (*__di)(void) = dlsym(__dh, \"" . $dep_init . "\"); if (__di) __di(); }\n");
+                        _ind($sg); _emit($sg, "}\n");
+                    }
+                    $di++;
+                }
+            }
+        }
+
+        _ind($sg); _emit($sg, "__C__ {\n");
+        _emit($sg, "    void *__mod_h = dlopen(\"" . $so_path . "\", RTLD_NOW | RTLD_GLOBAL);\n");
+        _emit($sg, "    if (__mod_h) {\n");
+        _emit($sg, "        void (*__mod_init)(void) = dlsym(__mod_h, \"" . $init_func . "\");\n");
+        _emit($sg, "        if (__mod_init) __mod_init();\n");
+        _emit($sg, "    } else {\n");
+        _emit($sg, "        fprintf(stderr, \"perla: failed to load %s: %s\\n\", \"" . $so_path . "\", dlerror());\n");
+        _emit($sg, "    }\n");
+        _ind($sg); _emit($sg, "}\n");
+        return;
+    }
+    if ($type == Perla::AST::N_SUB()) { return; }  # handled separately
+    if ($type == Perla::AST::N_BEGIN()) {
+        _ind($sg); _emit($sg, "# BEGIN\n");
+        _gen_block_stmts($sg, $node->{"body"});
+        return;
+    }
+
+    if ($type == Perla::AST::N_C_BLOCK()) {
+        _ind($sg); _emit($sg, "__C__ {\n");
+        _emit($sg, $node->{"code"});
+        _emit($sg, "\n");
+        _ind($sg); _emit($sg, "}\n");
+        return;
+    }
+    if ($type == Perla::AST::N_STRADA_BLOCK()) {
+        # __STRADA__ blocks are emitted as raw Strada code
+        # Variables use Strada naming (same as the surrounding generated code)
+        _emit($sg, $node->{"code"});
+        _emit($sg, "\n");
+        return;
+    }
+
+    # local $var = expr — in VM, just do the assignment (no dynamic scope save/restore)
+    if ($type == Perla::AST::N_LOCAL()) {
+        if (defined($node->{"var"}) && defined($node->{"init"})) {
+            _ind($sg); _emit($sg, "$" . _mangle($node->{"var"}->{"value"}) . " = ");
+            _gen_expr($sg, $node->{"init"});
+            _emit($sg, ";\n");
+        } else {
+            _ind($sg); _emit($sg, "# local (no-op)\n");
+        }
+        return;
+    }
+
+    if ($type == Perla::AST::N_EVAL_BLOCK()) {
+        _ind($sg); _emit($sg, "$__perla_eval_err = undef;\n");
+        _ind($sg); _emit($sg, "try {\n");
+        $sg->{"indent"} = $sg->{"indent"} + 1;
+        _gen_block_stmts($sg, $node->{"body"});
+        # After successful try, ensure $@ is cleared (nested evals may have set it)
+        _ind($sg); _emit($sg, "$__perla_eval_err = undef;\n");
+        $sg->{"indent"} = $sg->{"indent"} - 1;
+        _ind($sg); _emit($sg, "} catch ($__perla_catch_e) {\n");
+        $sg->{"indent"} = $sg->{"indent"} + 1;
+        _ind($sg); _emit($sg, "$__perla_eval_err = $__perla_catch_e;\n");
+        $sg->{"indent"} = $sg->{"indent"} - 1;
+        _ind($sg); _emit($sg, "}\n");
+        return;
+    }
+
+    # Postfix modifiers
+    if ($type == Perla::AST::N_POSTFIX_IF()) {
+        _ind($sg); _gen_expr($sg, $node->{"expr"});
+        _emit($sg, " if "); _gen_expr($sg, $node->{"cond"}); _emit($sg, ";\n");
+        return;
+    }
+    if ($type == Perla::AST::N_POSTFIX_UNLESS()) {
+        _ind($sg); _gen_expr($sg, $node->{"expr"});
+        _emit($sg, " unless "); _gen_expr($sg, $node->{"cond"}); _emit($sg, ";\n");
+        return;
+    }
+    if ($type == Perla::AST::N_POSTFIX_WHILE()) {
+        _ind($sg); _gen_expr($sg, $node->{"expr"});
+        _emit($sg, " while "); _gen_expr($sg, $node->{"cond"}); _emit($sg, ";\n");
+        return;
+    }
+    if ($type == Perla::AST::N_POSTFIX_UNTIL()) {
+        _ind($sg); _gen_expr($sg, $node->{"expr"});
+        _emit($sg, " while !("); _gen_expr($sg, $node->{"cond"}); _emit($sg, ");\n");
+        return;
+    }
+    if ($type == Perla::AST::N_POSTFIX_FOR()) {
+        _ind($sg); _emit($sg, "foreach my scalar $_ (");
+        _gen_expr($sg, $node->{"list"});
+        _emit($sg, ") { ");
+        _gen_expr($sg, $node->{"expr"});
+        _emit($sg, "; }\n");
+        return;
+    }
+
+    # Rewrite $var++/-- as statement to $var = $var +/- 1 (safer for our vars)
+    if ($type == Perla::AST::N_UNOP()) {
+        my str $op = $node->{"op"};
+        if ($op eq "++" || $op eq "--") {
+            my str $arith_op = "+";
+            if ($op eq "--") { $arith_op = "-"; }
+            _ind($sg); _gen_expr($sg, $node->{"operand"});
+            _emit($sg, " = ");
+            _gen_expr($sg, $node->{"operand"});
+            _emit($sg, " " . $arith_op . " 1;\n");
+            return;
+        }
+    }
+
+    # Expression statement — pre-emit hash flatten temps if needed
+    _emit_hash_flatten_temps($sg, $node);
+    _ind($sg); _gen_expr($sg, $node); _emit($sg, ";\n");
+}
+
+# Pre-emit `my array @__flat_X = pl_hash_flatten(\%X)` for any %hash args in calls
+func _emit_hash_flatten_temps(scalar $sg, scalar $node) void {
+    if (!defined($node)) { return; }
+    my int $type = $node->{"type"};
+    # Only process calls and method calls with spread=1 pattern
+    if ($type == Perla::AST::N_CALL() || $type == Perla::AST::N_METHOD()) {
+        my scalar $args = $node->{"args"};
+        if (defined($args)) {
+            my int $i = 0;
+            while ($i < scalar(@{$args})) {
+                my scalar $arg = $args->[$i];
+                if (defined($arg) && $arg->{"type"} == Perla::AST::N_HASH_VAR()) {
+                    my str $hname = _mangle($arg->{"name"});
+                    _ind($sg); _emit($sg, "my array @__flat_" . $hname . " = pl_hash_flatten(\%" . $hname . ");\n");
+                }
+                $i++;
+            }
+        }
+    }
+    # Also check return value expression
+    if ($type == Perla::AST::N_RETURN() && defined($node->{"value"})) {
+        _emit_hash_flatten_temps($sg, $node->{"value"});
+    }
+    # Check assignments
+    if ($type == Perla::AST::N_ASSIGN() && defined($node->{"value"})) {
+        _emit_hash_flatten_temps($sg, $node->{"value"});
+    }
+}
+
+# --- Variable declaration ---
+func _gen_my(scalar $sg, scalar $node) void {
+    if (defined($node->{"vars"})) {
+        my scalar $vars = $node->{"vars"};
+
+        # Check if any var is a hash (%var) or array (@var) slurp — needs special expansion
+        my int $has_hash = 0;
+        my int $has_array_slurp = 0;
+        my int $special_idx = -1;
+        my int $vi = 0;
+        while ($vi < scalar(@{$vars})) {
+            if ($vars->[$vi]->{"type"} eq "HASH_VAR") { $has_hash = 1; $special_idx = $vi; }
+            if ($vars->[$vi]->{"type"} eq "ARRAY_VAR") { $has_array_slurp = 1; $special_idx = $vi; }
+            $vi++;
+        }
+
+        # If destructuring contains @array slurp and init is @_, expand manually
+        if ($has_array_slurp == 1 && defined($node->{"init"})) {
+            $vi = 0;
+            while ($vi < $special_idx) {
+                my scalar $var = $vars->[$vi];
+                my str $vn = _mangle($var->{"value"});
+                _ind($sg); _emit($sg, "my $" . $vn . " = shift(@_);\n");
+                $vi++;
+            }
+            # Array slurp: @rest = @_ (remaining elements)
+            my str $aname = _mangle($vars->[$special_idx]->{"value"});
+            _ind($sg); _emit($sg, "my array @" . $aname . " = @_;\n");
+            return;
+        }
+
+        # If destructuring contains %hash and init is @_, expand manually
+        if ($has_hash == 1 && defined($node->{"init"})) {
+            # Emit scalar vars as shift(@_) or $_[i]
+            $vi = 0;
+            while ($vi < $special_idx) {
+                my scalar $var = $vars->[$vi];
+                my str $vn = _mangle($var->{"value"});
+                _ind($sg); _emit($sg, "my $" . $vn . " = shift(@_);\n");
+                $vi++;
+            }
+            # Emit hash var — manually fill from remaining @_
+            my str $hname = _mangle($vars->[$special_idx]->{"value"});
+            # Track this as a hash variable for proper access syntax
+            if (!defined($sg->{"hash_vars"})) { $sg->{"hash_vars"} = {}; }
+            $sg->{"hash_vars"}->{$vars->[$special_idx]->{"value"}} = 1;
+            _ind($sg); _emit($sg, "my hash %" . $hname . " = ();\n");
+            _ind($sg); _emit($sg, "if (1) { my int $__hi = 0;\n");
+            _ind($sg); _emit($sg, "while ($__hi + 1 < scalar(@_)) {\n");
+            $sg->{"indent"} = $sg->{"indent"} + 1;
+            _ind($sg); _emit($sg, "$" . $hname . "{$_[$__hi]} = $_[$__hi + 1];\n");
+            _ind($sg); _emit($sg, "$__hi = $__hi + 2;\n");
+            $sg->{"indent"} = $sg->{"indent"} - 1;
+            _ind($sg); _emit($sg, "} }\n");
+            return;
+        }
+
+        # Check if init is @_ — use shift() for each var (avoids closure capture issues)
+        my int $init_is_at = 0;
+        if (defined($node->{"init"}) && $node->{"init"}->{"type"} == Perla::AST::N_ARRAY_VAR() && $node->{"init"}->{"name"} eq "_") {
+            $init_is_at = 1;
+        }
+        if ($init_is_at == 1) {
+            $vi = 0;
+            while ($vi < scalar(@{$vars})) {
+                my scalar $var = $vars->[$vi];
+                my str $vn = _mangle($var->{"value"});
+                _ind($sg); _emit($sg, "my $" . $vn . " = shift(@_);\n");
+                $vi++;
+            }
+            return;
+        }
+
+        # Normal destructuring
+        _ind($sg); _emit($sg, "my (");
+        $vi = 0;
+        while ($vi < scalar(@{$vars})) {
+            if ($vi > 0) { _emit($sg, ", "); }
+            my scalar $var = $vars->[$vi];
+            _emit($sg, _sigil($var->{"type"}) . _mangle($var->{"value"}));
+            $vi++;
+        }
+        _emit($sg, ")");
+        if (defined($node->{"init"})) {
+            _emit($sg, " = "); _gen_expr($sg, $node->{"init"});
+        }
+        _emit($sg, ";\n");
+        return;
+    }
+    if (defined($node->{"var"})) {
+        my str $vtype = $node->{"var"}->{"type"};
+        my str $vname = $node->{"var"}->{"value"};
+        # Track hash variables
+        if ($vtype eq "HASH_VAR") {
+            if (!defined($sg->{"hash_vars"})) { $sg->{"hash_vars"} = {}; }
+            $sg->{"hash_vars"}->{$vname} = 1;
+        }
+        # Track array variables
+        if ($vtype eq "ARRAY_VAR") {
+            if (!defined($sg->{"array_vars"})) { $sg->{"array_vars"} = {}; }
+            $sg->{"array_vars"}->{$vname} = 1;
+        }
+        # Pre-emit hash flatten temps if init is a call with hash args
+        if (defined($node->{"init"})) {
+            _emit_hash_flatten_temps($sg, $node->{"init"});
+        }
+        # Check if this is a file-scope var (already declared as our)
+        my int $is_file_scope = 0;
+        if (defined($sg->{"file_scope_vars"}) && $sg->{"in_main"} == 1) {
+            if (exists($sg->{"file_scope_vars"}->{$vname})) {
+                $is_file_scope = 1;
+            }
+        }
+        if ($is_file_scope == 1) {
+            # File-scope var: emit assignment only (already declared as our)
+            _ind($sg); _emit($sg, _sigil($vtype) . _mangle($vname));
+        } else {
+            _ind($sg); _emit($sg, "my " . _sigil($vtype) . _mangle($vname));
+        }
+        if (defined($node->{"init"})) {
+            _emit($sg, " = ");
+            # For @arr = [...], emit (...) instead of [...]
+            if (($vtype eq "ARRAY_VAR" || $vtype eq "HASH_VAR") && $node->{"init"}->{"type"} == Perla::AST::N_ANON_ARRAY()) {
+                _gen_list_from_anon_array($sg, $node->{"init"});
+            } else {
+                _gen_expr($sg, $node->{"init"});
+            }
+        }
+        _emit($sg, ";\n");
+    }
+}
+
+func _gen_our(scalar $sg, scalar $node) void {
+    if (defined($node->{"var"})) {
+        my str $vname = $node->{"var"}->{"value"};
+        my str $vtype = $node->{"var"}->{"type"};
+        if ($vname eq "ISA" && $vtype eq "ARRAY_VAR") {
+            # @ISA handled via extends
+            return;
+        }
+        # Track constants (uppercase names used with use constant)
+        if ($vtype eq "SCALAR_VAR" && _is_upper($vname) == 1) {
+            $sg->{"constants"}->{$vname} = 1;
+        }
+        # Track our array variables for proper $arr[N] access
+        if ($vtype eq "ARRAY_VAR") {
+            if (!defined($sg->{"array_vars"})) { $sg->{"array_vars"} = {}; }
+            $sg->{"array_vars"}->{$vname} = 1;
+        }
+        # Track our hash variables for proper $hash{key} access
+        if ($vtype eq "HASH_VAR") {
+            if (!defined($sg->{"hash_vars"})) { $sg->{"hash_vars"} = {}; }
+            $sg->{"hash_vars"}->{$vname} = 1;
+        }
+        _ind($sg); _emit($sg, "our " . _sigil($vtype) . _mangle($vname));
+        if (defined($node->{"init"})) {
+            _emit($sg, " = ");
+            # For our %hash = [...], emit () instead of [] (hashes need () not [])
+            if ($vtype eq "HASH_VAR" && $node->{"init"}->{"type"} == Perla::AST::N_ANON_ARRAY()) {
+                _gen_list_from_anon_array($sg, $node->{"init"});
+            } else {
+                _gen_expr($sg, $node->{"init"});
+            }
+        }
+        _emit($sg, ";\n");
+    }
+}
+
+func _sigil(str $token_type) str {
+    if ($token_type eq "ARRAY_VAR") { return "@"; }
+    if ($token_type eq "HASH_VAR") { return "%"; }
+    return "$";
+}
+
+# --- If/Unless ---
+func _gen_if(scalar $sg, scalar $node) void {
+    _gen_if_inner($sg, $node, 0);
+}
+
+func _gen_if_inner(scalar $sg, scalar $node, int $is_elsif) void {
+    if ($is_elsif == 0) { _ind($sg); }
+    if ($node->{"type"} == Perla::AST::N_UNLESS()) { _emit($sg, "unless ("); }
+    else { _emit($sg, "if ("); }
+    _gen_expr($sg, $node->{"cond"});
+    _emit($sg, ") {\n");
+    $sg->{"indent"} = $sg->{"indent"} + 1;
+    my str $body_key = "then";
+    if ($node->{"type"} == Perla::AST::N_UNLESS()) { $body_key = "body"; }
+    _gen_block_stmts($sg, $node->{$body_key});
+    $sg->{"indent"} = $sg->{"indent"} - 1;
+    _ind($sg); _emit($sg, "}");
+    if (defined($node->{"else"})) {
+        if ($node->{"else"}->{"type"} == Perla::AST::N_IF()) {
+            _emit($sg, " els");
+            _gen_if_inner($sg, $node->{"else"}, 1);
+            return;
+        }
+        _emit($sg, " else {\n");
+        $sg->{"indent"} = $sg->{"indent"} + 1;
+        _gen_block_stmts($sg, $node->{"else"});
+        $sg->{"indent"} = $sg->{"indent"} - 1;
+        _ind($sg); _emit($sg, "}");
+    }
+    _emit($sg, "\n");
+}
+
+# --- While ---
+func _gen_while(scalar $sg, scalar $node) void {
+    my str $label = "";
+    if (defined($node->{"label"})) { $label = $node->{"label"} . ": "; }
+
+    # Handle while (my $var = <$fh>) { ... }
+    if (defined($node->{"init_my"})) {
+        my scalar $init_my = $node->{"init_my"};
+        if (defined($init_my->{"var"}) && defined($init_my->{"init"})) {
+            my str $vname = _mangle($init_my->{"var"}->{"value"});
+            _ind($sg); _emit($sg, "my $" . $vname . " = undef;\n");
+            _ind($sg); _emit($sg, $label . "while (1) {\n");
+            $sg->{"indent"} = $sg->{"indent"} + 1;
+            _ind($sg); _emit($sg, "$" . $vname . " = ");
+            _gen_expr($sg, $init_my->{"init"});
+            _emit($sg, ";\n");
+            _ind($sg); _emit($sg, "if (!defined($" . $vname . ")) { last; }\n");
+            _gen_block_stmts($sg, $node->{"body"});
+            $sg->{"indent"} = $sg->{"indent"} - 1;
+            _ind($sg); _emit($sg, "}\n");
+            return;
+        }
+    }
+
+    _ind($sg);
+    if ($node->{"type"} == Perla::AST::N_UNTIL()) {
+        _emit($sg, $label . "until (");
+    } else {
+        _emit($sg, $label . "while (");
+    }
+    _gen_expr($sg, $node->{"cond"});
+    _emit($sg, ") {\n");
+    $sg->{"indent"} = $sg->{"indent"} + 1;
+    _gen_block_stmts($sg, $node->{"body"});
+    $sg->{"indent"} = $sg->{"indent"} - 1;
+    _ind($sg); _emit($sg, "}\n");
+}
+
+# --- Foreach ---
+func _gen_foreach(scalar $sg, scalar $node) void {
+    my str $label = "";
+    if (defined($node->{"label"})) { $label = $node->{"label"} . ": "; }
+    my str $vname = "_";
+    if (defined($node->{"var"}) && defined($node->{"var"}->{"value"}) && length($node->{"var"}->{"value"}) > 0) {
+        $vname = _mangle($node->{"var"}->{"value"});
+    }
+    _ind($sg); _emit($sg, $label . "foreach my scalar $" . $vname . " (");
+    _gen_expr($sg, $node->{"list"});
+    _emit($sg, ") {\n");
+    $sg->{"indent"} = $sg->{"indent"} + 1;
+    _gen_block_stmts($sg, $node->{"body"});
+    $sg->{"indent"} = $sg->{"indent"} - 1;
+    _ind($sg); _emit($sg, "}\n");
+}
+
+# --- For C-style ---
+func _gen_for_c(scalar $sg, scalar $node) void {
+    my scalar $init = $node->{"init"};
+    if (defined($init) && $init->{"type"} == Perla::AST::N_MY()) {
+        # Wrap in block scope to avoid duplicate my declarations
+        _ind($sg); _emit($sg, "{\n");
+        $sg->{"indent"} = $sg->{"indent"} + 1;
+        _gen_my($sg, $init);
+        _ind($sg); _emit($sg, "for (; ");
+        _gen_expr($sg, $node->{"cond"});
+        _emit($sg, "; ");
+        _gen_expr($sg, $node->{"step"});
+        _emit($sg, ") {\n");
+        $sg->{"indent"} = $sg->{"indent"} + 1;
+        _gen_block_stmts($sg, $node->{"body"});
+        $sg->{"indent"} = $sg->{"indent"} - 1;
+        _ind($sg); _emit($sg, "}\n");
+        $sg->{"indent"} = $sg->{"indent"} - 1;
+        _ind($sg); _emit($sg, "}\n");
+    } else {
+        _ind($sg); _emit($sg, "for (");
+        _gen_expr($sg, $init);
+        _emit($sg, "; ");
+        _gen_expr($sg, $node->{"cond"});
+        _emit($sg, "; ");
+        _gen_expr($sg, $node->{"step"});
+        _emit($sg, ") {\n");
+        $sg->{"indent"} = $sg->{"indent"} + 1;
+        _gen_block_stmts($sg, $node->{"body"});
+        $sg->{"indent"} = $sg->{"indent"} - 1;
+        _ind($sg); _emit($sg, "}\n");
+    }
+}
+
+# --- Expression generation ---
+func _gen_expr(scalar $sg, scalar $node) void {
+    if (!defined($node)) { _emit($sg, "undef"); return; }
+    my int $type = $node->{"type"};
+
+    if ($type == Perla::AST::N_INT_LIT()) { _emit($sg, $node->{"value"}); return; }
+    if ($type == Perla::AST::N_NUM_LIT()) { _emit($sg, $node->{"value"}); return; }
+    if ($type == Perla::AST::N_STR_LIT()) { _emit($sg, "\"" . _escape_str($node->{"value"}) . "\""); return; }
+    if ($type == Perla::AST::N_INTERP_STR()) {
+        _gen_interp_str($sg, $node->{"value"});
+        return;
+    }
+    if ($type == Perla::AST::N_UNDEF()) { _emit($sg, "undef"); return; }
+
+    if ($type == Perla::AST::N_SCALAR_VAR()) {
+        my str $vn = $node->{"name"};
+        if ($vn eq "@") { _emit($sg, "$__perla_eval_err"); return; }
+        if ($vn eq "!") { _emit($sg, "core::strerror(core::errno())"); return; }
+        # Replace :: with _ for package-qualified variable names
+        my str $safe_vn = replace_all($vn, "::", "_");
+        _emit($sg, "$" . _mangle($safe_vn));
+        return;
+    }
+    if ($type == Perla::AST::N_ARRAY_VAR()) { _emit($sg, "@" . _mangle($node->{"name"})); return; }
+    if ($type == Perla::AST::N_HASH_VAR()) { _emit($sg, "%" . _mangle($node->{"name"})); return; }
+
+    if ($type == Perla::AST::N_BINOP()) {
+        my str $binop = $node->{"op"};
+        # Handle =~ with substitution/tr
+        if ($binop eq "=~") {
+            my scalar $rhs = $node->{"right"};
+            my int $rhs_type = $rhs->{"type"};
+            if ($rhs_type == Perla::AST::N_SUBST()) {
+                my str $spat = $rhs->{"pattern"};
+                my str $srepl = $rhs->{"replacement"};
+                my int $has_var = _has_perl_var_sg($spat) == 1 || _has_perl_var_sg($srepl) == 1;
+                if ($has_var == 1) {
+                    # Variable interpolation — use replace/replace_all function
+                    my str $sflags = "";
+                    if (defined($rhs->{"flags"})) { $sflags = $rhs->{"flags"}; }
+                    my int $is_global = index($sflags, "g") >= 0;
+                    _gen_expr($sg, $node->{"left"});
+                    if ($is_global == 1) {
+                        _emit($sg, " = pl_regex_replace_all(");
+                    } else {
+                        _emit($sg, " = replace(");
+                    }
+                    _gen_expr($sg, $node->{"left"});
+                    _emit($sg, ", ");
+                    _gen_interp_str($sg, $spat);
+                    _emit($sg, ", ");
+                    _gen_interp_str($sg, $srepl);
+                    _emit($sg, ")");
+                } else {
+                    # Re-escape / in pattern and replacement for s/// delimiters
+                    my str $esc_pat = replace_all($spat, "/", "\\/");
+                    my str $esc_repl = replace_all($srepl, "/", "\\/");
+                    _emit($sg, "("); _gen_expr($sg, $node->{"left"});
+                    _emit($sg, " =~ s/" . $esc_pat . "/" . $esc_repl . "/");
+                    if (defined($rhs->{"flags"})) { _emit($sg, $rhs->{"flags"}); }
+                    _emit($sg, ")");
+                }
+                return;
+            }
+            if ($rhs_type == Perla::AST::N_TR()) {
+                _emit($sg, "("); _gen_expr($sg, $node->{"left"});
+                _emit($sg, " =~ tr/" . $rhs->{"from"} . "/" . $rhs->{"to"} . "/");
+                if (defined($rhs->{"flags"})) { _emit($sg, $rhs->{"flags"}); }
+                _emit($sg, ")");
+                return;
+            }
+        }
+        _emit($sg, "("); _gen_expr($sg, $node->{"left"});
+        # Translate Perl keyword operators to Strada symbol operators
+        my str $sop = $binop;
+        if ($binop eq "or") { $sop = "||"; }
+        elsif ($binop eq "and") { $sop = "&&"; }
+        elsif ($binop eq "not") { $sop = "!"; }
+        _emit($sg, " " . $sop . " ");
+        _gen_expr($sg, $node->{"right"}); _emit($sg, ")");
+        return;
+    }
+    if ($type == Perla::AST::N_UNOP()) {
+        my str $op = $node->{"op"};
+        if ($op eq "not") { $op = "!"; }
+        if (defined($node->{"postfix"}) && $node->{"postfix"} == 1) {
+            _gen_expr($sg, $node->{"operand"}); _emit($sg, $op);
+        } else {
+            _emit($sg, $op); _gen_expr($sg, $node->{"operand"});
+        }
+        return;
+    }
+    if ($type == Perla::AST::N_ASSIGN()) {
+        my str $op = $node->{"op"};
+        my scalar $tgt = $node->{"target"};
+        my int $tgt_type = $tgt->{"type"};
+        # Expand compound assignments that Strada interpreter doesn't support
+        if ($op eq "||=" || $op eq "&&=" || $op eq "//=" || $op eq "*=" || $op eq "/=" || $op eq "%=" || $op eq "**=") {
+            my str $arith = substr($op, 0, length($op) - 1);
+            _gen_expr($sg, $tgt);
+            _emit($sg, " = ");
+            _gen_expr($sg, $tgt);
+            _emit($sg, " " . $arith . " ");
+            _gen_expr($sg, $node->{"value"});
+        } elsif ($op ne "=" && ($tgt_type == Perla::AST::N_HASH_ELEM() || $tgt_type == Perla::AST::N_ARROW_HASH())) {
+            # Expand compound assignments on hash targets: $h{k} += v → $h{k} = $h{k} + v
+            my str $arith = substr($op, 0, length($op) - 1);
+            _gen_expr($sg, $tgt);
+            _emit($sg, " = ");
+            _gen_expr($sg, $tgt);
+            _emit($sg, " " . $arith . " ");
+            _gen_expr($sg, $node->{"value"});
+        } else {
+            _gen_expr($sg, $tgt);
+            _emit($sg, " " . $op . " ");
+            _gen_expr($sg, $node->{"value"});
+        }
+        return;
+    }
+
+    if ($type == Perla::AST::N_CALL()) {
+        my str $name = $node->{"name"};
+        my scalar $args = $node->{"args"};
+        my int $argc = 0;
+        if (defined($args)) { $argc = scalar(@{$args}); }
+
+        # Check if it's a constant (our var) being called as function
+        if ($argc == 0 && defined($sg->{"constants"}) && defined($sg->{"constants"}->{$name})) {
+            _emit($sg, "$" . _mangle($name));
+            return;
+        }
+
+        # Code ref call
+        if ($name eq "__coderef__" && defined($node->{"coderef"})) {
+            _gen_expr($sg, $node->{"coderef"});
+            _emit($sg, "->(");
+            _gen_args_mode($sg, $args, 1);
+            _emit($sg, ")");
+            return;
+        }
+
+        # shift/pop without args → shift(@_)/pop(@_) (must pass @_ explicitly)
+        if (($name eq "shift" || $name eq "pop") && $argc == 0) {
+            _emit($sg, $name . "(@_)");
+            return;
+        }
+        # shift/pop with @_ arg — keep explicit
+        if (($name eq "shift" || $name eq "pop") && $argc == 1) {
+            my scalar $a0 = $args->[0];
+            if (defined($a0) && $a0->{"type"} == Perla::AST::N_ARRAY_VAR() && $a0->{"name"} eq "_") {
+                _emit($sg, $name . "(@_)");
+                return;
+            }
+        }
+
+        # Perl open(fh, mode, file) → core::open(file, mode)
+        if ($name eq "open" && $argc >= 3) {
+            _gen_expr($sg, $args->[0]);
+            _emit($sg, " = core::open(");
+            _gen_expr($sg, $args->[2]);
+            _emit($sg, ", ");
+            _gen_expr($sg, $args->[1]);
+            _emit($sg, ")");
+            return;
+        }
+        if ($name eq "open" && $argc >= 2) {
+            _emit($sg, "core::open(");
+            _gen_expr($sg, $args->[0]);
+            _emit($sg, ", ");
+            _gen_expr($sg, $args->[1]);
+            _emit($sg, ")");
+            return;
+        }
+
+        # close → core::close
+        if ($name eq "close") {
+            _emit($sg, "core::close(");
+            _gen_args($sg, $args);
+            _emit($sg, ")");
+            return;
+        }
+
+        # readline → core::readline
+        if ($name eq "readline") {
+            _emit($sg, "core::readline(");
+            _gen_args($sg, $args);
+            _emit($sg, ")");
+            return;
+        }
+
+        # unlink → core::unlink
+        if ($name eq "unlink") {
+            _emit($sg, "core::unlink(");
+            _gen_args($sg, $args);
+            _emit($sg, ")");
+            return;
+        }
+
+        # system → core::system
+        if ($name eq "system") {
+            _emit($sg, "core::system(");
+            _gen_args($sg, $args);
+            _emit($sg, ")");
+            return;
+        }
+
+        # exit → core::_exit
+        if ($name eq "exit") {
+            _emit($sg, "core::_exit(");
+            if ($argc > 0) { _gen_args($sg, $args); }
+            else { _emit($sg, "0"); }
+            _emit($sg, ")");
+            return;
+        }
+
+        # die → die (works as function call in Strada)
+        if ($name eq "die") {
+            _emit($sg, "die(");
+            if ($argc > 0) { _gen_args($sg, $args); }
+            else { _emit($sg, "\"Died\""); }
+            _emit($sg, ")");
+            return;
+        }
+
+        # print with filehandle: print($fh, $str) → say($fh, $str)
+        if ($name eq "print" && $argc >= 2) {
+            _emit($sg, "print(");
+            _gen_expr($sg, $args->[0]);
+            _emit($sg, ", ");
+            _gen_expr($sg, $args->[1]);
+            _emit($sg, ")");
+            return;
+        }
+
+        # STDERR/STDOUT/STDIN — bareword filehandles, not function calls
+        if ($name eq "STDERR" || $name eq "STDOUT" || $name eq "STDIN") {
+            _emit($sg, $name);
+            return;
+        }
+
+        # abs → math::abs
+        if ($name eq "abs") {
+            _emit($sg, "math::abs(");
+            _gen_args($sg, $args);
+            _emit($sg, ")");
+            return;
+        }
+
+        # eval string → skip (not supported in Strada)
+        if ($name eq "eval") {
+            _emit($sg, "undef /* eval string not supported */");
+            return;
+        }
+
+        # sprintf → core::sprintf
+        if ($name eq "sprintf") {
+            _emit($sg, "sprintf(");
+            _gen_args($sg, $args);
+            _emit($sg, ")");
+            return;
+        }
+
+        # join with multiple scalar args: join(",", "a", "b") → join(",", ("a", "b"))
+        if ($name eq "join" && $argc > 2) {
+            _emit($sg, "join(");
+            _gen_expr($sg, $args->[0]);
+            _emit($sg, ", (");
+            my int $ji = 1;
+            while ($ji < $argc) {
+                if ($ji > 1) { _emit($sg, ", "); }
+                _gen_expr($sg, $args->[$ji]);
+                $ji++;
+            }
+            _emit($sg, "))");
+            return;
+        }
+
+        # ref → ref
+        # defined → defined
+        # scalar → scalar
+        # These map directly
+
+        # Default: emit function call
+        # Spread @array/%hash args for user-defined subs, not Strada builtins
+        my int $do_spread = 1;
+        if ($name eq "push" || $name eq "pop" || $name eq "shift" || $name eq "unshift" ||
+            $name eq "join" || $name eq "splice" || $name eq "sort" || $name eq "reverse" ||
+            $name eq "grep" || $name eq "map" || $name eq "keys" || $name eq "values" ||
+            $name eq "each" || $name eq "delete" || $name eq "exists" || $name eq "defined" ||
+            $name eq "ref" || $name eq "scalar" || $name eq "chomp" || $name eq "chop" ||
+            $name eq "length" || $name eq "substr" || $name eq "index" || $name eq "rindex" ||
+            $name eq "uc" || $name eq "lc" || $name eq "ucfirst" || $name eq "lcfirst" ||
+            $name eq "trim" || $name eq "chr" || $name eq "ord" || $name eq "say" ||
+            $name eq "print" || $name eq "sprintf" || $name eq "printf" ||
+            $name eq "split" || $name eq "match" || $name eq "replace" || $name eq "replace_all" ||
+            $name eq "bless" || $name eq "die" || $name eq "warn" || $name eq "chomp" ||
+            $name eq "wantarray" || $name eq "caller" || $name eq "tied" ||
+            $name eq "tie" || $name eq "untie") {
+            $do_spread = 0;
+        }
+        _emit($sg, _mangle_qualified($name) . "(");
+        _gen_args_mode($sg, $args, $do_spread);
+        _emit($sg, ")");
+        return;
+    }
+    if ($type == Perla::AST::N_METHOD()) {
+        my str $meth = $node->{"method"};
+        # Handle SUPER::method() → Parent::method($self, args)
+        if (length($meth) > 7 && substr($meth, 0, 7) eq "SUPER::") {
+            my str $real_method = substr($meth, 7, length($meth) - 7);
+            my str $parent = "";
+            if (defined($sg->{"extends"}) && defined($sg->{"extends"}->{$sg->{"emit_pkg"}})) {
+                $parent = "" . $sg->{"extends"}->{$sg->{"emit_pkg"}};
+            }
+            if (length($parent) > 0) {
+                _emit($sg, $parent . "::" . _mangle($real_method) . "(");
+                _gen_expr($sg, $node->{"object"});
+                my scalar $margs = $node->{"args"};
+                if (defined($margs) && scalar(@{$margs}) > 0) {
+                    _emit($sg, ", ");
+                    _gen_args($sg, $margs);
+                }
+                _emit($sg, ")");
+                return;
+            }
+            # No parent known — strip SUPER:: and call as regular method
+            $meth = $real_method;
+        }
+        # Handle Class->method(args) — static method call
+        # In Perl, Counter->new("test") = Counter::new("Counter", "test")
+        my scalar $obj_node = $node->{"object"};
+        if (defined($obj_node) && $obj_node->{"type"} == Perla::AST::N_CALL() &&
+            (!defined($obj_node->{"args"}) || scalar(@{$obj_node->{"args"}}) == 0)) {
+            my str $class_name = $obj_node->{"name"};
+            # Check if it looks like a class name (starts with uppercase)
+            if (length($class_name) > 0 && char_at($class_name, 0) >= ord("A") && char_at($class_name, 0) <= ord("Z")) {
+                # For precompiled modules, use the stash-based method dispatch
+                my scalar $pc_mods = $sg->{"precompiled_mods"};
+                if (defined($pc_mods) && defined($pc_mods->{$class_name})) {
+                    _emit($sg, "__perla_class_dispatch(\"" . $class_name . "\", \"" . $meth . "\"");
+                    my scalar $margs = $node->{"args"};
+                    if (defined($margs) && scalar(@{$margs}) > 0) {
+                        _emit($sg, ", ");
+                        _gen_args_mode($sg, $margs, 1);
+                    }
+                    _emit($sg, ")");
+                    return;
+                }
+                _emit($sg, $class_name . "::" . _mangle($meth) . "(\"" . $class_name . "\"");
+                my scalar $margs = $node->{"args"};
+                if (defined($margs) && scalar(@{$margs}) > 0) {
+                    _emit($sg, ", ");
+                    _gen_args_mode($sg, $margs, 1);
+                }
+                _emit($sg, ")");
+                return;
+            }
+        }
+        # When precompiled modules exist, route through perla stash dispatch
+        # (objects blessed by precompiled modules won't have Strada method tables)
+        my scalar $pc_mods2 = $sg->{"precompiled_mods"};
+        if (defined($pc_mods2) && scalar(keys($pc_mods2)) > 0) {
+            _emit($sg, "__perla_obj_dispatch(");
+            _gen_expr($sg, $node->{"object"});
+            _emit($sg, ", \"" . $meth . "\"");
+            my scalar $margs2 = $node->{"args"};
+            if (defined($margs2) && scalar(@{$margs2}) > 0) {
+                _emit($sg, ", ");
+                _gen_args_mode($sg, $margs2, 1);
+            }
+            _emit($sg, ")");
+        } else {
+            _gen_expr($sg, $node->{"object"});
+            _emit($sg, "->" . _mangle($meth) . "(");
+            _gen_args_mode($sg, $node->{"args"}, 1);
+            _emit($sg, ")");
+        }
+        return;
+    }
+
+    if ($type == Perla::AST::N_HASH_ELEM()) {
+        _gen_expr($sg, $node->{"hash"});
+        _emit($sg, "{"); _gen_expr($sg, $node->{"key"}); _emit($sg, "}");
+        return;
+    }
+    if ($type == Perla::AST::N_ARRAY_ELEM()) {
+        _gen_expr($sg, $node->{"array"});
+        _emit($sg, "["); _gen_expr($sg, $node->{"index"}); _emit($sg, "]");
+        return;
+    }
+    if ($type == Perla::AST::N_ARROW_HASH()) {
+        my scalar $obj = $node->{"object"};
+        # If the object is a known hash variable, use $hash{key} instead of $hash->{"key"}
+        if ($obj->{"type"} == Perla::AST::N_SCALAR_VAR() && defined($sg->{"hash_vars"}) &&
+            defined($sg->{"hash_vars"}->{$obj->{"name"}})) {
+            _emit($sg, "$" . _mangle($obj->{"name"}) . "{");
+            _gen_expr($sg, $node->{"key"});
+            _emit($sg, "}");
+        } else {
+            _gen_expr($sg, $obj);
+            _emit($sg, "->{"); _gen_expr($sg, $node->{"key"}); _emit($sg, "}");
+        }
+        return;
+    }
+    if ($type == Perla::AST::N_ARROW_ARRAY()) {
+        my scalar $obj = $node->{"object"};
+        # $_->[N] when $_ is the implicit @_ → use $_[N] directly
+        if ($obj->{"type"} == Perla::AST::N_SCALAR_VAR() && $obj->{"name"} eq "_") {
+            _emit($sg, "$_["); _gen_expr($sg, $node->{"index"}); _emit($sg, "]");
+        } elsif ($obj->{"type"} == Perla::AST::N_SCALAR_VAR() && defined($sg->{"array_vars"}) && defined($sg->{"array_vars"}->{$obj->{"name"}})) {
+            # $arr->[N] on known @array variable → $arr[N]
+            _emit($sg, "$" . _mangle($obj->{"name"}) . "[");
+            _gen_expr($sg, $node->{"index"});
+            _emit($sg, "]");
+        } else {
+            _gen_expr($sg, $obj);
+            _emit($sg, "->["); _gen_expr($sg, $node->{"index"}); _emit($sg, "]");
+        }
+        return;
+    }
+
+    if ($type == Perla::AST::N_REF()) {
+        _emit($sg, "\\"); _gen_expr($sg, $node->{"operand"});
+        return;
+    }
+    if ($type == Perla::AST::N_DEREF_ARRAY()) {
+        _emit($sg, "@{"); _gen_expr($sg, $node->{"ref"}); _emit($sg, "}");
+        return;
+    }
+    if ($type == Perla::AST::N_DEREF_HASH()) {
+        _emit($sg, "%{"); _gen_expr($sg, $node->{"ref"}); _emit($sg, "}");
+        return;
+    }
+
+    if ($type == Perla::AST::N_ANON_HASH()) {
+        _emit($sg, "{");
+        my scalar $pairs = $node->{"pairs"};
+        if (defined($pairs)) {
+            my int $pi = 0;
+            while ($pi + 1 < scalar(@{$pairs})) {
+                if ($pi > 0) { _emit($sg, ", "); }
+                _gen_expr($sg, $pairs->[$pi]);
+                _emit($sg, " => ");
+                _gen_expr($sg, $pairs->[$pi + 1]);
+                $pi = $pi + 2;
+            }
+        }
+        _emit($sg, "}");
+        return;
+    }
+    if ($type == Perla::AST::N_ANON_ARRAY()) {
+        _emit($sg, "[");
+        my scalar $elems = $node->{"elems"};
+        if (defined($elems)) {
+            my int $ei = 0;
+            while ($ei < scalar(@{$elems})) {
+                if ($ei > 0) { _emit($sg, ", "); }
+                _gen_expr($sg, $elems->[$ei]);
+                $ei++;
+            }
+        }
+        _emit($sg, "]");
+        return;
+    }
+
+    if ($type == Perla::AST::N_TERNARY()) {
+        _emit($sg, "("); _gen_expr($sg, $node->{"cond"});
+        _emit($sg, " ? "); _gen_expr($sg, $node->{"then"});
+        _emit($sg, " : "); _gen_expr($sg, $node->{"else"});
+        _emit($sg, ")");
+        return;
+    }
+
+    if ($type == Perla::AST::N_RANGE()) {
+        _emit($sg, "("); _gen_expr($sg, $node->{"from"});
+        _emit($sg, ".."); _gen_expr($sg, $node->{"to"});
+        _emit($sg, ")");
+        return;
+    }
+
+    if ($type == Perla::AST::N_READLINE()) {
+        my str $handle = $node->{"handle"};
+        if ($handle eq "STDIN") { _emit($sg, "core::readline()"); }
+        else { _emit($sg, "core::readline($" . $handle . ")"); }
+        return;
+    }
+
+    if ($type == Perla::AST::N_REGEX()) {
+        _emit($sg, "/" . $node->{"pattern"} . "/");
+        if (defined($node->{"flags"})) { _emit($sg, $node->{"flags"}); }
+        return;
+    }
+    if ($type == Perla::AST::N_SUBST()) {
+        _emit($sg, "s/" . $node->{"pattern"} . "/" . $node->{"replacement"} . "/");
+        if (defined($node->{"flags"})) { _emit($sg, $node->{"flags"}); }
+        return;
+    }
+
+    if ($type == Perla::AST::N_QWORD()) {
+        _emit($sg, "qw(");
+        my scalar $elems = $node->{"elems"};
+        if (defined($elems)) {
+            my int $ei = 0;
+            while ($ei < scalar(@{$elems})) {
+                if ($ei > 0) { _emit($sg, " "); }
+                _emit($sg, $elems->[$ei]->{"value"});
+                $ei++;
+            }
+        }
+        _emit($sg, ")");
+        return;
+    }
+
+    if ($type == Perla::AST::N_MAP()) {
+        _emit($sg, "map { ");
+        _gen_map_block_expr($sg, $node->{"block"});
+        _emit($sg, " } ");
+        _gen_expr($sg, $node->{"list"});
+        return;
+    }
+    if ($type == Perla::AST::N_GREP()) {
+        _emit($sg, "grep { ");
+        _gen_map_block_expr($sg, $node->{"block"});
+        _emit($sg, " } ");
+        _gen_expr($sg, $node->{"list"});
+        return;
+    }
+    if ($type == Perla::AST::N_SORT()) {
+        my scalar $sort_block = $node->{"block"};
+        my int $has_block = 0;
+        if (defined($sort_block)) {
+            my scalar $sort_stmts = $sort_block->{"stmts"};
+            if (defined($sort_stmts) && scalar(@{$sort_stmts}) == 1) {
+                my scalar $sort_expr = $sort_stmts->[0];
+                if (defined($sort_expr) && $sort_expr->{"type"} != Perla::AST::N_UNDEF()) {
+                    $has_block = 1;
+                }
+            } elsif (defined($sort_stmts) && scalar(@{$sort_stmts}) > 1) {
+                $has_block = 1;
+            }
+        }
+        if ($has_block == 1) {
+            # sort { EXPR } @arr — emit with block comparator
+            _emit($sg, "sort { ");
+            my scalar $sort_stmts = $sort_block->{"stmts"};
+            if (defined($sort_stmts) && scalar(@{$sort_stmts}) == 1) {
+                my scalar $sort_expr = $sort_stmts->[0];
+                if (defined($sort_expr) && $sort_expr->{"type"} == Perla::AST::N_BINOP()) {
+                    _gen_expr($sg, $sort_expr->{"left"});
+                    _emit($sg, " " . $sort_expr->{"op"} . " ");
+                    _gen_expr($sg, $sort_expr->{"right"});
+                } else {
+                    _gen_expr($sg, $sort_expr);
+                }
+            } else {
+                _gen_map_block_expr($sg, $sort_block);
+            }
+            _emit($sg, "; } ");
+            _gen_expr($sg, $node->{"list"});
+        } else {
+            # Default sort (no block) — emit sort(list)
+            _emit($sg, "sort(");
+            _gen_expr($sg, $node->{"list"});
+            _emit($sg, ")");
+        }
+        return;
+    }
+
+    if ($type == Perla::AST::N_SPECIAL_VAR()) {
+        my str $val = $node->{"value"};
+        if (substr($val, 0, 1) eq "#") {
+            # $#arr → (scalar(@arr) - 1)
+            my str $arrname = _mangle(substr($val, 1, length($val) - 1));
+            _emit($sg, "(scalar(@" . $arrname . ") - 1)");
+        } elsif (substr($val, 0, 9) eq "backtick:") {
+            _emit($sg, "core::qx(\"" . _escape_str(substr($val, 9, length($val) - 9)) . "\")");
+        } elsif ($val eq "@") {
+            # $@ → eval error — use tracked variable
+            _emit($sg, "$__perla_eval_err");
+        } elsif ($val eq "_") {
+            _emit($sg, "$_");
+        } else {
+            _emit($sg, "undef /* special: " . $val . " */");
+        }
+        return;
+    }
+
+    if ($type == Perla::AST::N_SUB() && !defined($node->{"name"})) {
+        # Count how many @_ params the body uses (shift, $_[N], @_)
+        my int $param_count = _count_at_params($node->{"body"});
+        _emit($sg, "func (");
+        if ($param_count > 0) {
+            my int $pi = 0;
+            while ($pi < $param_count) {
+                if ($pi > 0) { _emit($sg, ", "); }
+                _emit($sg, "scalar $__p" . $pi);
+                $pi++;
+            }
+        }
+        _emit($sg, ") scalar {\n");
+        $sg->{"indent"} = $sg->{"indent"} + 1;
+        # If params were used, emit @_ reconstruction
+        if ($param_count > 0) {
+            _ind($sg); _emit($sg, "my array @_ = ();\n");
+            my int $pi = 0;
+            while ($pi < $param_count) {
+                _ind($sg); _emit($sg, "push(@_, $__p" . $pi . ");\n");
+                $pi++;
+            }
+        }
+        if (defined($node->{"body"})) { _gen_block_stmts($sg, $node->{"body"}); }
+        $sg->{"indent"} = $sg->{"indent"} - 1;
+        _ind($sg); _emit($sg, "}");
+        return;
+    }
+
+    # Loop control in expression context (postfix if/unless)
+    if ($type == Perla::AST::N_LAST()) {
+        if (defined($node->{"label"})) { _emit($sg, "last " . $node->{"label"}); }
+        else { _emit($sg, "last"); }
+        return;
+    }
+    if ($type == Perla::AST::N_NEXT()) {
+        if (defined($node->{"label"})) { _emit($sg, "next " . $node->{"label"}); }
+        else { _emit($sg, "next"); }
+        return;
+    }
+    if ($type == Perla::AST::N_REDO()) {
+        _emit($sg, "redo");
+        return;
+    }
+
+    # Array slice: @arr[1, 3] → (arr[1], arr[3])
+    if ($type == Perla::AST::N_ARRAY_SLICE()) {
+        my str $aname = _mangle($node->{"array"});
+        my scalar $indices = $node->{"indices"};
+        _emit($sg, "(");
+        my int $si = 0;
+        while ($si < scalar(@{$indices})) {
+            if ($si > 0) { _emit($sg, ", "); }
+            _emit($sg, "$" . $aname . "[");
+            _gen_expr($sg, $indices->[$si]);
+            _emit($sg, "]");
+            $si++;
+        }
+        _emit($sg, ")");
+        return;
+    }
+
+    # Hash slice: @h{"a", "c"} → ($h{"a"}, $h{"c"})
+    if ($type == Perla::AST::N_HASH_SLICE()) {
+        my str $hname = _mangle($node->{"hash"});
+        my scalar $slice_keys = $node->{"keys_list"};
+        if (defined($slice_keys)) {
+            _emit($sg, "(");
+            my int $si = 0;
+            while ($si < scalar(@{$slice_keys})) {
+                if ($si > 0) { _emit($sg, ", "); }
+                _emit($sg, "$" . $hname . "{");
+                _gen_expr($sg, $slice_keys->[$si]);
+                _emit($sg, "}");
+                $si++;
+            }
+            _emit($sg, ")");
+        } else {
+            _emit($sg, "()");
+        }
+        return;
+    }
+
+    # eval { BLOCK } in expression context → just emit body inline
+    # The try/catch wrapping is handled in statement context; in expression context
+    # we just need the value of the last expression in the block
+    if ($type == Perla::AST::N_EVAL_BLOCK()) {
+        if (defined($node->{"body"}) && defined($node->{"body"}->{"stmts"})) {
+            my scalar $stmts = $node->{"body"}->{"stmts"};
+            my int $sc = scalar(@{$stmts});
+            if ($sc > 0) {
+                # Emit last expression as the value
+                my scalar $last = $stmts->[$sc - 1];
+                _gen_expr($sg, $last);
+            } else {
+                _emit($sg, "undef");
+            }
+        } else {
+            _emit($sg, "undef");
+        }
+        return;
+    }
+
+    # N_RETURN in expression context (e.g., "return $x unless $cond" becomes expr)
+    if ($type == Perla::AST::N_RETURN()) {
+        _emit($sg, "return ");
+        if (defined($node->{"value"})) {
+            _gen_expr($sg, $node->{"value"});
+        } else {
+            _emit($sg, "undef");
+        }
+        return;
+    }
+
+    # N_MY in expression context (e.g., "if (my $x = expr)")
+    if ($type == Perla::AST::N_MY()) {
+        if (defined($node->{"vars"}) && scalar(@{$node->{"vars"}}) > 0) {
+            my scalar $v0 = $node->{"vars"}->[0];
+            if (defined($v0->{"init"})) {
+                _emit($sg, "(");
+                _emit($sg, "$" . _mangle($v0->{"var"}->{"value"}) . " = ");
+                _gen_expr($sg, $v0->{"init"});
+                _emit($sg, ")");
+            } else {
+                _emit($sg, "$" . _mangle($v0->{"var"}->{"value"}));
+            }
+        } else {
+            _emit($sg, "undef");
+        }
+        return;
+    }
+
+    # N_DEREF_SCALAR — $$ref
+    if ($type == Perla::AST::N_DEREF_SCALAR()) {
+        _emit($sg, "$$");
+        if (defined($node->{"operand"})) {
+            _gen_expr($sg, $node->{"operand"});
+        }
+        return;
+    }
+
+    # N_LOCAL — local $var (no-op in VM, just emit variable)
+    if ($type == Perla::AST::N_LOCAL()) {
+        if (defined($node->{"var"})) {
+            _emit($sg, "$" . _mangle($node->{"var"}->{"value"}));
+        } else {
+            _emit($sg, "undef");
+        }
+        return;
+    }
+
+    # N_SUB — anonymous sub in expression context
+    if ($type == Perla::AST::N_SUB()) {
+        _emit($sg, "func (");
+        if (defined($node->{"params"}) && scalar(@{$node->{"params"}}) > 0) {
+            my int $pi = 0;
+            while ($pi < scalar(@{$node->{"params"}})) {
+                if ($pi > 0) { _emit($sg, ", "); }
+                _emit($sg, "$" . _mangle($node->{"params"}->[$pi]->{"name"}));
+                $pi++;
+            }
+        }
+        _emit($sg, ") scalar {\n");
+        $sg->{"indent"} = $sg->{"indent"} + 1;
+        if (defined($node->{"body"})) {
+            _gen_block_stmts($sg, $node->{"body"});
+        }
+        $sg->{"indent"} = $sg->{"indent"} - 1;
+        _ind($sg); _emit($sg, "}");
+        return;
+    }
+
+    # N_IF/N_UNLESS in expression context — emit last value
+    if ($type == Perla::AST::N_IF() || $type == Perla::AST::N_UNLESS()) {
+        _emit($sg, "undef");
+        return;
+    }
+
+    # N_POSTFIX_IF in expression context
+    if ($type == Perla::AST::N_POSTFIX_IF()) {
+        _emit($sg, "(");
+        _gen_expr($sg, $node->{"cond"});
+        _emit($sg, " ? ");
+        _gen_expr($sg, $node->{"expr"});
+        _emit($sg, " : undef)");
+        return;
+    }
+
+    # N_POSTFIX_UNLESS in expression context
+    if ($type == Perla::AST::N_POSTFIX_UNLESS()) {
+        _emit($sg, "(!(");
+        _gen_expr($sg, $node->{"cond"});
+        _emit($sg, ") ? ");
+        _gen_expr($sg, $node->{"expr"});
+        _emit($sg, " : undef)");
+        return;
+    }
+
+    # N_USE/N_END — skip in expression context
+    if ($type == Perla::AST::N_USE() || $type == Perla::AST::N_END()) {
+        _emit($sg, "undef");
+        return;
+    }
+
+    _emit($sg, "undef /* TODO: type " . $type . " */");
+}
+
+func _gen_map_block_expr(scalar $sg, scalar $block) void {
+    my scalar $stmts = $block->{"stmts"};
+    if (!defined($stmts) || scalar(@{$stmts}) == 0) { _emit($sg, "undef"); return; }
+    if (scalar(@{$stmts}) == 1) { _gen_expr($sg, $stmts->[0]); return; }
+    my int $i = 0;
+    while ($i < scalar(@{$stmts})) {
+        if ($i > 0) { _emit($sg, "; "); }
+        _gen_expr($sg, $stmts->[$i]);
+        $i++;
+    }
+}
+
+# --- Interpolated string → concatenation ---
+func _gen_interp_str(scalar $sg, str $s) void {
+    # Parse the string, splitting on $var and ${var} references
+    my int $len = length($s);
+    my int $i = 0;
+    my int $parts = 0;
+    my str $buf = "";
+
+    while ($i < $len) {
+        my str $ch = substr($s, $i, 1);
+
+        if ($ch eq "\\" && $i + 1 < $len) {
+            # Escape sequence — keep as-is in string literal
+            $buf = $buf . "\\" . substr($s, $i + 1, 1);
+            $i = $i + 2;
+        } elsif ($ch eq "$" && $i + 1 < $len) {
+            # Variable reference
+            # Flush buffer
+            if (length($buf) > 0) {
+                if ($parts > 0) { _emit($sg, " . "); }
+                _emit($sg, "\"" . $buf . "\"");
+                $buf = "";
+                $parts = $parts + 1;
+            }
+            $i = $i + 1;
+            my str $next = substr($s, $i, 1);
+            if ($next eq "{") {
+                # ${var} form
+                $i = $i + 1;
+                my str $vname = "";
+                while ($i < $len && substr($s, $i, 1) ne "}") {
+                    $vname = $vname . substr($s, $i, 1);
+                    $i = $i + 1;
+                }
+                if ($i < $len) { $i = $i + 1; }  # skip }
+                if ($parts > 0) { _emit($sg, " . "); }
+                _emit($sg, "$" . _mangle($vname));
+                $parts = $parts + 1;
+            } else {
+                # $var form — read identifier
+                my str $vname = "";
+                while ($i < $len) {
+                    my str $c = substr($s, $i, 1);
+                    if (($c ge "a" && $c le "z") || ($c ge "A" && $c le "Z") || ($c ge "0" && $c le "9") || $c eq "_") {
+                        $vname = $vname . $c;
+                        $i = $i + 1;
+                    } else {
+                        last;
+                    }
+                }
+                if (length($vname) > 0) {
+                    if ($parts > 0) { _emit($sg, " . "); }
+                    _emit($sg, "$" . _mangle($vname));
+                    $parts = $parts + 1;
+                } else {
+                    # Lone $ — treat as literal
+                    $buf = $buf . "$";
+                }
+            }
+        } else {
+            $buf = $buf . $ch;
+            $i = $i + 1;
+        }
+    }
+
+    # Flush remaining buffer
+    if (length($buf) > 0 || $parts == 0) {
+        if ($parts > 0) { _emit($sg, " . "); }
+        _emit($sg, "\"" . $buf . "\"");
+    }
+}
+
+# Count how many @_ parameters an anonymous sub body uses
+# Returns max param count based on shift() calls and $_[N] accesses
+func _count_at_params(scalar $body) int {
+    if (!defined($body) || !defined($body->{"stmts"})) { return 0; }
+    my int $count = 0;
+    my scalar $stmts = $body->{"stmts"};
+    my int $i = 0;
+    while ($i < scalar(@{$stmts})) {
+        my int $c = _count_at_in_node($stmts->[$i]);
+        $count = $count + $c;
+        $i++;
+    }
+    return $count;
+}
+
+func _count_at_in_node(scalar $node) int {
+    if (!defined($node)) { return 0; }
+    my int $type = $node->{"type"};
+    my int $max = 0;
+    # shift(@_) or pop(@_) = 1 param consumed
+    if ($type == Perla::AST::N_CALL()) {
+        my str $name = $node->{"name"};
+        if ($name eq "shift" || $name eq "pop") { return 1; }
+        # Recurse into call args
+        if (defined($node->{"args"})) {
+            my int $ai = 0;
+            while ($ai < scalar(@{$node->{"args"}})) {
+                my int $c = _count_at_in_node($node->{"args"}->[$ai]);
+                if ($c > $max) { $max = $c; }
+                $ai++;
+            }
+        }
+        return $max;
+    }
+    # my ($a, $b) = @_ = N params
+    if ($type == Perla::AST::N_MY() && defined($node->{"vars"})) {
+        my scalar $init = $node->{"init"};
+        if (defined($init) && $init->{"type"} == Perla::AST::N_ARRAY_VAR() && $init->{"name"} eq "_") {
+            return scalar(@{$node->{"vars"}});
+        }
+    }
+    # my $s = $_[N] or my $s = EXPR containing $_[N]
+    if ($type == Perla::AST::N_MY() && defined($node->{"init"})) {
+        return _count_at_in_node($node->{"init"});
+    }
+    # $_[N] access = at least N+1 params
+    if ($type == Perla::AST::N_ARROW_ARRAY()) {
+        my scalar $obj = $node->{"object"};
+        if (defined($obj) && $obj->{"type"} == Perla::AST::N_SCALAR_VAR() && $obj->{"name"} eq "_") {
+            my scalar $idx = $node->{"index"};
+            if (defined($idx) && $idx->{"type"} == Perla::AST::N_INT_LIT()) {
+                my int $n = $idx->{"value"} + 1;
+                return $n;
+            }
+            return 1;
+        }
+    }
+    # Recurse into sub-expressions
+    if ($type == Perla::AST::N_RETURN() && defined($node->{"value"})) {
+        return _count_at_in_node($node->{"value"});
+    }
+    if ($type == Perla::AST::N_BINOP()) {
+        my int $l = _count_at_in_node($node->{"left"});
+        my int $r = _count_at_in_node($node->{"right"});
+        if ($l > $r) { return $l; }
+        return $r;
+    }
+    if ($type == Perla::AST::N_UNOP()) {
+        return _count_at_in_node($node->{"operand"});
+    }
+    if ($type == Perla::AST::N_ASSIGN()) {
+        my int $l = _count_at_in_node($node->{"target"});
+        my int $r = _count_at_in_node($node->{"value"});
+        if ($l > $r) { return $l; }
+        return $r;
+    }
+    if ($type == Perla::AST::N_ARROW_HASH()) {
+        return _count_at_in_node($node->{"object"});
+    }
+    if ($type == Perla::AST::N_METHOD()) {
+        my int $m = _count_at_in_node($node->{"object"});
+        if (defined($node->{"args"})) {
+            my int $ai = 0;
+            while ($ai < scalar(@{$node->{"args"}})) {
+                my int $ac = _count_at_in_node($node->{"args"}->[$ai]);
+                if ($ac > $m) { $m = $ac; }
+                $ai++;
+            }
+        }
+        return $m;
+    }
+    if ($type == Perla::AST::N_TERNARY()) {
+        my int $c = _count_at_in_node($node->{"cond"});
+        my int $t = _count_at_in_node($node->{"then"});
+        my int $e = _count_at_in_node($node->{"else"});
+        if ($t > $c) { $c = $t; }
+        if ($e > $c) { $c = $e; }
+        return $c;
+    }
+    # Recurse into if/elsif condition and body
+    if ($type == Perla::AST::N_IF() || $type == Perla::AST::N_UNLESS()) {
+        my int $c = _count_at_in_node($node->{"cond"});
+        my scalar $body = $node->{"then"};
+        if (!defined($body)) { $body = $node->{"body"}; }
+        if (defined($body) && defined($body->{"stmts"})) {
+            my int $bi = 0;
+            while ($bi < scalar(@{$body->{"stmts"}})) {
+                my int $bc = _count_at_in_node($body->{"stmts"}->[$bi]);
+                if ($bc > $c) { $c = $bc; }
+                $bi++;
+            }
+        }
+        return $c;
+    }
+    return 0;
+}
+
+# Check if string contains $var (not regex $ anchor)
+func _has_perl_var_sg(str $s) int {
+    my int $i = 0;
+    my int $len = length($s);
+    while ($i < $len - 1) {
+        if (substr($s, $i, 1) eq "$") {
+            my str $next = substr($s, $i + 1, 1);
+            if (($next ge "a" && $next le "z") || ($next ge "A" && $next le "Z") || $next eq "_") {
+                return 1;
+            }
+        }
+        $i = $i + 1;
+    }
+    return 0;
+}
+
+func _gen_list_from_anon_array(scalar $sg, scalar $node) void {
+    _emit($sg, "(");
+    my scalar $elems = $node->{"elems"};
+    if (defined($elems)) {
+        my int $ei = 0;
+        while ($ei < scalar(@{$elems})) {
+            if ($ei > 0) { _emit($sg, ", "); }
+            _gen_expr($sg, $elems->[$ei]);
+            $ei++;
+        }
+    }
+    _emit($sg, ")");
+}
+
+func _gen_args(scalar $sg, scalar $args) void {
+    _gen_args_mode($sg, $args, 0);
+}
+
+# mode 0 = normal (no spread), mode 1 = spread @array/%hash args
+func _gen_args_mode(scalar $sg, scalar $args, int $spread) void {
+    if (!defined($args)) { return; }
+    my int $i = 0;
+    while ($i < scalar(@{$args})) {
+        if ($i > 0) { _emit($sg, ", "); }
+        my scalar $arg = $args->[$i];
+        if ($spread == 1 && defined($arg) && ($arg->{"type"} == Perla::AST::N_ARRAY_VAR() || $arg->{"type"} == Perla::AST::N_DEREF_ARRAY())) {
+            _emit($sg, "...");
+            _gen_expr($sg, $arg);
+        } elsif ($spread == 1 && defined($arg) && $arg->{"type"} == Perla::AST::N_HASH_VAR()) {
+            # Hash spread: use pre-emitted flatten temp
+            my str $hname = _mangle($arg->{"name"});
+            _emit($sg, "...@__flat_" . $hname);
+        } else {
+            _gen_expr($sg, $arg);
+        }
+        $i++;
+    }
+}

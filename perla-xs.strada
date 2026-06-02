@@ -1,0 +1,423 @@
+/*
+ * perla-xs — Standalone XS compiler for Perla
+ *
+ * Takes an existing XS module source tree (not from CPAN) and compiles
+ * it against Perla's perl.h shim, producing a linkable .xs.a archive
+ * (plus optionally installing the .pm wrappers).
+ *
+ * Path B from the XS workflow: compile real CPAN-style .xs files
+ * against perla_perl.h / XSUB.h shims, link into perla_runtime.a.
+ *
+ * Usage:
+ *   perla-xs DIR                           Compile XS in DIR → DIR/<Module>.xs.a
+ *   perla-xs -o OUT DIR                    Write archive to OUT
+ *   perla-xs --install DIR [--lib PATH]    Also install .pm files under PATH
+ *                                          (default: $PERLA_LIB or ~/perla-lib/lib/perl5)
+ *   perla-xs -v DIR                        Verbose
+ *   perla-xs FILE.xs                       Compile a single .xs (same dir for helper .c)
+ *
+ * Environment:
+ *   PERLA_LIB   Install directory for .pm files (with --install)
+ *   PERLA_CC    Override C compiler (default: gcc)
+ */
+
+use lib "lib";
+
+func main() int {
+    my int $argc = size(@ARGV);
+    if ($argc < 1) {
+        _usage();
+        return 1;
+    }
+
+    my int $verbose = 0;
+    my int $do_install = 0;
+    my str $out_archive = "";
+    my str $lib_dir = core::getenv("PERLA_LIB");
+    if (length($lib_dir) == 0) {
+        my str $home = core::getenv("HOME");
+        $lib_dir = $home . "/perla-lib/lib/perl5";
+    }
+    my str $input = "";
+
+    my int $i = 0;
+    while ($i < $argc) {
+        my str $a = $ARGV[$i];
+        if ($a eq "-v" || $a eq "--verbose") {
+            $verbose = 1;
+        } elsif ($a eq "-h" || $a eq "--help") {
+            _usage();
+            return 0;
+        } elsif ($a eq "--install") {
+            $do_install = 1;
+        } elsif ($a eq "--lib") {
+            $i++;
+            if ($i < $argc) { $lib_dir = $ARGV[$i]; }
+        } elsif ($a eq "-o" || $a eq "--output") {
+            $i++;
+            if ($i < $argc) { $out_archive = $ARGV[$i]; }
+        } else {
+            $input = $a;
+        }
+        $i++;
+    }
+
+    if (length($input) == 0) {
+        say(STDERR, "perla-xs: missing input file or directory");
+        _usage();
+        return 1;
+    }
+
+    # Resolve to a source directory. If given a .xs file, use its dirname.
+    my str $src_dir = $input;
+    if (core::is_dir($input) != 1) {
+        if (core::file_exists($input) != 1) {
+            say(STDERR, "perla-xs: not found: " . $input);
+            return 1;
+        }
+        # Given a file — use its containing directory
+        my int $last_slash = -1;
+        my int $si = length($input) - 1;
+        while ($si >= 0) {
+            if (substr($input, $si, 1) eq "/") { $last_slash = $si; last; }
+            $si--;
+        }
+        if ($last_slash >= 0) {
+            $src_dir = substr($input, 0, $last_slash);
+        } else {
+            $src_dir = ".";
+        }
+    }
+
+    # Detect strada/perla root from our own binary
+    my str $strada_dir = _detect_strada_dir();
+    if (length($strada_dir) == 0 || core::is_dir($strada_dir . "/perla/runtime") != 1) {
+        say(STDERR, "perla-xs: could not locate Strada/Perla runtime headers");
+        say(STDERR, "         looked in: " . $strada_dir . "/perla/runtime");
+        return 1;
+    }
+
+    my int $ok = _compile_xs_tree($src_dir, $strada_dir, $out_archive, $verbose);
+    if ($ok == 0) { return 1; }
+
+    if ($do_install == 1) {
+        my int $inst = _install_pm_files($src_dir, $lib_dir, $verbose);
+        if ($inst == 0) {
+            say(STDERR, "perla-xs: .pm installation failed");
+            return 1;
+        }
+    }
+    return 0;
+}
+
+# ------------------------------------------------------------------
+# Locate Strada root from /proc/self/exe
+# Binary sits at <strada>/perla/perla-xs — two levels up.
+# ------------------------------------------------------------------
+func _detect_strada_dir() str {
+    my str $dir = "";
+    __C__ {
+        char buf[1024];
+        ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+        if (len > 0) {
+            buf[len] = '\0';
+            char *sl = strrchr(buf, '/');
+            if (sl) { *sl = '\0'; sl = strrchr(buf, '/'); if (sl) *sl = '\0'; }
+            strada_decref(dir);
+            dir = strada_new_str(buf);
+        }
+    }
+    if (length($dir) == 0) { $dir = "."; }
+    return $dir;
+}
+
+# ------------------------------------------------------------------
+# Compile every .xs + helper .c in the tree. Produce a .xs.a archive.
+# Patches common third-party include macros (ppport.h, mop.h) to use
+# Perla's shim versions.
+# ------------------------------------------------------------------
+func _compile_xs_tree(str $extract_dir, str $strada_dir, str $out_archive, int $verbose) int {
+    my str $perla_runtime = $strada_dir . "/perla/runtime";
+    my str $runtime_dir = $strada_dir . "/runtime";
+    my str $pcre2_dir = $strada_dir . "/vendor/pcre2/src";
+
+    my str $cc = core::getenv("PERLA_CC");
+    if (length($cc) == 0) { $cc = "gcc"; }
+
+    my str $xsubpp = trim(core::qx("which xsubpp 2>/dev/null"));
+    if (length($xsubpp) == 0) {
+        say(STDERR, "perla-xs: xsubpp not found in PATH");
+        say(STDERR, "         install ExtUtils::ParseXS (package: perl-ExtUtils-ParseXS)");
+        return 0;
+    }
+
+    my str $typemap = _find_typemap();
+    if (length($typemap) == 0) {
+        say(STDERR, "perla-xs: no ExtUtils typemap found; xsubpp will use its default");
+    }
+
+    # Find .xs files
+    my str $xs_list = core::qx("find '" . $extract_dir . "' -name '*.xs' 2>/dev/null");
+    my array @xs_files = split("\n", trim($xs_list));
+    if (size(@xs_files) == 0 || length(trim($xs_files[0])) == 0) {
+        say(STDERR, "perla-xs: no .xs files in " . $extract_dir);
+        return 0;
+    }
+
+    # Find helper .c files (not xsubpp output)
+    my str $c_list = core::qx("find '" . $extract_dir . "' -maxdepth 2 -name '*.c' ! -name '*.xs.c' 2>/dev/null");
+    my array @c_files = split("\n", trim($c_list));
+
+    # Infer module name from directory basename (strip version suffix)
+    my str $mod_name = _infer_module_name($extract_dir);
+    if (length($mod_name) == 0) { $mod_name = "xs_module"; }
+
+    say("perla-xs: compiling " . $mod_name
+        . " (" . size(@xs_files) . " .xs, "
+        . size(@c_files) . " .c) with " . $cc);
+
+    my array @obj_files = ();
+
+    # --- Phase 1: .xs → xsubpp → .xs.c → .o
+    my int $xi = 0;
+    while ($xi < size(@xs_files)) {
+        my str $xs = trim($xs_files[$xi]);
+        if (length($xs) == 0) { $xi++; next; }
+
+        my str $base = replace($xs, "\\.xs$", "");
+        my str $c_file = $base . ".xs.c";
+        my str $o_file = $base . ".xs.o";
+
+        if ($verbose == 1) { say("  xsubpp " . $xs); }
+
+        my str $tm_arg = "";
+        if (length($typemap) > 0) { $tm_arg = " -typemap " . $typemap; }
+        my str $xspp_cmd = $xsubpp . $tm_arg . " " . $xs . " > " . $c_file . " 2>/dev/null";
+        core::system($xspp_cmd);
+
+        if (core::file_exists($c_file) != 1) {
+            say(STDERR, "  warning: xsubpp failed for " . $xs);
+            $xi++;
+            next;
+        }
+
+        _patch_c_includes($c_file, $extract_dir);
+
+        my str $compile_cmd = _cc_cmd($cc, $perla_runtime, $runtime_dir, $pcre2_dir, $extract_dir, $o_file, $c_file);
+        if ($verbose == 1) { say("  " . $cc . " -c " . $c_file); }
+        my str $cc_out = core::qx($compile_cmd);
+        if (length($cc_out) > 0 && $verbose == 1) { say("    " . $cc_out); }
+
+        if (core::file_exists($o_file) == 1) {
+            push(@obj_files, $o_file);
+        } else {
+            say(STDERR, "  warning: " . $cc . " failed for " . $c_file);
+            if ($verbose == 0 && length($cc_out) > 0) { say(STDERR, "    " . $cc_out); }
+        }
+        $xi++;
+    }
+
+    # --- Phase 2: plain helper .c files (e.g. mop.c, onig_sources)
+    my int $ci = 0;
+    while ($ci < size(@c_files)) {
+        my str $c_file = trim($c_files[$ci]);
+        if (length($c_file) == 0) { $ci++; next; }
+
+        _patch_c_includes($c_file, $extract_dir);
+
+        my str $o_file = replace($c_file, "\\.c$", ".o");
+        my str $compile_cmd = _cc_cmd($cc, $perla_runtime, $runtime_dir, $pcre2_dir, $extract_dir, $o_file, $c_file);
+        if ($verbose == 1) { say("  " . $cc . " -c " . $c_file); }
+        my str $cc_out = core::qx($compile_cmd);
+        if (core::file_exists($o_file) == 1) {
+            push(@obj_files, $o_file);
+        } else if ($verbose == 1) {
+            say("  (skipped — compile failed: " . $c_file . ")");
+        }
+        $ci++;
+    }
+
+    if (size(@obj_files) == 0) {
+        say(STDERR, "perla-xs: no object files produced");
+        return 0;
+    }
+
+    # --- Phase 3: archive them
+    my str $archive = $out_archive;
+    if (length($archive) == 0) {
+        my str $lib_name = replace_all($mod_name, "-", "_");
+        $archive = $extract_dir . "/" . $lib_name . ".xs.a";
+    }
+    my str $ar_cmd = "ar rcs " . $archive . " " . join(" ", @obj_files);
+    core::system($ar_cmd);
+
+    if (core::file_exists($archive) != 1) {
+        say(STDERR, "perla-xs: ar failed to produce " . $archive);
+        return 0;
+    }
+
+    say("perla-xs: produced " . $archive . " (" . size(@obj_files) . " objects)");
+    say("         link into your perla build with:");
+    say("           perla -o myapp myapp.pl   # (then link " . $archive . " into the exe)");
+    say("         or pass directly to gcc when hand-linking.");
+    return 1;
+}
+
+# ------------------------------------------------------------------
+# Find an ExtUtils typemap. Search common locations.
+# ------------------------------------------------------------------
+func _find_typemap() str {
+    my array @candidates = (
+        "/usr/share/perl/5.42/ExtUtils/typemap",
+        "/usr/share/perl/5.40/ExtUtils/typemap",
+        "/usr/share/perl/5.38/ExtUtils/typemap",
+        "/usr/share/perl/5.36/ExtUtils/typemap"
+    );
+    my int $ci = 0;
+    while ($ci < size(@candidates)) {
+        if (core::file_exists($candidates[$ci]) == 1) { return $candidates[$ci]; }
+        $ci++;
+    }
+    my str $found = trim(core::qx("find /usr/share/perl /usr/lib/perl -name typemap -path '*/ExtUtils/*' 2>/dev/null | head -1"));
+    if (length($found) > 0) { return $found; }
+    return "";
+}
+
+# ------------------------------------------------------------------
+# Module name from path: "Foo-Bar-1.23/" → "Foo-Bar"
+# ------------------------------------------------------------------
+func _infer_module_name(str $dir) str {
+    my str $d = $dir;
+    if (length($d) > 0 && substr($d, length($d) - 1, 1) eq "/") {
+        $d = substr($d, 0, length($d) - 1);
+    }
+    my int $last = -1;
+    my int $i = length($d) - 1;
+    while ($i >= 0) {
+        if (substr($d, $i, 1) eq "/") { $last = $i; last; }
+        $i--;
+    }
+    my str $name = $d;
+    if ($last >= 0) { $name = substr($d, $last + 1, length($d) - $last - 1); }
+    # Strip version suffix: Foo-Bar-1.23 → Foo-Bar
+    $name = replace($name, "-[0-9].*$", "");
+    return $name;
+}
+
+# ------------------------------------------------------------------
+# Rewrite a C source file in-place to use Perla's include shims.
+# Idempotent — safe to call more than once.
+# ------------------------------------------------------------------
+func _patch_c_includes(str $c_file, str $extract_dir) void {
+    if (core::file_exists($c_file) != 1) { return; }
+    my str $src = core::slurp($c_file);
+    my int $changed = 0;
+
+    if (index($src, "#include \"ppport.h\"") >= 0) {
+        $src = replace_all($src, "#include \"ppport.h\"", "/* ppport.h — using Perla compat */");
+        $changed = 1;
+    }
+
+    # mop.h (Moose XS) references ppport.h — produce a patched sibling
+    if (index($src, "#include \"mop.h\"") >= 0) {
+        my str $mop_h = $extract_dir . "/mop.h";
+        if (core::file_exists($mop_h) == 1) {
+            my str $patched = $extract_dir . "/mop_perla.h";
+            if (core::file_exists($patched) != 1) {
+                my str $mop_src = core::slurp($mop_h);
+                $mop_src = replace_all($mop_src, "#include \"ppport.h\"", "/* ppport.h skipped */");
+                core::spew($patched, $mop_src);
+            }
+            $src = replace_all($src, "#include \"mop.h\"", "#include \"mop_perla.h\"");
+            $changed = 1;
+        }
+    }
+
+    if ($changed == 1) { core::spew($c_file, $src); }
+}
+
+# ------------------------------------------------------------------
+# Compose a compile command. Mirrors perla-cpan's flags.
+# ------------------------------------------------------------------
+func _cc_cmd(str $cc, str $perla_runtime, str $runtime_dir, str $pcre2_dir, str $extract_dir, str $o_file, str $c_file) str {
+    my str $pcre2_flags = "";
+    if (core::file_exists($pcre2_dir . "/pcre2.h") == 1) {
+        $pcre2_flags = " -DHAVE_PCRE2 -DPCRE2_STATIC -I" . $pcre2_dir;
+    }
+    return $cc . " -c -w -fPIC -O2"
+        . " -I" . $perla_runtime
+        . " -I" . $runtime_dir
+        . " -I" . $extract_dir
+        . $pcre2_flags
+        . " -o " . $o_file
+        . " " . $c_file
+        . " 2>&1";
+}
+
+# ------------------------------------------------------------------
+# Install .pm files from <dir>/lib into lib_dir, preserving tree shape.
+# Simple recursive copy.
+# ------------------------------------------------------------------
+func _install_pm_files(str $src_dir, str $lib_dir, int $verbose) int {
+    my str $pm_list = core::qx("find '" . $src_dir . "/lib' -name '*.pm' 2>/dev/null");
+    my array @pm_files = split("\n", trim($pm_list));
+    if (size(@pm_files) == 0 || length(trim($pm_files[0])) == 0) {
+        say("perla-xs: no .pm files under " . $src_dir . "/lib — skipping install");
+        return 1;
+    }
+
+    core::system("mkdir -p '" . $lib_dir . "'");
+
+    my int $count = 0;
+    my str $lib_prefix = $src_dir . "/lib/";
+    my int $i = 0;
+    while ($i < size(@pm_files)) {
+        my str $pm = trim($pm_files[$i]);
+        if (length($pm) == 0) { $i++; next; }
+
+        my str $rel = $pm;
+        if (index($rel, $lib_prefix) == 0) {
+            $rel = substr($rel, length($lib_prefix), length($rel) - length($lib_prefix));
+        }
+        my str $dest = $lib_dir . "/" . $rel;
+
+        # Ensure parent dir exists
+        my int $last_slash = -1;
+        my int $si = length($dest) - 1;
+        while ($si >= 0) {
+            if (substr($dest, $si, 1) eq "/") { $last_slash = $si; last; }
+            $si--;
+        }
+        if ($last_slash > 0) {
+            core::system("mkdir -p '" . substr($dest, 0, $last_slash) . "'");
+        }
+
+        core::system("cp '" . $pm . "' '" . $dest . "'");
+        if ($verbose == 1) { say("  " . $rel); }
+        $count++;
+        $i++;
+    }
+    say("perla-xs: installed " . $count . " .pm files to " . $lib_dir);
+    return 1;
+}
+
+func _usage() void {
+    say("perla-xs — compile an existing XS source tree against Perla's perl.h shim");
+    say("");
+    say("Usage:");
+    say("  perla-xs DIR                         Compile XS in DIR → DIR/<Module>.xs.a");
+    say("  perla-xs -o FILE DIR                 Write archive to FILE");
+    say("  perla-xs --install DIR [--lib PATH]  Also install .pm files");
+    say("  perla-xs -v DIR                      Verbose");
+    say("  perla-xs FILE.xs                     Compile a single .xs file");
+    say("");
+    say("Environment:");
+    say("  PERLA_LIB   .pm install directory (default: ~/perla-lib/lib/perl5)");
+    say("  PERLA_CC    override C compiler (default: gcc)");
+    say("");
+    say("This is Path B: feeds the real .xs through xsubpp, then compiles the");
+    say("generated C against Perla's simulated perl.h/XSUB.h (perla/runtime/).");
+    say("The resulting .xs.a links into any perla-built binary.");
+    say("");
+    say("For fetching modules from CPAN, use perla-cpan instead.");
+}
