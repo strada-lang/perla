@@ -3997,6 +3997,17 @@ func gen_stmt(scalar $cg, scalar $node) void {
                     $cg->{"moose_pkgs"}->{$cg->{"pkg"}} = 1;
                     $special = 1;
                 }
+                # `use Moose::Util::TypeConstraints` — export the type DSL
+                # sugar (coerce/from/via/subtype/class_type/...) as no-op stubs
+                # into the calling package so barewords like `from 'HashRef'`
+                # don't fall through to an unrelated same-named sub. perla
+                # neither enforces type constraints nor runs coercions.
+                if ($mod eq "Moose::Util::TypeConstraints" || $mod eq "MooseX::Types::Moose"
+                    || $mod eq "Mouse::Util::TypeConstraints") {
+                    ind($cg); emit($cg, "perla_init_moose_stubs();\n");
+                    ind($cg); emit($cg, "perla_moose_typeconstraints_import(NULL);\n");
+                    $special = 1;
+                }
                 if ($mod eq "Moose::Role" || $mod eq "Any::Moose::Role" || $mod eq "Mouse::Role") {
                     ind($cg); emit($cg, "perla_init_moose_stubs();\n");
                     ind($cg); emit($cg, "perla_moose_role_import(NULL);\n");
@@ -4168,6 +4179,16 @@ func gen_stmt(scalar $cg, scalar $node) void {
                             $ai++;
                         }
                     }
+                    # Exporter::Tiny `-base` / `-extends` convention: `use
+                    # SomeLib -base` makes the calling package inherit from
+                    # SomeLib (Type::Library, Type::Tiny libraries, and many
+                    # Exporter::Tiny consumers rely on this to get `meta`,
+                    # `add_type`, etc.). perla's import dispatch doesn't wire
+                    # this @ISA up on its own, so do it here. Real-world:
+                    # `package Types::Standard; use Type::Library -base;` —
+                    # without the @ISA push, `Types::Standard->meta` is
+                    # unresolvable (undef), breaking every Type::Tiny library.
+                    ind($cg); emit($cg, "for (size_t __bi = 0; __iav && __bi < __iav->size; __bi++) { StradaValue *__be = __iav->elements[__iav->head + __bi]; char *__bs = strada_to_str(__be); if (__bs && (strcmp(__bs, \"-base\") == 0 || strcmp(__bs, \"-extends\") == 0)) { perla_isa_push(\"" . $cg->{"pkg"} . "\", \"" . $mod . "\"); } if (__bs) free(__bs); }\n");
                     ind($cg); emit($cg, "StradaValue *__icls = strada_new_str(\"" . $mod . "\");\n");
                     # Set perla_use_caller_pkg so import handlers like
                     # perla_overload_import can find the right caller
@@ -17177,6 +17198,16 @@ func _gen_assign(scalar $cg, scalar $node) void {
             emit($cg, "; } ");
             gen_expr($cg, $node->{"target"});
             emit($cg, "; })");
+        } elsif ($target_type == Perla::AST::N_DEREF_SCALAR()) {
+            # `${EXPR} //= V` — scalar deref lvalue (symbolic / ref / slot).
+            # Read current; if undef, route the assignment through the plain
+            # `=` deref-scalar path. Mirrors the ||= deref-scalar case.
+            my scalar $da_synth = { "op" => "=", "target" => $target, "value" => $node->{"value"} };
+            emit($cg, "({ StradaValue *__l = ");
+            gen_expr($cg, $target);
+            emit($cg, "; if (!strada_defined_bool(__l)) { __l = ");
+            _gen_assign($cg, $da_synth);
+            emit($cg, "; } __l; })");
         } else {
             # Non-lvalue target (e.g. //= on a call result, anon hash, etc.).
             # Real Perl raises a compile-time error for these. At runtime we
@@ -17239,6 +17270,18 @@ func _gen_assign(scalar $cg, scalar $node) void {
             emit($cg, "; } ");
             gen_expr($cg, $target);
             emit($cg, "; })");
+        } elsif ($target_type == Perla::AST::N_DEREF_SCALAR()) {
+            # `${EXPR} ||= V` — scalar deref (symbolic `${"Pkg::X"}`, `$$ref`,
+            # slot ref) as an lvalue. Read the current value; if falsy, route
+            # the assignment through the plain `=` deref-scalar path (which
+            # handles symbolic-name / ref / slot-ref writes). Real-world:
+            # Type::Library::meta's `${"$_[0]::META"} ||= bless {}, $_[0]`.
+            my scalar $oa_synth = { "op" => "=", "target" => $target, "value" => $node->{"value"} };
+            emit($cg, "({ StradaValue *__l = ");
+            gen_expr($cg, $target);
+            emit($cg, "; if (!perla_to_bool(__l)) { __l = ");
+            _gen_assign($cg, $oa_synth);
+            emit($cg, "; } __l; })");
         } else {
             emit($cg, "({ strada_die(\"%s\", \"Can't modify non-lvalue in ||= assignment\"); strada_new_undef(); })");
         }
@@ -20780,11 +20823,28 @@ func _gen_call(scalar $cg, scalar $node) void {
                     $sv_node->{"name"} = $ch_vname;
                     $args->[0] = $sv_node;
                 }
+                # `chomp($@)` — $@ reads as a lazy-init statement expression
+                # `({ if (!perla_eval_error)…; perla_eval_error; })`, which is
+                # NOT a C lvalue, so the standard `<read> = <chomped>` assign
+                # fails to compile ("lvalue required"). Write the global
+                # directly instead. Real-world: Types::TypeTiny chomps $@ in an
+                # error-formatting path, which blocked Type::Library.pm.o (and
+                # thus DBIx::Class / Type::Tiny) from compiling at all.
+                my int $ch_is_at = 0;
+                if (defined($args->[0]) && $args->[0]->{"type"} == Perla::AST::N_SCALAR_VAR()
+                    && defined($args->[0]->{"name"}) && $args->[0]->{"name"} eq "@") {
+                    $ch_is_at = 1;
+                }
                 emit($cg, "StradaValue *__ch_in = ");
                 gen_expr($cg, $args->[0]);
                 emit($cg, "; char *__s = strada_to_str(__ch_in); size_t __sl_pre = __s ? strlen(__s) : 0; char *__c = perla_chomp_irs(__s); size_t __sl_post = __c ? strlen(__c) : 0; ");
-                gen_expr($cg, $args->[0]);
-                emit($cg, " = strada_new_str_like(__c, __ch_in); free(__s); free(__c); STRADA_MAKE_TAGGED_INT((int64_t)(__sl_pre - __sl_post)); })");
+                if ($ch_is_at == 1) {
+                    emit($cg, "{ StradaValue *__ch_nv = strada_new_str_like(__c, __ch_in); if (perla_eval_error) strada_decref(perla_eval_error); perla_eval_error = __ch_nv; } ");
+                    emit($cg, "free(__s); free(__c); STRADA_MAKE_TAGGED_INT((int64_t)(__sl_pre - __sl_post)); })");
+                } else {
+                    gen_expr($cg, $args->[0]);
+                    emit($cg, " = strada_new_str_like(__c, __ch_in); free(__s); free(__c); STRADA_MAKE_TAGGED_INT((int64_t)(__sl_pre - __sl_post)); })");
+                }
             } else {
                 # Array-style: chomp(@arr) chomps each element in place.
                 # Evaluate the arg to produce the array (whether `@arr` alone

@@ -462,6 +462,7 @@ StradaValue *perla_mop_get_all_attributes(StradaValue *args);
 static StradaValue *perla_mop_set_slot_value(StradaValue *args);
 static StradaValue *perla_mop_get_slot_value(StradaValue *args);
 StradaValue *perla_moose_import(StradaValue *args);
+StradaValue *perla_moose_typeconstraints_import(StradaValue *args);
 StradaValue *perla_moose_role_import(StradaValue *args);
 static StradaValue *perla_moose_object_new(StradaValue *args);
 static StradaValue *perla_moose_native_has(StradaValue *args);
@@ -17186,6 +17187,36 @@ StradaValue *perla_moose_import(StradaValue *args) {
     /* Set up @ISA for the calling package */
     perla_isa_push(target, "Moose::Object");
     /* Set strict/warnings (no-op in Perla) */
+    return STRADA_MAKE_TAGGED_INT(1);
+}
+
+/* `use Moose::Util::TypeConstraints` — export the type-constraint DSL sugar
+ * (coerce/from/via/subtype/as/where/class_type/enum/...) into the calling
+ * package. perla doesn't enforce Moose type constraints or run coercions, so
+ * these are no-ops; the critical job is to BIND the names in the calling
+ * package so a bareword like `from 'HashRef'` resolves here instead of falling
+ * back through the global code registry to an unrelated same-named sub (e.g.
+ * DBIx::Class::ResultSource::Table::from), which would then receive 'HashRef'
+ * as an invocant and die "Can't locate object method name". Real-world:
+ * Abe::Search::Source::DBI's `coerce 'X', from 'HashRef', via { ... }`. */
+StradaValue *perla_moose_typeconstraints_import(StradaValue *args) {
+    (void)args;
+    const char *target = "main";
+    if (perla_call_depth > 0) {
+        const char *pkg = perla_call_stack[perla_call_depth - 1].package;
+        if (pkg && pkg[0]) target = pkg;
+    }
+    static const char *tc_words[] = {
+        "type", "subtype", "as", "where", "message", "inline_as",
+        "coerce", "from", "via", "class_type", "role_type", "duck_type",
+        "enum", "union", "maybe_type", "find_type_constraint",
+        "register_type_constraint", "match_on_type", "create_type_constraint",
+        "coerce_named", NULL
+    };
+    for (int i = 0; tc_words[i]; i++) {
+        perla_code_set(target, tc_words[i],
+                       strada_cpointer_new((void*)perla_noop_undef));
+    }
     return STRADA_MAKE_TAGGED_INT(1);
 }
 
