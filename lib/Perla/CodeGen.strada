@@ -10186,7 +10186,19 @@ func gen_expr(scalar $cg, scalar $node) void {
             my scalar $ae_arr = ($operand->{"type"} == Perla::AST::N_ARRAY_ELEM())
                 ? $operand->{"array"} : $operand->{"object"};
             emit($cg, "({ StradaArray *__sref_av = strada_deref_array(");
-            gen_expr($cg, $ae_arr);
+            # `\$_[N]` indexes @_ (perla_at_), NOT the scalar $_ — mirror the
+            # read/writeback special-case. Without this, gen_expr emitted the
+            # scalar $_ (perla_dollar_underscore), strada_deref_array(scalar)
+            # was NULL, and `\$_[0]` yielded undef → ref(\$_[0]) was "" not
+            # "SCALAR". Broke Specio::TypeChecks::is_Str (`ref(\$_[0]) eq
+            # 'SCALAR'`), which rejected every value and blocked DateTime's
+            # Specio type construction.
+            if (defined($ae_arr) && $ae_arr->{"type"} == Perla::AST::N_SCALAR_VAR()
+                && defined($ae_arr->{"name"}) && $ae_arr->{"name"} eq "_") {
+                emit($cg, "perla_at_");
+            } else {
+                gen_expr($cg, $ae_arr);
+            }
             emit($cg, "); int __sref_i = (int)strada_to_int(");
             gen_expr($cg, $operand->{"index"});
             emit($cg, "); StradaValue *__sref_r; ");
@@ -10367,7 +10379,12 @@ func gen_expr(scalar $cg, scalar $node) void {
         emit($cg, "StradaValue *__map_prev_du = perla_dollar_underscore; ");
         emit($cg, "int __sav_wl_lu = __perla_want_list; __perla_want_list = 1; StradaValue *__ml = ");
         gen_expr($cg, $node->{"list"});
-        emit($cg, "; __perla_want_list = __sav_wl_lu; StradaArray *__mla = strada_deref_array(__ml); ");
+        emit($cg, "; __perla_want_list = __sav_wl_lu; ");
+        # `map BLOCK %hash` iterates the hash's flattened key/value pairs.
+        # strada_deref_array is NULL for a hash, so without this the hash fell
+        # to the scalar-wrap below and was mapped once as a single hashref.
+        emit($cg, "StradaValue *__ml_hf = perla_hash_kv_list(__ml); StradaValue *__ml_eff = __ml_hf ? __ml_hf : __ml; ");
+        emit($cg, "StradaArray *__mla = strada_deref_array(__ml_eff); ");
         # Scalar-in-list-context: wrap as 1-element array. Mirrors grep fix.
         emit($cg, "StradaArray *__mla_tmp = NULL; if (!__mla && __ml) { __mla_tmp = strada_array_new(); strada_array_push(__mla_tmp, __ml); strada_incref(__ml); __mla = __mla_tmp; } ");
         emit($cg, "int __mlen = __mla ? strada_array_length(__mla) : 0; ");
@@ -10405,6 +10422,8 @@ func gen_expr(scalar $cg, scalar $node) void {
         if ($ml_borrowed == 0) {
             emit($cg, "if (__ml) strada_decref(__ml); ");
         }
+        # Free the temporary flattened hash kv-list, if one was built.
+        emit($cg, "if (__ml_hf) strada_decref(__ml_hf); ");
         # In scalar context, map returns the count of elements in the
         # output list (Perl). Same fix as grep.
         emit($cg, "(__perla_want_list == 0) ? ({ int64_t __mc = (int64_t)(__mav ? __mav->size : 0); strada_decref(__ma); STRADA_MAKE_TAGGED_INT(__mc); }) : __ma; })");
@@ -10735,7 +10754,10 @@ func gen_expr(scalar $cg, scalar $node) void {
         emit($cg, "({ StradaValue *__ga = strada_new_array(); StradaArray *__gav = strada_deref_array(__ga); ");
         emit($cg, "int __sav_wl_lu = __perla_want_list; __perla_want_list = 1; StradaValue *__gl = ");
         gen_expr($cg, $node->{"list"});
-        emit($cg, "; __perla_want_list = __sav_wl_lu; StradaArray *__gla = strada_deref_array(__gl); ");
+        emit($cg, "; __perla_want_list = __sav_wl_lu; ");
+        # `grep BLOCK %hash` iterates the hash's flattened key/value pairs.
+        emit($cg, "StradaValue *__gl_hf = perla_hash_kv_list(__gl); StradaValue *__gl_eff = __gl_hf ? __gl_hf : __gl; ");
+        emit($cg, "StradaArray *__gla = strada_deref_array(__gl_eff); ");
         # Scalar-in-list-context: `grep { } ($text)` and `grep { } $text`
         # should iterate the scalar as a 1-element list. Without this,
         # strada_deref_array(scalar) returns NULL and the loop runs 0
@@ -10768,6 +10790,7 @@ func gen_expr(scalar $cg, scalar $node) void {
         emit($cg, "if (__gkeep) strada_array_push(__gav, perla_dollar_underscore); } ");
         emit($cg, "perla_dollar_underscore = __gr_prev_du; ");
         emit($cg, "if (__gla_tmp) strada_free_array(__gla_tmp); ");
+        emit($cg, "if (__gl_hf) strada_decref(__gl_hf); ");
         emit($cg, "(__perla_want_list == 0) ? ({ int64_t __gc = (int64_t)(__gav ? __gav->size : 0); strada_decref(__ga); STRADA_MAKE_TAGGED_INT(__gc); }) : __ga; })");
         return;
     }

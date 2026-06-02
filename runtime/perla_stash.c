@@ -24546,6 +24546,31 @@ StradaValue *perla_undef_coderef(void) {
     return cv;
 }
 
+/* Flatten a hash SV into a NEW owned array of (key, value, key, value, ...)
+ * for list-context iteration. `map BLOCK %h` and `grep BLOCK %h` must iterate
+ * the hash's flattened key/value pairs (Perl semantics); the map/grep codegen
+ * used strada_deref_array on the list value, which is NULL for a hash, so the
+ * hash fell through to the scalar-wrap and was iterated once as a single
+ * hashref. Returns NULL when `hv` isn't a hash so the caller keeps its normal
+ * path. */
+StradaValue *perla_hash_kv_list(StradaValue *hv) {
+    if (!hv || STRADA_IS_TAGGED_INT(hv) || hv->type != STRADA_HASH) return NULL;
+    StradaValue *out = strada_new_array();
+    StradaArray *oa = strada_deref_array(out);
+    StradaArray *keys = strada_hash_keys(strada_deref_hash(hv));
+    int n = keys ? (int)strada_array_length(keys) : 0;
+    for (int i = 0; i < n; i++) {
+        StradaValue *k = strada_array_get(keys, i);
+        strada_incref(k);
+        strada_array_push_take(oa, k);
+        char *ks = strada_to_str(k);
+        strada_array_push_take(oa, strada_hv_fetch_owned(hv, ks));
+        free(ks);
+    }
+    if (keys) strada_decref(strada_new_array_from_av(keys));
+    return out;
+}
+
 StradaValue *perla_undef_coderef_named(const char *name) {
     if (name) {
         snprintf(g_undef_coderef_name, sizeof(g_undef_coderef_name), "%s", name);

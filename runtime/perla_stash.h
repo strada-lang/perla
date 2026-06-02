@@ -166,6 +166,7 @@ StradaValue *perla_str_xor(StradaValue *a, StradaValue *b);
  * "CODE"; calling it dies "Undefined subroutine called". */
 StradaValue *perla_undef_coderef(void);
 StradaValue *perla_undef_coderef_named(const char *name);
+StradaValue *perla_hash_kv_list(StradaValue *hv);
 
 void perla_mark_loaded(const char *module);
 void perla_set_mro(const char *pkg, const char *algo);
