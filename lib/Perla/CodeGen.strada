@@ -5661,6 +5661,27 @@ func _gen_my(scalar $cg, scalar $node) void {
                     # `my ($P, %e, %o) = caller . '::';` where $P silently
                     # ended up undef and `@{$P.ISA} = ...` hit a bogus
                     # symbol.
+                    # `shift`/`pop` return a SINGLE SCALAR — never a list — so
+                    # `my ($x) = shift` must bind that one scalar to $x, even
+                    # when it's an arrayref. Deref-flattening it (the array path
+                    # below) wrongly spreads an arrayref's elements, so
+                    # `my ($opt_list) = shift` got element 0 instead of the
+                    # arrayref. Concrete victim: Data::OptList::mkopt (used by
+                    # Sub::Exporter / Moose::Exporter). Generate the op in scalar
+                    # context and wrap its result as a one-element list.
+                    my int $di_is_scalar_op = 0;
+                    my scalar $di_init = $node->{"init"};
+                    if (defined($di_init) && $di_init->{"type"} == Perla::AST::N_CALL()
+                        && defined($di_init->{"name"})
+                        && ($di_init->{"name"} eq "shift" || $di_init->{"name"} eq "pop")) {
+                        $di_is_scalar_op = 1;
+                    }
+                    if ($di_is_scalar_op == 1) {
+                        ind($cg); emit($cg, "{ int __sav_wl_dl = __perla_want_list; __perla_want_list = 0; StradaValue *__dl = ");
+                        gen_expr($cg, $node->{"init"});
+                        emit($cg, "; __perla_want_list = __sav_wl_dl; StradaValue *__dl_fallback = strada_new_array(); { StradaArray *__sf = strada_deref_array(__dl_fallback); if (__dl) { strada_incref(__dl); strada_array_push(__sf, __dl); } } StradaArray *__da = strada_deref_array(__dl_fallback); ");
+                        emit($cg, "int __dlen = __da ? strada_array_length(__da) : 0;\n");
+                    } else {
                     ind($cg); emit($cg, "{ int __sav_wl_dl = __perla_want_list; __perla_want_list = 1; StradaValue *__dl = ");
                     gen_expr($cg, $node->{"init"});
                     emit($cg, "; __perla_want_list = __sav_wl_dl; StradaArray *__da = strada_deref_array(__dl); ");
@@ -5680,6 +5701,7 @@ func _gen_my(scalar $cg, scalar $node) void {
                     emit($cg, "  } strada_free_array(__hf_keys); } __da = __hf_av; ");
                     emit($cg, "} else if (!__da && __dl) { __dl_fallback = strada_new_array(); strada_array_push(strada_deref_array(__dl_fallback), __dl); __da = strada_deref_array(__dl_fallback); } ");
                     emit($cg, "int __dlen = __da ? strada_array_length(__da) : 0;\n");
+                    }
                     $di = 0;
                     while ($di < $nv) {
                         my str $dname = $vars->[$di]->{"value"};
