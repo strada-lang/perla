@@ -25080,8 +25080,49 @@ func _gen_method_call(scalar $cg, scalar $node) void {
     # calls — when an arg is a bare N_SCALAR_VAR, propagate any change
     # the callee made to the slot back to the caller's variable. Index
     # 0 of __a is the object, so user args start at 1.
+    #
+    # SKIP the whole writeback when any arg is a FLATTENING expression
+    # (%hash, @arr, %{$ref}, @{$ref}, a list-returning call, slice, range,
+    # qw, or a non-ref anon-list): such an arg occupies a variable number
+    # of slots, so the `$mwb_ai + 1` slot math is wrong for every arg after
+    # it. Worse, the callee's `my $self = shift` mutates the SHARED arg
+    # array, sliding later slots down — so a scalar-var arg's writeback
+    # reads a flattened value and clobbers the caller's lexical. Concrete
+    # victim: Type::Library::add_type's
+    # `'Type::Tiny'->new( library => $class, %{ $_[0] } )` overwrote $class
+    # with "name" (the typedef's first key), so every Type::Tiny type sub
+    # installed in package "name" instead of the library.
+    my int $mwb_has_flatten = 0;
+    {
+        my int $mwb_fi = 0;
+        while ($mwb_fi < $argc) {
+            my scalar $mwb_fa = $args->[$mwb_fi];
+            if (defined($mwb_fa)) {
+                my int $mwb_ft = $mwb_fa->{"type"};
+                if ($mwb_ft == Perla::AST::N_ARRAY_VAR()
+                    || $mwb_ft == Perla::AST::N_HASH_VAR()
+                    || $mwb_ft == Perla::AST::N_DEREF_ARRAY()
+                    || $mwb_ft == Perla::AST::N_DEREF_HASH()
+                    || $mwb_ft == Perla::AST::N_CALL()
+                    || $mwb_ft == Perla::AST::N_METHOD()
+                    || $mwb_ft == Perla::AST::N_MAP()
+                    || $mwb_ft == Perla::AST::N_GREP()
+                    || $mwb_ft == Perla::AST::N_SORT()
+                    || $mwb_ft == Perla::AST::N_RANGE()
+                    || $mwb_ft == Perla::AST::N_QWORD()
+                    || $mwb_ft == Perla::AST::N_ARRAY_SLICE()
+                    || $mwb_ft == Perla::AST::N_HASH_SLICE()
+                    || ($mwb_ft == Perla::AST::N_ANON_ARRAY()
+                        && !(defined($mwb_fa->{"is_ref"}) && $mwb_fa->{"is_ref"} == 1))) {
+                    $mwb_has_flatten = 1;
+                    last;
+                }
+            }
+            $mwb_fi = $mwb_fi + 1;
+        }
+    }
     my int $mwb_ai = 0;
-    while ($mwb_ai < $argc) {
+    while ($mwb_has_flatten == 0 && $mwb_ai < $argc) {
         my scalar $mwb_arg = $args->[$mwb_ai];
         if (defined($mwb_arg) && $mwb_arg->{"type"} == Perla::AST::N_SCALAR_VAR()
             && defined($mwb_arg->{"name"}) && length($mwb_arg->{"name"}) > 0
@@ -25098,7 +25139,12 @@ func _gen_method_call(scalar $cg, scalar $node) void {
                 my str $mwb_cv = c_var($mwb_name);
                 # Arg slot in __a is at position $mwb_ai + 1 (slot 0 is __obj).
                 my int $mwb_slot = $mwb_ai + 1;
-                emit($cg, "if (__av && __av->size > " . $mwb_slot . ") { ");
+                # `__av->head == 0` — the callee left @_ unshifted. __a is a
+                # fresh array (head 0) before dispatch; a callee `my $self =
+                # shift` slides head forward, after which slot $mwb_slot reads
+                # the wrong (slid) element. Mirrors the plain-sub-call
+                # writeback's __a_head_before guard.
+                emit($cg, "if (__av && __av->head == 0 && __av->size > " . $mwb_slot . ") { ");
                 emit($cg, "StradaValue *__mwb" . $mwb_ai . " = strada_array_get(__av, " . $mwb_slot . "); ");
                 emit($cg, "if (__mwb" . $mwb_ai . " != " . $mwb_cv . ") { ");
                 emit($cg, "if (__mwb" . $mwb_ai . ") strada_incref(__mwb" . $mwb_ai . "); ");
