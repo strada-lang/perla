@@ -8,6 +8,22 @@
 package Perla::Lexer;
 
 func lex(str $source) array {
+    # PERF: the lexer scans the source one position at a time via
+    # substr($source, $pos, 1). Strada's substr is CHARACTER-indexed, so on a
+    # UTF-8-flagged string (any source containing a non-ASCII byte) each access
+    # is O($pos) — turning the whole lex into O(n^2). A single unicode byte in a
+    # large file (e.g. IO::Socket::SSL::PublicSuffix's ~12k-line embedded TLD
+    # list, whose IDN comments contain Arabic/Cyrillic/etc.) made lexing take
+    # 25+ minutes. The lexer is byte-oriented — it copies multibyte sequences
+    # straight through into token values — so clear the UTF-8 flag up front to
+    # make substr O(1) byte access. The bytes (and thus token contents) are
+    # unchanged; string-literal UTF-8 semantics are reapplied downstream in
+    # codegen based on each literal's own content.
+    __C__ {
+        if (source && !STRADA_IS_TAGGED_INT(source) && source->type == STRADA_STR) {
+            strada_set_utf8_flag(source, 0);
+        }
+    }
     my array @tokens = ();
     my int $len = length($source);
     my hash %lx = ();
