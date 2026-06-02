@@ -136,6 +136,22 @@ func emit_subst_writeback(scalar $cg, scalar $target, str $src_c) void {
                 Perla::CodeGen::emit($cg, "perla_scalar_set(\"" . $wpkg . "\", \"" . $wshort . "\", " . $src_c . "); strada_decref(" . $src_c . "); ");
                 return;
             }
+            # Bare `our $VERSION` (package global accessed without the ::
+            # prefix): gen_expr reads it through a local static mirror, so the
+            # plain-lvalue path below would update only the mirror and leave
+            # the stash stale — `$Pkg::VERSION` (read via perla_scalar_get by
+            # UNIVERSAL::VERSION) keeps the OLD value. Plain `$VERSION = X`
+            # already routes through perla_scalar_set; mirror that here so
+            # in-place s///tr/// on an `our` scalar persists to the stash.
+            # Surfaced by List::Util/Scalar::Util/Sub::Util's
+            # `our $VERSION = "1.68_01"; $VERSION =~ tr/_//d;` — without this,
+            # $List::Util::VERSION stayed "1.68_01" (numifies to 1.68) and
+            # Sub::Util's `List::Util->VERSION(1.6801)` self-check died.
+            if (defined($cg->{"our_vars"}) && defined($cg->{"our_vars"}->{$tvname})) {
+                my str $opkg = "" . $cg->{"pkg"};
+                Perla::CodeGen::emit($cg, "perla_scalar_set(\"" . $opkg . "\", \"" . $tvname . "\", " . $src_c . "); strada_decref(" . $src_c . "); ");
+                return;
+            }
             # Parameter writeback: the param was incref'd + cleanup_push'd
             # at function entry. If we decref the old value here, then
             # cleanup_drain at function exit will decref it AGAIN via the
