@@ -24486,7 +24486,16 @@ func _gen_method_call(scalar $cg, scalar $node) void {
         my scalar $obj_node = $node->{"object"};
         my int $is_static_class = 0;
         my str $class_name = "";
-        if (defined($obj_node) && $obj_node->{"type"} == Perla::AST::N_CALL() && defined($obj_node->{"name"}) && scalar(@{$obj_node->{"args"}}) == 0) {
+        # EXPLICIT parens make it a function CALL, not a class name:
+        # `Foo->method` is a class-method call, but `Foo()->method` calls Foo()
+        # and invokes ->method on its RESULT (Perl semantics). Without the
+        # has_parens guard, `Foo()` collapsed to the bareword class "Foo" and
+        # the `()` was dropped — e.g. Types::Standard's
+        # `Value()->inline_check('$val')` became `"Value"->inline_check(...)`
+        # → "Can't locate object method inline_check via package Value".
+        # Affects every `SomeType()->inline_check/coercion/...` in Type::Tiny.
+        if (defined($obj_node) && $obj_node->{"type"} == Perla::AST::N_CALL() && defined($obj_node->{"name"}) && scalar(@{$obj_node->{"args"}}) == 0
+            && !(defined($obj_node->{"has_parens"}) && $obj_node->{"has_parens"} == 1)) {
             my str $cn = $obj_node->{"name"};
             if (length($cn) > 0 && char_at($cn, 0) >= 65 && char_at($cn, 0) <= 90) {
                 $is_static_class = 1;
@@ -24562,7 +24571,8 @@ func _gen_method_call(scalar $cg, scalar $node) void {
         my str $can_class = "";
         if (defined($can_obj) && $can_obj->{"type"} == Perla::AST::N_CALL()
             && defined($can_obj->{"name"})
-            && (!defined($can_obj->{"args"}) || scalar(@{$can_obj->{"args"}}) == 0)) {
+            && (!defined($can_obj->{"args"}) || scalar(@{$can_obj->{"args"}}) == 0)
+            && !(defined($can_obj->{"has_parens"}) && $can_obj->{"has_parens"} == 1)) {
             my str $cn = $can_obj->{"name"};
             if (length($cn) > 0 && char_at($cn, 0) >= 65 && char_at($cn, 0) <= 90) {
                 $can_is_static = 1;
