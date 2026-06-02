@@ -2409,6 +2409,20 @@ func expr_is_borrowed(scalar $node) int {
             return 0;
         }
     }
+    # Ternary `COND ? A : B` yields one of its branches. If EITHER branch is
+    # borrowed (a sub-local `my` scalar, a deref view, …), the whole result may
+    # be borrowed, so callers that decide incref-on-keep (notably the `return`
+    # path) must treat it as borrowed and incref — otherwise sub-exit cleanup
+    # decrefs the local and the returned pointer dangles. Concrete victim:
+    # Type::Tiny::inline_check's `return @r == 1 ? $r : "($r)"` returned a
+    # freed string, so Eval::TypeTiny compiled a garbled
+    # `<freed>lar::Util::blessed(...)` check ("Scalar" → garbage) and DBIx::Class
+    # type checks died "Undefined subroutine &lar::Util::blessed".
+    if ($t == Perla::AST::N_TERNARY()) {
+        if (defined($node->{"then"}) && expr_is_borrowed($node->{"then"}) == 1) { return 1; }
+        if (defined($node->{"else"}) && expr_is_borrowed($node->{"else"}) == 1) { return 1; }
+        return 0;
+    }
     return 0;
 }
 
