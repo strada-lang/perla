@@ -1704,6 +1704,26 @@ void perla_init(void) {
         strada_decref(export_ok);
     }
 
+    /* Clone::clone — XS-only deep copy. Same engine as Storable::dclone
+     * (strada_clone, now cycle-aware + coderef-preserving). Specio::XS does
+     * `use Clone qw(clone); sub _clone { clone(shift) }`; without a native
+     * Clone::clone, the imported `clone` was undefined and the unqualified
+     * call resolved to Specio::OO::clone (a same-named method), which then
+     * died "Can't call method _attrs on unblessed reference" when handed a
+     * plain ref. Seed @ISA=(Exporter) + @EXPORT_OK=(clone) so
+     * `use Clone qw(clone)` imports it. */
+    perla_code_set("Clone", "clone", strada_cpointer_new((void*)perla_storable_dclone));
+    {
+        StradaValue *cisa = strada_new_array();
+        strada_array_push_take(cisa->value.av, strada_new_str("Exporter"));
+        perla_isa_assign("Clone::ISA", cisa);
+        strada_decref(cisa);
+        StradaValue *ceok = strada_new_array();
+        strada_array_push_take(ceok->value.av, strada_new_str("clone"));
+        perla_array_set("Clone", "EXPORT_OK", ceok);
+        strada_decref(ceok);
+    }
+
     /* List::Util — XS in real Perl, but perla doesn't reliably bootstrap
      * its .so at runtime. SAC's special_op dispatch
      * (`List::Util::first { $op =~ $_->{regex} }`) returned undef which
