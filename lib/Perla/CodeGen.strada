@@ -7508,9 +7508,24 @@ func _gen_foreach_inner(scalar $cg, scalar $node) void {
     # (`for $k ()` — empty list — leaves __fe_av=NULL with len=0, correct.)
     # `for (undef)` / `for ($x)` where $x is undef iterates once with
     # $_=undef per Perl — wrap the undef value into a 1-elem array too.
-    ind($cg); emit($cg, "if (!__fe_av && __fe_arr && !STRADA_IS_TAGGED_INT(__fe_arr)) { ");
-    emit($cg, "__fe_fb = strada_new_array(); strada_array_push(strada_deref_array(__fe_fb), __fe_arr); __fe_av = strada_deref_array(__fe_fb); ");
-    emit($cg, "} else if (!__fe_av && STRADA_IS_TAGGED_INT(__fe_arr)) { __fe_fb = strada_new_array(); strada_array_push(strada_deref_array(__fe_fb), __fe_arr); __fe_av = strada_deref_array(__fe_fb); }\n");
+    # The 1-element scalar wrap is ONLY for genuinely scalar list exprs
+    # (`for ($x)`, `for (CALL())`). For an EXPLICIT array expr (`@arr`, `@$ref`,
+    # `@{EXPR}`), an undef/empty deref means ZERO iterations, not one over a
+    # phantom undef. Without this guard, `for my $a (@$undef)` iterated once
+    # (Perl: zero) — e.g. Moose::Exporter::_parse_trait_aliases' `for my $alias
+    # (@$aliases)` with undef trait_aliases produced a bogus empty export name.
+    my int $fe_is_array_list = 0;
+    if (defined($node->{"list"})) {
+        my int $felt = $node->{"list"}->{"type"};
+        if ($felt == Perla::AST::N_ARRAY_VAR() || $felt == Perla::AST::N_DEREF_ARRAY()) {
+            $fe_is_array_list = 1;
+        }
+    }
+    if ($fe_is_array_list == 0) {
+        ind($cg); emit($cg, "if (!__fe_av && __fe_arr && !STRADA_IS_TAGGED_INT(__fe_arr)) { ");
+        emit($cg, "__fe_fb = strada_new_array(); strada_array_push(strada_deref_array(__fe_fb), __fe_arr); __fe_av = strada_deref_array(__fe_fb); ");
+        emit($cg, "} else if (!__fe_av && STRADA_IS_TAGGED_INT(__fe_arr)) { __fe_fb = strada_new_array(); strada_array_push(strada_deref_array(__fe_fb), __fe_arr); __fe_av = strada_deref_array(__fe_fb); }\n");
+    }
     ind($cg); emit($cg, "int __fe_len = __fe_av ? strada_array_length(__fe_av) : 0;\n");
     # Outer local-chain mark so `last` / `break` (which skip the
     # per-iteration restore at the bottom of the body) still unwinds
