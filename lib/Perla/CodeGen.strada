@@ -10209,6 +10209,23 @@ func gen_expr(scalar $cg, scalar $node) void {
             emit($cg, "} else { __sref_r = strada_new_undef(); } __sref_r; })");
             return;
         }
+        # `\%{EXPR}` / `\@{EXPR}` — a ref to a hash/array deref must yield the
+        # CONTAINER, not its scalar-context reduction. N_DEREF_HASH /
+        # N_DEREF_ARRAY collapse to the key/element COUNT (a tagged int) when
+        # __perla_want_list==0, so `\%{...}` in scalar context (e.g. `my $r =
+        # \%{"Pkg::"}`) reffed the count → ref() was "SCALAR" not "HASH".
+        # Force list context so the deref returns the hash/array. Concrete
+        # victim: Role::Tiny::_getstash (`\%{"$_[0]::"}`) returned a scalar
+        # ref to a number, so _all_subs found no subs → roles never applied →
+        # Specio's `does` checks failed loading DateTime types.
+        if (defined($operand)
+            && ($operand->{"type"} == Perla::AST::N_DEREF_HASH()
+                || $operand->{"type"} == Perla::AST::N_DEREF_ARRAY())) {
+            emit($cg, "strada_ref_create(({ int __rdwl = __perla_want_list; __perla_want_list = 1; StradaValue *__rdv = ");
+            gen_expr($cg, $operand);
+            emit($cg, "; __perla_want_list = __rdwl; __rdv; }))");
+            return;
+        }
         emit($cg, "strada_ref_create(");
         gen_expr($cg, $operand);
         emit($cg, ")");
