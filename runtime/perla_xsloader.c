@@ -263,6 +263,29 @@ StradaValue *perla_xsloader_load(StradaValue *args) {
         av = args->value.av;
     }
     if (!av || av->size < 1) {
+        /* Modern XSLoader convention: `XSLoader::load()` with no args loads
+         * the XS for the CALLER's package (XSLoader derives it from caller()).
+         * perla used to die here, so any module using the no-arg form (a
+         * common idiom, e.g. via `use XSLoader; XSLoader::load();`) aborted.
+         * Walk the call stack for the nearest frame that isn't XSLoader /
+         * DynaLoader and re-enter with that package name. */
+        const char *cpkg = NULL;
+        for (int i = perla_call_depth - 1; i >= 0; i--) {
+            const char *p = perla_call_stack[i].package;
+            if (p && p[0]
+                && strcmp(p, "XSLoader") != 0
+                && strcmp(p, "DynaLoader") != 0) {
+                cpkg = p;
+                break;
+            }
+        }
+        if (cpkg) {
+            StradaValue *fake = strada_new_array();
+            strada_array_push_take(fake->value.av, strada_new_str(cpkg));
+            StradaValue *r = perla_xsloader_load(fake);
+            strada_decref(fake);
+            return r;
+        }
         strada_die("XSLoader::load requires a module name");
         return strada_new_undef();
     }
