@@ -100,6 +100,8 @@ static int perla_does_check(const char *pkg, const char *target, int max_depth);
 static void perla_moose_add_role(const char *pkg, const char *role);
 static StradaValue *perla_mro_get_linear_isa(StradaValue *args);
 static StradaValue *perla_mro_is_universal(StradaValue *args);
+static StradaValue *perla_mro_set_mro(StradaValue *args);
+static StradaValue *perla_mro_get_mro(StradaValue *args);
 static StradaValue *perla_universal_can(StradaValue *args);
 static StradaValue *perla_universal_version(StradaValue *args);
 static StradaValue *perla_exporter_import(StradaValue *args);
@@ -1372,6 +1374,8 @@ void perla_init(void) {
      * the standard Perl MRO walk instead of its own fallback. */
     perla_code_set_protected("mro", "get_linear_isa", strada_cpointer_new((void*)perla_mro_get_linear_isa));
     perla_code_set("mro", "is_universal", strada_cpointer_new((void*)perla_mro_is_universal));
+    perla_code_set("mro", "set_mro", strada_cpointer_new((void*)perla_mro_set_mro));
+    perla_code_set("mro", "get_mro", strada_cpointer_new((void*)perla_mro_get_mro));
 
     /* Exporter::import: real implementation that copies @EXPORT /
      * @EXPORT_OK / %EXPORT_TAGS symbols into the caller's stash.
@@ -4775,6 +4779,37 @@ void perla_set_mro(const char *pkg, const char *algo) {
     PerlStash *stash = perla_stash_get_or_create(pkg);
     if (!stash) return;
     stash->mro_c3 = (strcmp(algo, "c3") == 0) ? 1 : 0;
+}
+
+/* mro::set_mro($class, $type) — set a package's method resolution order
+ * to 'dfs' or 'c3'. MRO::Compat / Class::C3::Componentised call this as a
+ * plain function (not the `use mro` pragma). Without it registered,
+ * DBIx::Class component loading dies "Undefined subroutine &mro::set_mro".
+ * Records the algorithm on the stash (next::method honours it). */
+static StradaValue *perla_mro_set_mro(StradaValue *args) {
+    StradaArray *av = args ? strada_deref_array(args) : NULL;
+    if (!av || av->size < 2) return strada_new_undef();
+    char *pkg = strada_to_str(av->elements[av->head + 0]);
+    char *algo = strada_to_str(av->elements[av->head + 1]);
+    if (pkg && algo) perla_set_mro(pkg, algo);
+    if (pkg) free(pkg);
+    if (algo) free(algo);
+    return strada_new_undef();
+}
+
+/* mro::get_mro($class) — return the package's MRO type as a string,
+ * 'c3' or 'dfs' (default). Mirrors perla_set_mro's stash->mro_c3 flag. */
+static StradaValue *perla_mro_get_mro(StradaValue *args) {
+    StradaArray *av = args ? strada_deref_array(args) : NULL;
+    if (!av || av->size < 1) return strada_new_str("dfs");
+    char *pkg = strada_to_str(av->elements[av->head + 0]);
+    const char *r = "dfs";
+    if (pkg) {
+        PerlStash *stash = perla_stash_get_or_create(pkg);
+        if (stash && stash->mro_c3) r = "c3";
+        free(pkg);
+    }
+    return strada_new_str(r);
 }
 
 /* mro::is_universal($pkg) — every class is in UNIVERSAL's ISA chain.
@@ -11480,7 +11515,18 @@ StradaValue *perla_method_dispatch(StradaValue *obj, const char *method, StradaV
      * perla looked up the literal method name "UNIVERSAL::isa" in the
      * object's class and threw "Can't locate". */
     {
-        const char *dcolon = strstr(method, "::");
+        /* Split on the LAST "::" so multi-level packages resolve correctly:
+         * $obj->Type::Tiny::_install_overloads(...) => pkg "Type::Tiny",
+         * method "_install_overloads". Splitting on the first "::" (strstr)
+         * would wrongly give pkg "Type", method "Tiny::_install_overloads". */
+        const char *dcolon = NULL;
+        {
+            const char *scan = method;
+            while ((scan = strstr(scan, "::")) != NULL) {
+                dcolon = scan;
+                scan += 2;
+            }
+        }
         if (dcolon && dcolon != method) {
             size_t pkg_len = (size_t)(dcolon - method);
             char pkg_buf[256];

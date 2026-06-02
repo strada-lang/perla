@@ -110,7 +110,7 @@ func body_uses_at_underscore(scalar $node) int {
                              "hash", "left", "right", "operand", "from",
                              "to", "lhs", "rhs", "true_branch",
                              "false_branch", "block", "args", "elems",
-                             "keys_list", "indices", "vars");
+                             "keys_list", "indices", "vars", "list");
     my int $fi = 0;
     while ($fi < scalar(@field_names)) {
         my str $fn = $field_names[$fi];

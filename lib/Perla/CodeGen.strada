@@ -7331,6 +7331,45 @@ func _gen_foreach_inner(scalar $cg, scalar $node) void {
             $fe_values_hash = $varg;
         }
     }
+    # Literal-list aliasing: `for my $x ($a, $b) { $x = ... }` — Perl aliases
+    # the loop var to each list element, so assigning $x mutates the original
+    # lvalue. perla materializes the list into a temp array and writes back
+    # into THAT (not the source vars). Detect a literal scalar-lvalue list and
+    # write each (possibly reassigned) loop value back to its source lexical at
+    # iteration end. Restricted to plain `my` scalars (not our/file-scope/
+    # special, where the write would also need glob mirroring) and 1:1
+    # index-to-element mapping (no array flattening). Real-world: DBIx::Class
+    # ::Schema::load_namespaces' `for my $arg ($result_namespace,
+    # $resultset_namespace) { $arg = [ $arg ] if ... }`.
+    my int $fe_lvalue_list = 0;
+    my scalar $fe_lvalue_elems = undef;
+    if (defined($node->{"list"}) && $node->{"list"}->{"type"} == Perla::AST::N_ANON_ARRAY()
+        && (!defined($node->{"list"}->{"is_ref"}) || $node->{"list"}->{"is_ref"} != 1)
+        && defined($node->{"list"}->{"elems"})) {
+        my scalar $fe_els = $node->{"list"}->{"elems"};
+        my int $fe_all_lv = 1;
+        my int $fe_ei = 0;
+        while ($fe_ei < scalar(@{$fe_els})) {
+            my scalar $fe_el = $fe_els->[$fe_ei];
+            my int $fe_ok = 0;
+            if (defined($fe_el) && $fe_el->{"type"} == Perla::AST::N_SCALAR_VAR()
+                && defined($fe_el->{"name"}) && length($fe_el->{"name"}) > 0
+                && index($fe_el->{"name"}, "::") < 0) {
+                my str $fe_en = $fe_el->{"name"};
+                my str $fe_ec0 = substr($fe_en, 0, 1);
+                if (!($fe_ec0 ge "0" && $fe_ec0 le "9") && $fe_en ne "_"
+                    && !(defined($cg->{"our_vars"}) && exists($cg->{"our_vars"}->{$fe_en}))) {
+                    $fe_ok = 1;
+                }
+            }
+            if ($fe_ok == 0) { $fe_all_lv = 0; last; }
+            $fe_ei = $fe_ei + 1;
+        }
+        if ($fe_all_lv == 1 && scalar(@{$fe_els}) > 0) {
+            $fe_lvalue_list = 1;
+            $fe_lvalue_elems = $fe_els;
+        }
+    }
     # Save perla_dollar_underscore around `for (LIST) { ... }` (default $_)
     # so an outer map/sort/grep iter var isn't clobbered. Perl semantics:
     # the for-loop's $_ is an alias to each list element, and after the
@@ -7607,7 +7646,28 @@ func _gen_foreach_inner(scalar $cg, scalar $node) void {
     }
     # Aliasing writeback (placed after the next-label so `next LABEL` jumps
     # also flow through the writeback path).
-    ind($cg); emit($cg, "if (" . $cvar . " != __orig_" . $cvar . ") { strada_incref(" . $cvar . "); strada_array_set(__fe_av, __fe_i, " . $cvar . "); }\n");
+    if ($fe_lvalue_list == 1) {
+        # Literal scalar-lvalue list aliasing: write the (possibly reassigned)
+        # loop value straight back to its source lexical, keyed on the iteration
+        # index. We do NOT route through __fe_av here (the generic array_set
+        # path below): when the new value references the old element — e.g.
+        # `$arg = [ $arg ]` — array_set decref's the old slot value, freeing the
+        # element the new ref still points at (UAF). Writing the source lexical
+        # directly keeps the temp array's original element alive (still ref'd by
+        # __fe_av until loop teardown), so the new ref's contents stay valid.
+        ind($cg); emit($cg, "if (" . $cvar . " != __orig_" . $cvar . ") {\n");
+        $cg->{"indent"} = $cg->{"indent"} + 1;
+        my int $fe_wi = 0;
+        while ($fe_wi < scalar(@{$fe_lvalue_elems})) {
+            my str $fe_wcn = c_var($fe_lvalue_elems->[$fe_wi]->{"name"});
+            ind($cg); emit($cg, "if (__fe_i == " . $fe_wi . ") { StradaValue *__fe_ov = " . $fe_wcn . "; if (" . $cvar . ") strada_incref(" . $cvar . "); " . $fe_wcn . " = " . $cvar . "; if (__fe_ov && __fe_ov != " . $cvar . ") strada_decref(__fe_ov); }\n");
+            $fe_wi = $fe_wi + 1;
+        }
+        $cg->{"indent"} = $cg->{"indent"} - 1;
+        ind($cg); emit($cg, "}\n");
+    } else {
+        ind($cg); emit($cg, "if (" . $cvar . " != __orig_" . $cvar . ") { strada_incref(" . $cvar . "); strada_array_set(__fe_av, __fe_i, " . $cvar . "); }\n");
+    }
     # `for (values %h)` aliasing: store the (possibly reassigned) loop var
     # back into the hash under this iteration's key.
     if ($fe_values_alias == 1) {
@@ -15235,6 +15295,35 @@ func _gen_assign(scalar $cg, scalar $node) void {
                 }
                 emit($cg, "strada_new_undef(); })");
                 return;
+            }
+            # `*Dst = \$ourvar` — taking a ref to an unqualified package
+            # (our / file-scope) scalar. The default gen_expr for `\$var`
+            # emits `strada_slot_ref_create(&v_var)`, pointing at the C-static
+            # backing cell, NOT a glob slot. perla_glob_assign back-casts the
+            # slot address to a PerlGlob* (slot_addr - offsetof(slots) ...);
+            # for a static cell that recovers garbage and crashes in the
+            # aliased_by realloc. Package scalars mirror every write into
+            # their stash glob's SCALAR slot, so emit a slot ref to THAT glob
+            # slot instead — perla_glob_assign then gets a valid glob, the
+            # aliased_by registration is correct, and writes to $var fan out
+            # to the aliased target. Real-world: FindBin::init's
+            # `*Dir = \$Bin; *RealDir = \$RealBin;` (list-`our` vars).
+            my scalar $gav = $node->{"value"};
+            if (defined($gav) && $gav->{"type"} == Perla::AST::N_REF()
+                && defined($gav->{"operand"})
+                && $gav->{"operand"}->{"type"} == Perla::AST::N_SCALAR_VAR()
+                && defined($gav->{"operand"}->{"name"})
+                && index($gav->{"operand"}->{"name"}, "::") < 0) {
+                my str $gavn = $gav->{"operand"}->{"name"};
+                my int $gav_pkgvar = 0;
+                if (defined($cg->{"our_vars"}) && exists($cg->{"our_vars"}->{$gavn})) { $gav_pkgvar = 1; }
+                if (defined($cg->{"file_scope_vars"}) && exists($cg->{"file_scope_vars"}->{$gavn})) { $gav_pkgvar = 1; }
+                if ($gav_pkgvar == 1) {
+                    emit($cg, "({ StradaValue *__gv = strada_slot_ref_create(&perla_glob_get_or_create(perla_stash_get_or_create(\"" . $cg->{"pkg"} . "\"), \"" . $gavn . "\")->slots[PERLA_SLOT_SCALAR]); ");
+                    emit($cg, "PerlGlob *__glob = perla_glob_get_or_create(perla_stash_get_or_create(\"" . $gpkg . "\"), \"" . $gshort . "\"); ");
+                    emit($cg, "perla_glob_assign(__glob, __gv); __gv; })");
+                    return;
+                }
             }
             emit($cg, "({ StradaValue *__gv = ");
             gen_expr($cg, $node->{"value"});

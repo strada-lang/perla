@@ -532,6 +532,40 @@ func _parse_stmt(scalar $p) scalar {
             _match($p, "SEMI");
             return $node;
         }
+        # `goto EXPR` where EXPR yields a code ref: `goto \&Pkg::sub`
+        # (backslash-amp ref expression) and `goto $cref` (scalar holding a
+        # code ref). Perl treats a goto to a code value as a tail call,
+        # identical to `goto &$cref`. Without this, the `&`-only branch above
+        # misses these forms, `goto` falls through to a discarded expression,
+        # and the wrapping sub returns undef. Real-world: Types::Standard's
+        # `goto \&Type::Library::add_type` (every core type built this way) and
+        # Type::Tiny's `goto \&overload::OVERLOAD`.
+        my str $g_pt = _peek_type($p);
+        if ($g_pt eq "BACKSLASH" || $g_pt eq "SCALAR_VAR") {
+            my scalar $target = _parse_expr($p);
+            my scalar $node = Perla::AST::node(Perla::AST::N_GOTO_SUB());
+            $node->{"target"} = $target;
+            if (_peek_type($p) eq "IF") {
+                _advance($p);
+                my scalar $cond = _parse_expr($p);
+                my scalar $wrap = Perla::AST::node(Perla::AST::N_POSTFIX_IF());
+                $wrap->{"body"} = $node;
+                $wrap->{"cond"} = $cond;
+                _match($p, "SEMI");
+                return $wrap;
+            }
+            if (_peek_type($p) eq "UNLESS") {
+                _advance($p);
+                my scalar $cond = _parse_expr($p);
+                my scalar $wrap = Perla::AST::node(Perla::AST::N_POSTFIX_UNLESS());
+                $wrap->{"body"} = $node;
+                $wrap->{"cond"} = $cond;
+                _match($p, "SEMI");
+                return $wrap;
+            }
+            _match($p, "SEMI");
+            return $node;
+        }
         # `goto LABEL` (bareword label-jump form).
         if (_peek_type($p) eq "IDENT" && _peek_val($p) ne "if" && _peek_val($p) ne "unless") {
             my str $label_name = _advance($p)->{"value"};
@@ -2362,6 +2396,52 @@ func _push_module_stmts_force(scalar $p, scalar $prog_stmts, str $module) void {
     _push_module_stmts($p, $prog_stmts, $module);
 }
 
+# Force-build the component modules named in a `load_components` /
+# `load_own_components` call so their inherited methods are compiled and
+# linked (see the call site in the ARROW method-call parser). Walks the
+# argument AST (string literals, qw(...) lists, and [...] arrayrefs) and
+# force-builds each component. A bare name gets the `DBIx::Class::` base
+# (the overwhelmingly common Componentised user); a `+`-prefixed name is
+# taken verbatim. Names whose .pm doesn't exist no-op in _load_module.
+func _load_components_collect(scalar $p, scalar $prog_stmts, scalar $arg) void {
+    if (!defined($arg)) { return; }
+    my int $t = $arg->{"type"};
+    if ($t == Perla::AST::N_STR_LIT()) {
+        my str $c = "" . $arg->{"value"};
+        if (length($c) == 0 || substr($c, 0, 1) eq "#") { return; }
+        my str $full = $c;
+        if (substr($c, 0, 1) eq "+") {
+            $full = substr($c, 1, length($c) - 1);
+        } else {
+            $full = "DBIx::Class::" . $c;
+        }
+        my str $saved_pkg = $p->{"pkg"};
+        _push_module_stmts_force($p, $prog_stmts, $full);
+        $p->{"pkg"} = $saved_pkg;
+        return;
+    }
+    if ($t == Perla::AST::N_QWORD() || $t == Perla::AST::N_ANON_ARRAY()) {
+        if (defined($arg->{"elems"})) {
+            my int $ei = 0;
+            while ($ei < scalar(@{$arg->{"elems"}})) {
+                _load_components_collect($p, $prog_stmts, $arg->{"elems"}->[$ei]);
+                $ei = $ei + 1;
+            }
+        }
+        return;
+    }
+}
+
+func _load_components_deps(scalar $p, scalar $args) void {
+    if (!defined($args)) { return; }
+    my scalar $prog_stmts = $p->{"prog"}->{"stmts"};
+    my int $ai = 0;
+    while ($ai < scalar(@{$args})) {
+        _load_components_collect($p, $prog_stmts, $args->[$ai]);
+        $ai = $ai + 1;
+    }
+}
+
 # Load a module file and return its AST statements
 func _load_module(scalar $p, str $module) scalar {
     # Don't load the same module twice
@@ -3950,6 +4030,18 @@ func _parse_postfix(scalar $p) scalar {
                         }
                     }
                     _expect($p, "RPAREN");
+                }
+                # `$class->load_components(qw/A +Full::B/)` — DBIx::Class /
+                # Class::C3::Componentised loads these component modules at
+                # RUNTIME (via inject_base into @ISA), which the static dep
+                # scan misses, so their inherited methods (`table`,
+                # `has_column`, …) are never compiled/linked and dispatch dies
+                # "Can't locate object method". Force-build each component like
+                # `use base` does: bare names get the DBIx::Class:: base
+                # (nonexistent files no-op in _load_module); `+`-prefixed names
+                # are used verbatim.
+                if ($method eq "load_components" || $method eq "load_own_components") {
+                    _load_components_deps($p, $node->{"args"});
                 }
                 $left = $node;
             } elsif (_peek_type($p) eq "LBRACE") {
