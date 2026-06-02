@@ -1377,6 +1377,19 @@ void perla_init(void) {
     perla_code_set("mro", "is_universal", strada_cpointer_new((void*)perla_mro_is_universal));
     perla_code_set("mro", "set_mro", strada_cpointer_new((void*)perla_mro_set_mro));
     perla_code_set("mro", "get_mro", strada_cpointer_new((void*)perla_mro_get_mro));
+    /* Method-cache maintenance — no-ops in perla (no method cache to flush).
+     * DBIx::Class / Class::C3 / MRO::Compat call method_changed_in after
+     * mucking with @ISA; without the stub it dies "Undefined subroutine". */
+    perla_code_set("mro", "method_changed_in", strada_cpointer_new((void*)perla_noop_undef));
+    perla_code_set("mro", "invalidate_all_method_caches", strada_cpointer_new((void*)perla_noop_undef));
+    /* Internals::* — Perl's internal builtins used by constant.pm, Readonly,
+     * Type::Tiny's constant caching, etc. perla doesn't enforce the readonly
+     * flag or expose refcounts, so these are no-ops. Without SvREADONLY,
+     * `use constant`-heavy code (and Type::Tiny) dies "Undefined subroutine
+     * &Internals::SvREADONLY". */
+    perla_code_set("Internals", "SvREADONLY", strada_cpointer_new((void*)perla_noop_undef));
+    perla_code_set("Internals", "SvREFCNT", strada_cpointer_new((void*)perla_noop_undef));
+    perla_code_set("Internals", "hv_clear_placeholders", strada_cpointer_new((void*)perla_noop_undef));
 
     /* Exporter::import: real implementation that copies @EXPORT /
      * @EXPORT_OK / %EXPORT_TAGS symbols into the caller's stash.
