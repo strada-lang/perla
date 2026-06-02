@@ -2084,6 +2084,17 @@ void perla_init(void) {
      * (every parameter check elides, so `validation_for` returns the
      * empty hash for every call). */
     perla_code_set("B", "perlstring", strada_cpointer_new((void*)perla_b_perlstring));
+    /* XString::perlstring — XS-only fast replacement for B::perlstring.
+     * Specio::Helpers aliases `*perlstring = \&XString::perlstring` when
+     * `eval { require XString; 1 }` succeeds (it does under perla's
+     * XSLoader-lie), so without a native XString::perlstring the alias is a
+     * stub that dies "Undefined subroutine &XString::perlstring called" the
+     * first time Specio::OO inlines a constructor with an isa/does check
+     * (hit loading DateTime's Specio types). Same semantics as B::perlstring.
+     * XString::cstring is the C-string variant; perlstring is close enough
+     * for the callers perla sees (both quote+escape). */
+    perla_code_set("XString", "perlstring", strada_cpointer_new((void*)perla_b_perlstring));
+    perla_code_set("XString", "cstring",    strada_cpointer_new((void*)perla_b_perlstring));
     /* Specio::Helpers::install_t_sub override.
      *
      * Specio's `t($name)` resolves a type name from the calling package's
@@ -24489,8 +24500,22 @@ StradaValue *perla_str_xor(StradaValue *a, StradaValue *b) {
 /* `\&unknown_sub` should give a CODE ref even when the sub is undefined
  * (Perl creates a stub CV). Without a stub, perla returns NULL and
  * ref() yields "" instead of "CODE". Calling the stub dies. */
+/* Best-effort name of the most-recently-created undef coderef, so the die
+ * names the missing sub like Perl ("Undefined subroutine &Pkg::sub called").
+ * A CPOINTER can't carry per-instance data; in the overwhelmingly common
+ * create-then-call pattern this global holds the right name when the stub
+ * fires. NULL → fall back to the unnamed message. */
+static char g_undef_coderef_name[256] = {0};
 static StradaValue *_perla_undef_code_stub(StradaValue *args) {
     (void)args;
+    if (g_undef_coderef_name[0]) {
+        /* strada_die only printf-formats when the format is exactly "%s";
+         * build the message first, then pass it through that path. */
+        char msg[320];
+        snprintf(msg, sizeof(msg), "Undefined subroutine &%s called",
+                 g_undef_coderef_name);
+        strada_die("%s", msg);
+    }
     strada_die("Undefined subroutine called");
     return strada_new_undef();
 }
@@ -24499,6 +24524,13 @@ StradaValue *perla_undef_coderef(void) {
     /* CPOINTER wraps a function pointer; ref() returns "CODE" for it. */
     StradaValue *cv = strada_cpointer_new((void*)_perla_undef_code_stub);
     return cv;
+}
+
+StradaValue *perla_undef_coderef_named(const char *name) {
+    if (name) {
+        snprintf(g_undef_coderef_name, sizeof(g_undef_coderef_name), "%s", name);
+    }
+    return strada_cpointer_new((void*)_perla_undef_code_stub);
 }
 
 /* ===== local on hash element =====

@@ -10039,9 +10039,9 @@ func gen_expr(scalar $cg, scalar $node) void {
                 if ($dc >= 0) {
                     my str $fpkg = substr($fn, 0, $dc);
                     my str $fsub = substr($fn, $dc + 2, length($fn) - $dc - 2);
-                    emit($cg, "({ StradaValue *__cr = perla_code_get(\"" . $fpkg . "\", \"" . $fsub . "\"); __cr ? __cr : perla_undef_coderef(); })");
+                    emit($cg, "({ StradaValue *__cr = perla_code_get(\"" . $fpkg . "\", \"" . $fsub . "\"); __cr ? __cr : perla_undef_coderef_named(\"" . $fpkg . "::" . $fsub . "\"); })");
                 } else {
-                    emit($cg, "({ StradaValue *__cr = perla_code_get(\"" . $cg->{"pkg"} . "\", \"" . $fn . "\"); __cr ? __cr : perla_undef_coderef(); })");
+                    emit($cg, "({ StradaValue *__cr = perla_code_get(\"" . $cg->{"pkg"} . "\", \"" . $fn . "\"); __cr ? __cr : perla_undef_coderef_named(\"" . $cg->{"pkg"} . "::" . $fn . "\"); })");
                 }
             }
             return;

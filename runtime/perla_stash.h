@@ -165,6 +165,7 @@ StradaValue *perla_str_xor(StradaValue *a, StradaValue *b);
 /* CPOINTER stub used as the target of `\&undefined_sub`. ref() returns
  * "CODE"; calling it dies "Undefined subroutine called". */
 StradaValue *perla_undef_coderef(void);
+StradaValue *perla_undef_coderef_named(const char *name);
 
 void perla_mark_loaded(const char *module);
 void perla_set_mro(const char *pkg, const char *algo);
