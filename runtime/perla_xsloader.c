@@ -338,6 +338,14 @@ StradaValue *perla_xsloader_load(StradaValue *args) {
                 "List::MoreUtils::XS",
                 "JSON::XS",
                 "Cpanel::JSON::XS",
+                /* List::Util is pure-XS (no .pm-side pure-Perl fallback), so a
+                 * fatal XSLoader::load death during `use List::Util` would exit
+                 * the program. perla registers the full List::Util API natively
+                 * in the stash (first/reduce/sum/max/uniq/pairs/...), so lie
+                 * success: the .pm.so finishes init (sets @EXPORT_OK/$VERSION),
+                 * Exporter copies the native subs into the caller, and all calls
+                 * land on perla's natives. */
+                "List::Util",
                 NULL,
             };
             for (int ni = 0; native_lie_modules[ni]; ni++) {
