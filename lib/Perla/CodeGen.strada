@@ -11884,9 +11884,32 @@ func gen_expr(scalar $cg, scalar $node) void {
                 emit($cg, $vli_cvar . " = (__destr_n > " . $vli . ") ? ({ StradaValue *__el = strada_array_get(__destr_av, " . $vli . "); if (__el) strada_incref(__el); __el; }) : strada_new_undef(); ");
                 $vli++;
             }
-            # Return the count as the truthy/falsy marker. Non-zero = true.
-            emit($cg, "if (__destr_wrap) strada_decref(__destr_wrap); ");
-            emit($cg, "STRADA_MAKE_TAGGED_INT((int64_t)__destr_n); })");
+            # The yield depends on the CALLER's context (__sav_wl_destr — the
+            # want_list captured BEFORE we forced list for the RHS):
+            #   * list context (==1): Perl's list-assignment returns the LHS
+            #     lvalue list (the just-assigned vars). Needed for
+            #     `(my ($num) = grep {...} @args)[0]` (Sub::Exporter::Progressive's
+            #     installed import closure) and `my @x = (my ($n) = ...)`.
+            #     Previously this yielded the element COUNT, so the slice
+            #     `(...)[0]` saw `(count)[0]` — e.g. empty list → count 0 →
+            #     `defined(0)` true → spurious "leading digit" croak that
+            #     blocked Drogo::Dispatch → Abe::App in e.pl.
+            #   * scalar/void: the element count, the truthy/falsy marker for
+            #     `if (my ($a,$b)=...)` / `while (my ($k,$v)=each %h)`.
+            emit($cg, "StradaValue *__destr_yield; ");
+            emit($cg, "if (__sav_wl_destr == 1) { __destr_yield = strada_new_array(); StradaArray *__destr_yav = strada_deref_array(__destr_yield); ");
+            my int $vyi = 0;
+            while ($vyi < $nv_e) {
+                my scalar $vy_node = $vars_list->[$vyi];
+                my str $vy_name = $vy_node->{"value"};
+                my str $vy_type = "" . $vy_node->{"type"};
+                if (length($vy_type) == 0) { $vy_type = "SCALAR_VAR"; }
+                my str $vy_cvar = c_var_for_vtype($vy_type, $vy_name);
+                emit($cg, "if (" . $vy_cvar . ") { strada_incref(" . $vy_cvar . "); strada_array_push_take(__destr_yav, " . $vy_cvar . "); } else { strada_array_push_take(__destr_yav, strada_new_undef()); } ");
+                $vyi++;
+            }
+            emit($cg, "} else { __destr_yield = STRADA_MAKE_TAGGED_INT((int64_t)__destr_n); } ");
+            emit($cg, "if (__destr_wrap) strada_decref(__destr_wrap); __destr_yield; })");
             return;
         }
         my scalar $single_var = undef;
@@ -12662,7 +12685,19 @@ func _gen_anon_array(scalar $cg, scalar $node) void {
                  || $arg_type == Perla::AST::N_MAP()
                  || $arg_type == Perla::AST::N_SORT()
                  || $arg_type == Perla::AST::N_BINOP()
+                 || $arg_type == Perla::AST::N_MY()
+                 || $arg_type == Perla::AST::N_ASSIGN()
                  || $arg_type == Perla::AST::N_TERNARY()) {
+            # N_MY / N_ASSIGN: a list-assignment in list context returns its
+            # LHS lvalue list (a STRADA_ARRAY) — see the destructuring yield in
+            # _gen_stmt's N_MY handler. It must be FLATTENED into the
+            # surrounding list, not pushed as one array element. This is what
+            # makes `(my ($num) = grep {...} @args)[0]` (wrapped by the primary
+            # paren handler as N_ANON_ARRAY{[N_MY], paren_list}) index the LHS
+            # list instead of a 1-elem array-of-array. Without it the slice saw
+            # `( [LHS] )[0]` = the inner array (truthy) — e.g. empty match list
+            # gave `(0)`/array → `defined` true → spurious croak in
+            # Sub::Exporter::Progressive that blocked e.pl.
             # Function/method call result - may return list that should be
             # flattened in list context. Set `__perla_want_list = 1` so the
             # callee picks list return semantics (without it the callee
