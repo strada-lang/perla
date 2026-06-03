@@ -34,6 +34,37 @@ sub throw { my $next = $_[0]->can('handler'); splice(@_, 1, 0, "CB"); goto $next
 package main;
 is(Bar->throw("a", "b"), "self=Bar cb=CB args=[a b]", 'splice @_ then goto coderef preserves modified @_');
 
+# --- @_ inside an anon HASH after shift (N_ANON_HASH stores its key/value
+#     contents under "pairs", which the @_-usage walk did not visit, so the
+#     peel fired and `{ @_ }` read the stale PRE-shift @_). This is the
+#     `bless { @_ }, $class` constructor idiom. ---
+sub mkhash { my $c = shift; return { @_ }; }
+{
+    my $h = mkhash("CLASS", "message", "boom", "code", 42);
+    is($h->{message}, "boom", 'anon hash { @_ } after shift sees post-shift @_ (key)');
+    is($h->{code},    42,     'anon hash { @_ } after shift sees post-shift @_ (value)');
+    is(scalar(keys %$h), 2,   'anon hash { @_ } after shift has correct pair count');
+}
+
+# --- the real-world shape: my $class = shift; bless { @_ }, $class ---
+package Widget;
+sub new { my $class = shift; return bless { @_ }, $class; }
+package main;
+{
+    my $w = Widget->new(name => "ok", size => 9);
+    is(ref($w),     "Widget", 'bless { @_ } after shift blesses correctly');
+    is($w->{name},  "ok",     'bless { @_ } after shift keeps first key/value pair');
+    is($w->{size},  9,        'bless { @_ } after shift keeps second pair');
+}
+
+# --- @_ inside an anon hash VALUE position after shift ---
+sub wrap { my $tag = shift; return { tag => $tag, rest => [ @_ ] }; }
+{
+    my $h = wrap("T", "p", "q");
+    is($h->{tag}, "T", 'anon hash with shifted scalar value');
+    is("@{$h->{rest}}", "p q", 'nested [ @_ ] inside anon hash sees post-shift @_');
+}
+
 # --- plain (non-interpolated, non-goto) shift still peels correctly ---
 sub plain { my $x = shift; my $y = shift; return $x + $y; }
 is(plain(3, 4, 5), 7, 'plain shift-peel unaffected');

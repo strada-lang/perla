@@ -151,7 +151,14 @@ func body_uses_at_underscore(scalar $node) int {
                              "hash", "left", "right", "operand", "from",
                              "to", "lhs", "rhs", "true_branch",
                              "false_branch", "block", "args", "elems",
-                             "keys_list", "indices", "vars", "list");
+                             "keys_list", "indices", "vars", "list",
+                             # N_ANON_HASH stores its key/value contents under
+                             # "pairs" — without this, `my $c = shift; { @_ }`
+                             # never sees the @_ inside the anon hash, so the
+                             # shift-peel fires and `{ @_ }` reads the stale
+                             # pre-shift @_ (e.g. `bless { @_ }, $class`
+                             # constructors lost their first key/value pair).
+                             "pairs");
     my int $fi = 0;
     while ($fi < scalar(@field_names)) {
         my str $fn = $field_names[$fi];
