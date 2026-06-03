@@ -65,8 +65,22 @@ func body_uses_at_underscore(scalar $node) int {
     # Direct @_ references that need perla_at_.
     if ($t == Perla::AST::N_ARRAY_VAR() && defined($node->{"name"}) && $node->{"name"} eq "_") { return 1; }
     if ($t == Perla::AST::N_HASH_VAR() && defined($node->{"name"}) && $node->{"name"} eq "_") { return 1; }
-    # `\$_[N]` — array elem on @_.
-    if ($t == Perla::AST::N_ARRAY_ELEM() && defined($node->{"array"}) && $node->{"array"} eq "_") { return 1; }
+    # `$_[N]` — element access on @_. The element's array node is the scalar
+    # `$_` (N_SCALAR_VAR name "_"), which `$_[N]` uses to mean @_. The old
+    # check compared `$node->{"array"}` (an AST HASH node) to the STRING "_"
+    # — always false — so `$_[N]` was NEVER detected as using @_. That let the
+    # shift-param peeling (analyze_sub_params) fire for subs like
+    # `my $self = shift; my $v = $_[0];` even though they read @_, so $_[N]
+    # then read the PRE-shift positional param. (Recursion into the "array"
+    # child doesn't catch it either: it's N_SCALAR_VAR "_" = $_, not @_.)
+    if ($t == Perla::AST::N_ARRAY_ELEM() && defined($node->{"array"})
+        && ref($node->{"array"}) eq "HASH"
+        && $node->{"array"}->{"type"} == Perla::AST::N_SCALAR_VAR()
+        && defined($node->{"array"}->{"name"}) && $node->{"array"}->{"name"} eq "_") { return 1; }
+    if ($t == Perla::AST::N_ARROW_ARRAY() && defined($node->{"object"})
+        && ref($node->{"object"}) eq "HASH"
+        && $node->{"object"}->{"type"} == Perla::AST::N_SCALAR_VAR()
+        && defined($node->{"object"}->{"name"}) && $node->{"object"}->{"name"} eq "_") { return 1; }
     # Builtins that default to @_ when called with no args: shift, pop,
     # unshift (default-pushes), wantarray (uses caller frame, NOT
     # perla_at_), caller (also frame, not perla_at_). We treat
