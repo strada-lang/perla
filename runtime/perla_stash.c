@@ -932,6 +932,13 @@ static StradaValue *perla_mop_find_attribute_by_name(StradaValue *args) {
 static StradaValue *perla_mop_add_attribute_noop(StradaValue *args) {
     (void)args; return strada_new_undef();
 }
+/* returns a fresh EMPTY array — a real list stub (unlike perla_mop_attributes,
+ * which returns the metaclass's attribute objects). Used for get_all_methods/
+ * get_method_list so consumers (e.g. MiniTrait::apply's
+ * `grep { $_->package_name ... } $trait->get_all_methods`) iterate nothing. */
+static StradaValue *perla_mop_empty_list(StradaValue *args) {
+    (void)args; return strada_new_array();
+}
 /* get_meta_instance($meta) — the meta-instance object knows how to build an
  * instance. perla doesn't model the full meta-instance protocol; return the
  * metaclass itself (it carries "package"), and implement create_instance on it
@@ -1914,7 +1921,7 @@ void perla_init(void) {
     /* get_all_methods / get_all_attributes — return empty during MOP bootstrap */
     /* These are XS-provided in real Moose; we return empty arrays as stubs */
     {
-        StradaValue *empty_arr_fn = strada_cpointer_new((void*)perla_mop_attributes);
+        StradaValue *empty_arr_fn = strada_cpointer_new((void*)perla_mop_empty_list);
         /* get_all_methods, get_method_list etc. return empty array */
         const char *stub_pkgs[] = {
             "Class::MOP::Mixin::HasMethods", "Class::MOP::Mixin::HasAttributes",
@@ -1922,8 +1929,15 @@ void perla_init(void) {
             "Moose::Meta::Object::Trait", NULL
         };
         for (int i = 0; stub_pkgs[i]; i++) {
-            perla_code_set(stub_pkgs[i], "get_all_methods", empty_arr_fn);
-            perla_code_set(stub_pkgs[i], "get_method_list", empty_arr_fn);
+            /* PROTECTED: the compiled Class::MOP .pm.so otherwise overrides
+             * these with the real method-map machinery (full_method_map ->
+             * slot_hash etc.) that perla's incomplete metaclass can't drive.
+             * Empty is correct — perla provides metaclass methods natively, so
+             * Class::MOP::MiniTrait::apply's `$trait->get_all_methods` copy loop
+             * is a no-op. Effective now that the grep-alias fix makes $trait a
+             * real metaclass blessed into one of stub_pkgs. */
+            perla_code_set_protected(stub_pkgs[i], "get_all_methods", empty_arr_fn);
+            perla_code_set_protected(stub_pkgs[i], "get_method_list", empty_arr_fn);
         }
     }
 
