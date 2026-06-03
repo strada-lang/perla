@@ -6834,27 +6834,83 @@ static StradaValue *perla_b_perlstring(StradaValue *args) {
     return r;
 }
 
-/* Specio::Helpers::install_t_sub override — see perla_init for rationale.
- * Args: ($caller_pkg, $types_hashref). Installs a permissive `t` in the
- * caller's stash that returns undef for every name. PVC type-checks
- * elide on undef, validators still build and enforce required/extras. */
+/* Per-package `$types` registry captured from Specio's install_t_sub, so the
+ * native `t($name)` can return the REAL registered (blessed) type — the same
+ * live hashref the pure-Perl `t` closure captures. The earlier stub returned
+ * undef for EVERY name, which broke Specio's own type construction
+ * (`declare('Undef', parent => t('Item'), ...)` got an unblessed parent →
+ * `does_role` false → "...does not do the ...Role::Interface role"). Returning
+ * the registered type when present and undef (NOT croak) when absent keeps the
+ * permissive behavior the stub was added for (Params::ValidationCompiler). */
+static struct { char *pkg; StradaValue *types; } *g_specio_t_map = NULL;
+static int g_specio_t_n = 0, g_specio_t_cap = 0;
+
+static StradaValue *specio_t_types_for(const char *pkg) {
+    if (!pkg) return NULL;
+    for (int i = 0; i < g_specio_t_n; i++)
+        if (g_specio_t_map[i].pkg && strcmp(g_specio_t_map[i].pkg, pkg) == 0)
+            return g_specio_t_map[i].types;
+    return NULL;
+}
+static void specio_t_types_set(const char *pkg, StradaValue *types) {
+    for (int i = 0; i < g_specio_t_n; i++) {
+        if (g_specio_t_map[i].pkg && strcmp(g_specio_t_map[i].pkg, pkg) == 0) {
+            if (types) strada_incref(types);
+            if (g_specio_t_map[i].types) strada_decref(g_specio_t_map[i].types);
+            g_specio_t_map[i].types = types;
+            return;
+        }
+    }
+    if (g_specio_t_n == g_specio_t_cap) {
+        g_specio_t_cap = g_specio_t_cap ? g_specio_t_cap * 2 : 8;
+        g_specio_t_map = realloc(g_specio_t_map, (size_t)g_specio_t_cap * sizeof(*g_specio_t_map));
+    }
+    g_specio_t_map[g_specio_t_n].pkg = strdup(pkg);
+    if (types) strada_incref(types);
+    g_specio_t_map[g_specio_t_n].types = types;
+    g_specio_t_n++;
+}
+
+/* Specio::Helpers::install_t_sub override. Args: ($caller_pkg, $types_hashref).
+ * Capture $types per-package and install a `t` that consults it. */
 static StradaValue *perla_specio_install_t_sub(StradaValue *args) {
     if (!args) return strada_new_undef();
     StradaArray *av = strada_deref_array(args);
     if (!av || av->size < 1) return strada_new_undef();
-    StradaValue *caller_sv = av->elements[av->head + 0]; 
+    StradaValue *caller_sv = av->elements[av->head + 0];
+    StradaValue *types_sv = (av->size >= 2) ? av->elements[av->head + 1] : NULL;
     if (!caller_sv) return strada_new_undef();
     char *caller = strada_to_str(caller_sv);
     if (!caller || !caller[0]) { free(caller); return strada_new_undef(); }
+    specio_t_types_set(caller, types_sv);
     perla_code_set(caller, "t", strada_cpointer_new((void*)perla_specio_t_stub));
     free(caller);
     return strada_new_undef();
 }
 
-/* Permissive Specio `t($name)` — always returns undef. */
+/* Specio `t($name)` — return the registered type for the CALLER's package
+ * (live $types ref captured at install), or undef when the name isn't (yet)
+ * registered. Extra args (parameterized types) currently yield the base type. */
 static StradaValue *perla_specio_t_stub(StradaValue *args) {
-    (void)args;
-    return strada_new_undef();
+    StradaArray *av = args ? strada_deref_array(args) : NULL;
+    if (!av || strada_array_length(av) < 1) return strada_new_undef();
+    StradaValue *name_sv = strada_array_get(av, 0);
+    char *name = name_sv ? strada_to_str(name_sv) : NULL;
+    if (!name) return strada_new_undef();
+    const char *pkg = (perla_call_depth >= 1)
+        ? perla_call_stack[perla_call_depth - 1].package : NULL;
+    StradaValue *types = specio_t_types_for(pkg);
+    StradaValue *result = strada_new_undef();
+    if (types) {
+        StradaValue *found = strada_hv_fetch(types, name);
+        if (found && (STRADA_IS_TAGGED_INT(found) || found->type != STRADA_UNDEF)) {
+            strada_incref(found);
+            strada_decref(result);
+            result = found;
+        }
+    }
+    free(name);
+    return result;
 }
 
 /* Params::ValidationCompiler::validation_for override — see perla_init
