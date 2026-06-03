@@ -799,6 +799,56 @@ static StradaValue *perla_pu_DRIVER(StradaValue *args) {  /* _CLASS that isa bas
 }
 static StradaValue *perla_pu_CLASSDOES(StradaValue *args) { return perla_pu_CLASSISA(args); }
 
+/* ===================================================================
+ * Variable::Magic stubs.
+ *
+ * Variable::Magic is pure-XS — it attaches real Perl SV "magic" (get/set/
+ * free/... callbacks) to variables. perla's value model can't provide that.
+ * But B::Hooks::EndOfScope and namespace::clean depend on it to run
+ * callbacks at compile-scope end, and that chain is pulled in by
+ * Moose -> Class::MOP (and thus Abe::Bootstrap for e.pl). Without a backing,
+ * `use Variable::Magic` dies fatally (XS bootstrap) and even when allowlisted
+ * the .pm's `wizard` body references undefined XS constants (MGf_LOCAL, ...)
+ * and B::Hooks calls undefined Variable::Magic::getdata.
+ *
+ * We register no-op stubs so the chain LOADS. Consequence: scope-end magic
+ * never fires, so namespace::clean's cleanup is a no-op (imported helper subs
+ * stay visible) — harmless for executing a program. `getdata` returns undef
+ * so B::Hooks::EndOfScope::on_scope_end takes its `cast` (init) branch rather
+ * than pushing onto a non-existent stack; `cast`/`dispell` are no-ops. ===== */
+static StradaValue *perla_vm_wizard_(StradaValue *args) {
+    (void)args; return strada_new_ref_take(strada_new_hash(), '%'); /* opaque wiz token */
+}
+static StradaValue *perla_vm_cast(StradaValue *args)    { (void)args; return STRADA_MAKE_TAGGED_INT(1); }
+static StradaValue *perla_vm_getdata(StradaValue *args) { (void)args; return strada_new_undef(); }
+static StradaValue *perla_vm_dispell(StradaValue *args) { (void)args; return STRADA_MAKE_TAGGED_INT(1); }
+static StradaValue *perla_vm_const0(StradaValue *args)  { (void)args; return STRADA_MAKE_TAGGED_INT(0); }
+static StradaValue *perla_vm_const1(StradaValue *args)  { (void)args; return STRADA_MAKE_TAGGED_INT(1); }
+static StradaValue *perla_vm_const2(StradaValue *args)  { (void)args; return STRADA_MAKE_TAGGED_INT(2); }
+
+static void perla_register_variable_magic(void) {
+    perla_code_set("Variable::Magic", "_wizard", strada_cpointer_new((void*)perla_vm_wizard_));
+    perla_code_set("Variable::Magic", "cast",    strada_cpointer_new((void*)perla_vm_cast));
+    perla_code_set("Variable::Magic", "getdata", strada_cpointer_new((void*)perla_vm_getdata));
+    perla_code_set("Variable::Magic", "dispell", strada_cpointer_new((void*)perla_vm_dispell));
+    /* feature/flag constants — value is irrelevant to the no-op stubs; 0 keeps
+     * the .pm's `wizard` from appending optional magic keys it can't use. */
+    static const char *const zero_consts[] = {
+        "MGf_COPY", "MGf_DUP", "MGf_LOCAL", "VMG_UVAR",
+        "VMG_COMPAT_SCALAR_LENGTH_NOLEN", "VMG_COMPAT_SCALAR_NOLEN",
+        "VMG_COMPAT_ARRAY_PUSH_NOLEN", "VMG_COMPAT_ARRAY_PUSH_NOLEN_VOID",
+        "VMG_COMPAT_ARRAY_UNSHIFT_NOLEN_VOID", "VMG_COMPAT_ARRAY_UNDEF_CLEAR",
+        "VMG_COMPAT_HASH_DELETE_NOUVAR_VOID", "VMG_COMPAT_CODE_COPY_CLONE",
+        "VMG_COMPAT_GLOB_GET", "VMG_PERL_PATCHLEVEL", NULL
+    };
+    for (int i = 0; zero_consts[i]; i++)
+        perla_code_set("Variable::Magic", zero_consts[i], strada_cpointer_new((void*)perla_vm_const0));
+    perla_code_set("Variable::Magic", "VMG_THREADSAFE",     strada_cpointer_new((void*)perla_vm_const1));
+    perla_code_set("Variable::Magic", "VMG_FORKSAFE",       strada_cpointer_new((void*)perla_vm_const1));
+    perla_code_set("Variable::Magic", "VMG_OP_INFO_NAME",   strada_cpointer_new((void*)perla_vm_const1));
+    perla_code_set("Variable::Magic", "VMG_OP_INFO_OBJECT", strada_cpointer_new((void*)perla_vm_const2));
+}
+
 static void perla_register_params_util(void) {
     perla_code_set("Params::Util", "_STRING",       strada_cpointer_new((void*)perla_pu_STRING));
     perla_code_set("Params::Util", "_IDENTIFIER",   strada_cpointer_new((void*)perla_pu_IDENTIFIER));
@@ -2017,6 +2067,7 @@ void perla_init(void) {
      * `use List::Util qw(first ...)` populates the caller's stash via
      * perla_exporter_import. */
     perla_register_params_util();
+    perla_register_variable_magic();
     perla_code_set("List::Util", "first", strada_cpointer_new((void*)perla_list_util_first));
     perla_code_set("List::Util", "any",   strada_cpointer_new((void*)perla_list_util_any));
     perla_code_set("List::Util", "all",   strada_cpointer_new((void*)perla_list_util_all));

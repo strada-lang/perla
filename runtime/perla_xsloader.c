@@ -404,6 +404,12 @@ StradaValue *perla_xsloader_load(StradaValue *args) {
                  * .pm.so finishes init, Exporter copies the native subs.
                  * Hit via Moose -> Class::Load -> Data::OptList. */
                 "Params::Util",
+                /* Variable::Magic is pure-XS (real SV magic). perla can't
+                 * provide magic, but registers no-op stubs (wizard, cast,
+                 * getdata, dispell, plus the MGf_xxx and VMG_xxx constants) so
+                 * B::Hooks::EndOfScope and namespace::clean LOAD (pulled in by
+                 * Moose then Class::MOP). Scope-end cleanup silently no-ops. */
+                "Variable::Magic",
                 NULL,
             };
             for (int ni = 0; native_lie_modules[ni]; ni++) {
