@@ -1166,6 +1166,16 @@ void perla_init(void) {
      * above and copies the slots we set up. _protected so the .pm load
      * doesn't clobber it. */
     perla_code_set_protected("Time::HiRes", "import", strada_cpointer_new((void*)perla_exporter_import));
+    /* Runtime-callable time/sleep/usleep (for `Time::HiRes::time()` etc. and
+     * the native-lie path, in addition to codegen's compile-time use_hires
+     * fast path). */
+    extern StradaValue *perla_time_hires_time(StradaValue *args);
+    extern StradaValue *perla_time_hires_sleep(StradaValue *args);
+    extern StradaValue *perla_time_hires_usleep(StradaValue *args);
+    perla_code_set_protected("Time::HiRes", "time",   strada_cpointer_new((void*)perla_time_hires_time));
+    perla_code_set_protected("Time::HiRes", "sleep",  strada_cpointer_new((void*)perla_time_hires_sleep));
+    perla_code_set_protected("Time::HiRes", "usleep", strada_cpointer_new((void*)perla_time_hires_usleep));
+    perla_code_set_protected("Time::HiRes", "nanosleep", strada_cpointer_new((void*)perla_time_hires_usleep));
     /* @EXPORT_OK so `use Time::HiRes qw(gettimeofday tv_interval time
      * sleep usleep)` import works. The runtime backs gettimeofday/
      * tv_interval natively; time/sleep go through codegen's use_hires
@@ -19283,6 +19293,48 @@ StradaValue *perla_gettimeofday(StradaValue *args) {
     strada_array_push_take(av, strada_new_int(sec));
     strada_array_push_take(av, strada_new_int(usec));
     return arr;
+}
+
+/* Time::HiRes::time — current time as a float with sub-second precision
+ * (Perl's high-res replacement for the integer-only core time()). */
+StradaValue *perla_time_hires_time(StradaValue *args) {
+    (void)args;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return strada_new_num((double)ts.tv_sec + (double)ts.tv_nsec / 1.0e9);
+}
+
+/* Time::HiRes::sleep — fractional-second sleep (arg is seconds, may be a
+ * float). Returns the number of seconds slept (approx). */
+StradaValue *perla_time_hires_sleep(StradaValue *args) {
+    StradaArray *av = args ? strada_deref_array(args) : NULL;
+    double secs = 0.0;
+    if (av && strada_array_length(av) >= 1) {
+        secs = strada_to_num(strada_array_get(av, 0));
+    }
+    if (secs > 0) {
+        struct timespec req;
+        req.tv_sec = (time_t)secs;
+        req.tv_nsec = (long)((secs - (double)req.tv_sec) * 1.0e9);
+        nanosleep(&req, NULL);
+    }
+    return strada_new_num(secs);
+}
+
+/* Time::HiRes::usleep — sleep N microseconds. */
+StradaValue *perla_time_hires_usleep(StradaValue *args) {
+    StradaArray *av = args ? strada_deref_array(args) : NULL;
+    int64_t usec = 0;
+    if (av && strada_array_length(av) >= 1) {
+        usec = (int64_t)strada_to_num(strada_array_get(av, 0));
+    }
+    if (usec > 0) {
+        struct timespec req;
+        req.tv_sec = (time_t)(usec / 1000000);
+        req.tv_nsec = (long)((usec % 1000000) * 1000);
+        nanosleep(&req, NULL);
+    }
+    return strada_new_int(usec);
 }
 
 /* ===== Scalar::Util extras ===== */

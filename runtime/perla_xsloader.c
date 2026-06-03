@@ -393,6 +393,9 @@ StradaValue *perla_xsloader_load(StradaValue *args) {
                 "B",
                 "Cwd",
                 "Encode",
+                /* Time::HiRes: gettimeofday/tv_interval/time/sleep/usleep are
+                 * registered natively. */
+                "Time::HiRes",
                 NULL,
             };
             for (int ni = 0; native_lie_modules[ni]; ni++) {
