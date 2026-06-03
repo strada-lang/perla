@@ -1058,9 +1058,15 @@ static void perla_register_class_mop_isa(void) {
      * (runs at `use Moose` setup) — but Class/MOP.pm's bootstrap calls
      * `->meta->make_immutable` on its own metaclasses *before* that, so wire
      * the real impl here too (perla_init runs first). */
+    /* make_immutable must be PROTECTED: the compiled Class::MOP .pm.so loads
+     * after perla_init and otherwise overrides this with the real method, whose
+     * _rebless_as_immutable -> MiniTrait::apply path drives the unsupported
+     * immutable-trait `around` dispatch (and ran even for the bootstrap's own
+     * `Class::MOP::Class->meta->make_immutable`). perla's constructor is
+     * already native, so make_immutable is a no-op. */
     StradaValue *_mi_fn = strada_cpointer_new((void*)perla_moose_make_immutable);
-    perla_code_set("Moose::Meta::Class", "make_immutable", _mi_fn);
-    perla_code_set("Class::MOP::Class",  "make_immutable", _mi_fn);
+    perla_code_set_protected("Moose::Meta::Class", "make_immutable", _mi_fn);
+    perla_code_set_protected("Class::MOP::Class",  "make_immutable", _mi_fn);
     StradaValue *_fabn_fn = strada_cpointer_new((void*)perla_mop_find_attribute_by_name);
     perla_code_set("Moose::Meta::Class", "find_attribute_by_name", _fabn_fn);
     perla_code_set("Class::MOP::Class",  "find_attribute_by_name", _fabn_fn);
@@ -1870,8 +1876,17 @@ void perla_init(void) {
             "Class::MOP::Class", "Moose::Meta::Class", NULL
         };
         for (int i = 0; mut_pkgs[i]; i++) {
-            perla_code_set(mut_pkgs[i], "is_mutable", strada_cpointer_new((void*)perla_mop_default_val)); /* returns falsy — skip make_immutable */
-            perla_code_set(mut_pkgs[i], "is_immutable", strada_cpointer_new((void*)perla_mop_name)); /* returns truthy */
+            /* Report metaclasses as MUTABLE. Reporting immutable (to "skip"
+             * make_immutable) backfired: Moose then routes method lookups
+             * through Class::MOP::Class::Immutable::Trait's `around` wrappers
+             * (e.g. get_all_methods does `$self->$orig`), which perla's
+             * modifier dispatch mishandles ($orig arrives as the trait class
+             * name, not the original coderef) — and this fired for EVERY
+             * `use Moose` class, even ones that never call make_immutable.
+             * make_immutable is already a no-op here, so mutable + no-op
+             * achieves the same "skip" while keeping plain method dispatch. */
+            perla_code_set(mut_pkgs[i], "is_mutable", strada_cpointer_new((void*)perla_mop_name)); /* truthy */
+            perla_code_set(mut_pkgs[i], "is_immutable", strada_cpointer_new((void*)perla_mop_default_val)); /* falsy */
         }
     }
 
