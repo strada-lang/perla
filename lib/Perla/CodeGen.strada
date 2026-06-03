@@ -11877,9 +11877,23 @@ func gen_expr(scalar $cg, scalar $node) void {
                         # incref the cell so the LAST one freed releases the
                         # captured value. Without refcounting, both closures'
                         # free paths would decref the cell+value, double-free.
+                        #
+                        # RUNTIME alloc-vs-incref: the "first capture" is a
+                        # COMPILE-TIME notion (source order), but at runtime a
+                        # closure may sit inside a conditional (`... sub {$x}
+                        # if EXPR`) so the textually-first closure's alloc may
+                        # not execute while a later sibling's incref does. And
+                        # __perla_cell[N] persists across foreach iterations.
+                        # So key the decision on whether the slot already holds
+                        # THIS scope's current value: if empty or stale (a new
+                        # iteration's value), alloc fresh; else incref to share.
+                        # Fixes Moose::Meta::Role's `add_method(..., sub{$reader})
+                        # if exists $methods{KEY}` cascade (cell double-free).
+                        emit($cg, "if (!__perla_cell[" . $cidx . "] || *__perla_cell[" . $cidx . "] != " . $vn . ") { ");
                         emit($cg, "__perla_cell[" . $cidx . "] = strada_cell_alloc(); ");
                         emit($cg, "*__perla_cell[" . $cidx . "] = " . $vn . "; ");
                         emit($cg, "if (" . $vn . ") strada_incref(" . $vn . "); ");
+                        emit($cg, "} else { strada_cell_incref(__perla_cell[" . $cidx . "]); } ");
                         if (!defined($cg->{"cells_malloc_d"})) { $cg->{"cells_malloc_d"} = {}; }
                         $cg->{"cells_malloc_d"}->{$varname} = 1;
                     }
@@ -11902,7 +11916,13 @@ func gen_expr(scalar $cg, scalar $node) void {
                     if (defined($cg->{"cells_malloc_d"})
                         && defined($cg->{"cells_malloc_d"}->{$varname})
                         && $cg->{"cells_malloc_d"}->{$varname} == 1) {
-                        emit($cg, "strada_cell_incref(__perla_cell[" . $cidx . "]); ");
+                        # Same runtime alloc-vs-incref as the first-capture path:
+                        # this "reuse" closure may actually be the first to run
+                        # (the textual first sits in an un-taken conditional), or
+                        # a new foreach iteration may have left __perla_cell[N]
+                        # holding a stale prior-iteration cell. Alloc fresh when
+                        # the slot is empty/stale; else incref to share.
+                        emit($cg, "if (!__perla_cell[" . $cidx . "] || *__perla_cell[" . $cidx . "] != " . $vn . ") { __perla_cell[" . $cidx . "] = strada_cell_alloc(); *__perla_cell[" . $cidx . "] = " . $vn . "; if (" . $vn . ") strada_incref(" . $vn . "); } else { strada_cell_incref(__perla_cell[" . $cidx . "]); } ");
                     }
                 }
                 $ci++;
