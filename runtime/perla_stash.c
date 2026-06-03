@@ -10062,6 +10062,20 @@ static StradaValue *perla_class_data_lookup(const char *pkg, const char *name) {
         PerlGlob *g = perla_glob_get(stash, name);
         if (g && g->slots[PERLA_SLOT_SCALAR]) {
             StradaValue *v = g->slots[PERLA_SLOT_SCALAR];
+            /* Class data (inherited/mk_classdata accessors) lives for the whole
+             * program in this package-global glob slot. Make it immortal so an
+             * accidental over-decref by a caller can't drop it to zero, free it,
+             * and let its StradaValue struct be recycled by the SV pool out from
+             * under the slot. Concretely this fixed DBIx::Class table_class:
+             * ResultSourceProxy::Table's `table` borrows `my $table_class =
+             * $class->table_class` into the cleanup-drained args array of
+             * `ensure_class_loaded($table_class)` without an incref, freeing it
+             * over-decref'd the shared default string to 0, and add_columns'
+             * strada_new_array reused its struct → `$class->table_class`
+             * returned a COLUMNS array → require(ARRAYREF) → "Can't locate
+             * ARRAY(..).pm". (gdb watchpoint confirmed the STR→ARRAY reuse.) */
+            if (!STRADA_IS_TAGGED_INT(v) && v->refcount < 1000000000)
+                v->refcount = 2000000000;
             strada_incref(v);
             return v;
         }
