@@ -3760,7 +3760,14 @@ StradaValue *perla_call_code(StradaValue *code_val, StradaValue *args) {
         }
 
         void *fptr = dlsym(RTLD_DEFAULT, fn_name);
-        StradaValue *result = strada_new_undef();
+        /* Don't pre-allocate the undef here: every branch below that resolves
+         * the sub reassigns `result` and returns it immediately, so a
+         * pre-allocated undef leaks one StradaValue per call. This is the
+         * hot path for tied FETCH/STORE (the CODE slot holds the C-symbol
+         * name as a STRADA_STR, so dispatch lands here and dlsym finds it) —
+         * ~32 bytes leaked per tied access. Materialize the undef only on the
+         * no-match fallthrough at the end of this block. */
+        StradaValue *result = NULL;
         if (fptr) {
             result = ((StradaValue*(*)(StradaValue*))fptr)(args);
             free(fn_name);
@@ -3866,7 +3873,7 @@ StradaValue *perla_call_code(StradaValue *code_val, StradaValue *args) {
             }
         }
         free(fn_name);
-        return result;
+        return result ? result : strada_new_undef();
     }
 
     return strada_new_undef();
