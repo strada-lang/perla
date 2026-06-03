@@ -7384,6 +7384,50 @@ func _gen_foreach_inner(scalar $cg, scalar $node) void {
     ind($cg); emit($cg, "/* foreach */\n");
     ind($cg); emit($cg, "{\n");
     $cg->{"indent"} = $cg->{"indent"} + 1;
+    # `for ( grep { COND } $a, $b, ... ) { BODY }` (default $_) — Perl's grep
+    # returns ALIASES to the source elements, so `$_ = X` in BODY writes back to
+    # the originals. perla materializes the grep result as a value copy, losing
+    # the writeback. Rewrite to iterate the grep's SOURCE list directly (reusing
+    # the literal-lvalue-list aliasing/writeback below, which already writes back
+    # to source lexicals) and guard BODY with the grep block. Restricted to the
+    # implicit-$_ form over a literal list of plain scalar lvalues — exactly the
+    # `for ( grep { !ref } $to_class, $trait ) { $_ = ...->initialize($_) }`
+    # idiom in Class::MOP::MiniTrait::apply that blocks `use Moose`. (map is NOT
+    # handled: map returns the block's values, not source aliases.)
+    my int $fe_grep_lvalue = 0;
+    my scalar $fe_grep_block = undef;
+    if (!defined($node->{"var"})
+        && defined($node->{"list"}) && $node->{"list"}->{"type"} == Perla::AST::N_GREP()
+        && defined($node->{"list"}->{"list"})
+        && $node->{"list"}->{"list"}->{"type"} == Perla::AST::N_ANON_ARRAY()
+        && (!defined($node->{"list"}->{"list"}->{"is_ref"}) || $node->{"list"}->{"list"}->{"is_ref"} != 1)
+        && defined($node->{"list"}->{"list"}->{"elems"})
+        && defined($node->{"list"}->{"block"})) {
+        my scalar $fgsrc = $node->{"list"}->{"list"};
+        my scalar $fgelems = $fgsrc->{"elems"};
+        my int $fg_all_lv = 1;
+        my int $fg_i = 0;
+        while ($fg_i < scalar(@{$fgelems})) {
+            my scalar $fge = $fgelems->[$fg_i];
+            my int $fg_ok = 0;
+            if (defined($fge) && $fge->{"type"} == Perla::AST::N_SCALAR_VAR()
+                && defined($fge->{"name"}) && length($fge->{"name"}) > 0
+                && index($fge->{"name"}, "::") < 0 && $fge->{"name"} ne "_") {
+                my str $fgc0 = substr($fge->{"name"}, 0, 1);
+                if (!($fgc0 ge "0" && $fgc0 le "9")
+                    && !(defined($cg->{"our_vars"}) && exists($cg->{"our_vars"}->{$fge->{"name"}}))) {
+                    $fg_ok = 1;
+                }
+            }
+            if ($fg_ok == 0) { $fg_all_lv = 0; last; }
+            $fg_i = $fg_i + 1;
+        }
+        if ($fg_all_lv == 1 && scalar(@{$fgelems}) > 0) {
+            $fe_grep_lvalue = 1;
+            $fe_grep_block = $node->{"list"}->{"block"};
+            $node->{"list"} = $fgsrc;   # iterate the source; lvalue-list path writes back to the vars
+        }
+    }
     # `for (values %h)` / `for (values %$ref)` — Perl aliases the loop var to
     # each hash value slot, so `$_ *= 2` / `$v = X` inside the body writes
     # back into the hash. Detect it here; the list is then iterated key-by-key
@@ -7679,7 +7723,21 @@ func _gen_foreach_inner(scalar $cg, scalar $node) void {
     # outer `my $x`.
     my scalar $__fe_saved_ssd = $cg->{"same_scope_decls"};
     $cg->{"same_scope_decls"} = {};
+    # grep-source rewrite (see top of function): only run BODY for elements the
+    # grep block keeps. $_ is already the current source element here, so the
+    # block's `ref`/etc. checks see the right value; non-kept elements leave $_
+    # unchanged so the lvalue writeback below is a no-op for them.
+    if ($fe_grep_lvalue == 1) {
+        ind($cg); emit($cg, "if (perla_to_bool(");
+        _gen_map_block($cg, $fe_grep_block);
+        emit($cg, ")) {\n");
+        $cg->{"indent"} = $cg->{"indent"} + 1;
+    }
     gen_block_stmts($cg, $node->{"body"});
+    if ($fe_grep_lvalue == 1) {
+        $cg->{"indent"} = $cg->{"indent"} - 1;
+        ind($cg); emit($cg, "}\n");
+    }
     $cg->{"same_scope_decls"} = $__fe_saved_ssd;
     $cg->{"sub_local_scalars"} = $__fe_sls_saved;
     # Per-iter decref+NULL of body my-decls.
