@@ -24470,6 +24470,11 @@ func _gen_call(scalar $cg, scalar $node) void {
             my int $has_parens = 0;
             if (defined($node->{"has_parens"}) && $node->{"has_parens"} == 1) { $has_parens = 1; }
             emit($cg, "({ StradaValue *__xs_fn_name = perla_code_get(\"" . $call_pkg . "\", \"" . $call_fn . "\"); ");
+            # Pkg's perla_mod_init may not have run yet (a top-level call into a
+            # `use`d dependency whose init hasn't fired in the cascade) — lazy-run
+            # it and retry before failing. Fixes Moose::Exporter::_make_exporter
+            # dying "Undefined subroutine &Sub::Exporter::build_exporter".
+            emit($cg, "if (!__xs_fn_name) { perla_ensure_mod_init(\"" . $call_pkg . "\"); __xs_fn_name = perla_code_get(\"" . $call_pkg . "\", \"" . $call_fn . "\"); } ");
             emit($cg, "StradaValue *__xs_result; ");
             emit($cg, "if (__xs_fn_name) { StradaValue *__xs_args = strada_new_array(); __xs_result = perla_call_code(__xs_fn_name, __xs_args); strada_decref(__xs_args); } ");
             # When the call had explicit parens (`Foo::bar()`), it's a
@@ -24500,6 +24505,8 @@ func _gen_call(scalar $cg, scalar $node) void {
             # dispatch semantics (method calls already AUTOLOAD via
             # perla_method_resolve).
             emit($cg, "({ StradaValue *__xs_fn_name = perla_code_get(\"" . $call_pkg . "\", \"" . $call_fn . "\"); ");
+            # Lazy-init Pkg on a miss then retry (see no-args path above).
+            emit($cg, "if (!__xs_fn_name) { perla_ensure_mod_init(\"" . $call_pkg . "\"); __xs_fn_name = perla_code_get(\"" . $call_pkg . "\", \"" . $call_fn . "\"); } ");
             emit($cg, "StradaValue *__xs_args = strada_new_array(); StradaArray *__av = strada_deref_array(__xs_args); ");
             _gen_push_args($cg, $args, $argc);
             emit($cg, "StradaValue *__xs_result; ");

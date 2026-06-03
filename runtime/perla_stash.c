@@ -12258,8 +12258,24 @@ int perla_method_can_adapter(StradaValue *obj, const char *method) {
  * by dlsym'ing and calling perla_mod_init_<pkg> on demand. Each init has its
  * own `__perla_init_done` once-guard, so this is idempotent and re-entry-safe
  * (perla links -export-dynamic, so RTLD_DEFAULT resolves the symbol). */
-static void perla_ensure_mod_init(const char *pkg) {
+/* Depth of an in-progress lazy module init. The general method-dispatch
+ * lazy-init (perla_method_dispatch) only fires at depth 0: a module's init
+ * dispatches MANY methods, some of which legitimately miss, and lazy-initing
+ * each of those recursively cascades through the whole dep tree and overflows
+ * the stack. Top-level-only is enough — a method missing during another
+ * module's init means that dependency should already be ordered before it. */
+__thread int perla_lazy_init_depth = 0;
+void perla_ensure_mod_init(const char *pkg) {
     if (!pkg || !pkg[0]) return;
+    /* Each package is lazy-init-attempted at most once: re-attempting one whose
+     * init has already run (or is running) is pointless and, on the hot
+     * method-dispatch miss path, recursively cascaded through the dep tree and
+     * blew the recursion limit. The init's own __perla_init_done makes re-runs
+     * no-ops, but skipping here also avoids the re-resolve churn. */
+    static const char *tried[4096];
+    static int tried_n = 0;
+    for (int i = 0; i < tried_n; i++) if (tried[i] && strcmp(tried[i], pkg) == 0) return;
+    if (tried_n < 4096) tried[tried_n++] = strdup(pkg);
     char sym[300];
     size_t o = 0;
     const char *pfx = "perla_mod_init_";
@@ -12270,14 +12286,16 @@ static void perla_ensure_mod_init(const char *pkg) {
     }
     sym[o] = '\0';
     void (*init_fn)(void) = (void (*)(void))dlsym(RTLD_DEFAULT, sym);
-    if (init_fn) { init_fn(); return; }
+    if (init_fn) { perla_lazy_init_depth++; init_fn(); perla_lazy_init_depth--; return; }
     /* Not statically linked (precompiled as a runtime .pm.so, or not yet
      * loaded) — fall back to the require machinery, which dlopens the
      * .pm.so (RTLD_GLOBAL) and runs its init. */
     {
         extern StradaValue *perla_require_module(StradaValue *module_sv);
         StradaValue *m = strada_new_str(pkg);
+        perla_lazy_init_depth++;
         StradaValue *r = perla_require_module(m);
+        perla_lazy_init_depth--;
         if (r) strada_decref(r);
         strada_decref(m);
     }
@@ -13293,6 +13311,21 @@ StradaValue *perla_method_dispatch(StradaValue *obj, const char *method, StradaV
             fprintf(stderr, "[dispatch] %s->%s resolved to %s\n", pkg, method, kind);
         }
         return perla_call_code(g->slots[PERLA_SLOT_CODE], args);
+    }
+
+    /* Method not found in pkg's MRO yet — pkg may be a `use`d dependency whose
+     * perla_mod_init hasn't run in the cascade before this top-level dispatch
+     * (e.g. Class::MOP::Package->initialize during a Moose/Class::MOP bootstrap).
+     * Lazy-run pkg's init and re-resolve once. A re-entry guard prevents
+     * unbounded recursion: a module's init dispatches lots of methods, some of
+     * which legitimately miss (and would re-trigger lazy-init for the SAME pkg
+     * already mid-init), so skip if pkg is already on the lazy-init stack. */
+    if (pkg && perla_lazy_init_depth == 0) {
+        perla_ensure_mod_init(pkg);
+        PerlGlob *__lz_g = perla_method_resolve(pkg, method);
+        if (__lz_g && __lz_g->slots[PERLA_SLOT_CODE]) {
+            return perla_call_code(__lz_g->slots[PERLA_SLOT_CODE], args);
+        }
     }
 
     /* Fallback: Class::C3::Componentised::load_components.
