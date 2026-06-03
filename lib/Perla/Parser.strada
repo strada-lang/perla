@@ -1998,6 +1998,18 @@ func _parse_use(scalar $p) scalar {
         return Perla::AST::node(Perla::AST::N_USE());
     }
 
+    # use FFI::Platypus — a heavy XS FFI library perla can't bootstrap. It's
+    # used only lazily (Abe::Rust's `sub bind` does `FFI::Platypus->new`), so
+    # at load time only `use FFI::Platypus 1.00` runs (XSLoader + version
+    # check) and dies. Skip the `use` entirely; any code path that actually
+    # needs FFI (Rust bindings) will fail later, but the common load path
+    # (e.g. e.pl's DB search) never calls into it.
+    if ($module eq "FFI::Platypus") {
+        while (_peek_type($p) ne "SEMI" && _peek_type($p) ne "RBRACE" && !_at_end($p)) { _advance($p); }
+        _match($p, "SEMI");
+        return Perla::AST::node(Perla::AST::N_USE());
+    }
+
     # use Errno — the E* constants are provided natively (perla_init
     # PERLA_ERRNO_BIND). Skip the system Errno.pm whose FIRST statement is an
     # architecture guard: `"$Config{archname}-$Config{osvers}" eq "<frozen

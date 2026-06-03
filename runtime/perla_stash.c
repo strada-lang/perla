@@ -1395,6 +1395,14 @@ void perla_init(void) {
      * mucking with @ISA; without the stub it dies "Undefined subroutine". */
     perla_code_set("mro", "method_changed_in", strada_cpointer_new((void*)perla_noop_undef));
     perla_code_set("mro", "invalidate_all_method_caches", strada_cpointer_new((void*)perla_noop_undef));
+    /* warnings::register_categories / register_category — the `warnings::
+     * register` pragma machinery used by strictures, UNIVERSAL::isa/can, and
+     * many CPAN modules to declare custom warning categories. perla doesn't
+     * enforce per-category warning state, so a no-op is correct. Without it,
+     * loading strictures (which underlies Moo/DBIx::Class) died "Undefined
+     * subroutine &warnings::register_categories called". */
+    perla_code_set("warnings", "register_categories", strada_cpointer_new((void*)perla_noop_undef));
+    perla_code_set("warnings", "register_category",   strada_cpointer_new((void*)perla_noop_undef));
     /* Internals::* — Perl's internal builtins used by constant.pm, Readonly,
      * Type::Tiny's constant caching, etc. perla doesn't enforce the readonly
      * flag or expose refcounts, so these are no-ops. Without SvREADONLY,
