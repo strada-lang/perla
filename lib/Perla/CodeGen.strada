@@ -6566,6 +6566,20 @@ func _hoist_loop_vars(scalar $cg, scalar $node) void {
     }
 }
 
+# Shallow-copy a hashref (values are scalars/ints). Returns a fresh hashref;
+# undef in -> empty hashref out. Used to give if/else/do branches their own
+# copy of cell-tracking maps so in-branch mutations don't leak across
+# branches, and the pre-branch state is restored afterward.
+func _cg_copy_int_hash(scalar $h) scalar {
+    my hash %c = ();
+    if (defined($h)) {
+        my array @k = keys($h);
+        my int $i = 0;
+        while ($i < scalar(@k)) { $c{$k[$i]} = $h->{$k[$i]}; $i = $i + 1; }
+    }
+    return \%c;
+}
+
 # --- If/Unless ---
 func _gen_if(scalar $cg, scalar $node) void {
     # `if (my $X = expr)` — the my-decl in the condition writes to the
@@ -6639,6 +6653,11 @@ func _gen_if(scalar $cg, scalar $node) void {
     # uninitialized __perla_cell entry and segfaults on first invocation.
     my scalar $__if_saved_sc = $cg->{"shared_cells_emitted"};
     my scalar $__if_saved_cm = $cg->{"closure_cell_mirror"};
+    # cells_malloc_d must move in lockstep with shared_cells_emitted: the
+    # reuse-incref decision keys on cells_malloc_d[var]==1, so if it desyncs
+    # (branch sets it then the branch is restored while cells_malloc_d isn't)
+    # a later closure reusing the cell skips its incref -> double-free.
+    my scalar $__if_saved_cmd = $cg->{"cells_malloc_d"};
     my hash %__if_branch_dv = ();
     my array @__if_dvk = keys($__if_saved_dv);
     my int $__if_dvi = 0;
@@ -6668,6 +6687,7 @@ func _gen_if(scalar $cg, scalar $node) void {
         }
         $cg->{"closure_cell_mirror"} = \%__if_branch_cm;
     }
+    if (defined($__if_saved_cmd)) { $cg->{"cells_malloc_d"} = _cg_copy_int_hash($__if_saved_cmd); }
     # Hoist body's my-vars and decref at branch exit. Without this,
     # `if (COND) { my $w = $1; ...; }` left v_w's value stranded in the
     # C scope when the if-block ended, leaking once per evaluation.
@@ -6756,6 +6776,7 @@ func _gen_if(scalar $cg, scalar $node) void {
     $cg->{"same_scope_decls"} = $__if_saved_ssd;
     $cg->{"shared_cells_emitted"} = $__if_saved_sc;
     $cg->{"closure_cell_mirror"} = $__if_saved_cm;
+    $cg->{"cells_malloc_d"} = $__if_saved_cmd;
     $cg->{"indent"} = $cg->{"indent"} - 1;
     ind($cg); emit($cg, "}");
     if (defined($node->{"else"})) {
@@ -6809,6 +6830,7 @@ func _gen_if(scalar $cg, scalar $node) void {
             }
             $cg->{"closure_cell_mirror"} = \%__if_else_cm;
         }
+        if (defined($__if_saved_cmd)) { $cg->{"cells_malloc_d"} = _cg_copy_int_hash($__if_saved_cmd); }
         # Same hoist + shadow handling as the then-branch.
         my scalar $__if_e_saved_hoisted = $cg->{"hoisted_loop_vars"};
         my scalar $__if_e_saved_shadows = $cg->{"hoisted_shadows"};
@@ -6880,6 +6902,7 @@ func _gen_if(scalar $cg, scalar $node) void {
         $cg->{"same_scope_decls"} = $__if_saved_ssd;
         $cg->{"shared_cells_emitted"} = $__if_saved_sc;
         $cg->{"closure_cell_mirror"} = $__if_saved_cm;
+        $cg->{"cells_malloc_d"} = $__if_saved_cmd;
         $cg->{"indent"} = $cg->{"indent"} - 1;
         ind($cg); emit($cg, "}");
     }
@@ -6974,6 +6997,7 @@ func gen_if_capture_return(scalar $cg, scalar $node, str $ret_var) void {
     # captures[N] = NULL → segfault when invoked.
     my scalar $__icr_saved_sc = $cg->{"shared_cells_emitted"};
     my scalar $__icr_saved_cm = $cg->{"closure_cell_mirror"};
+    my scalar $__icr_saved_cmd = $cg->{"cells_malloc_d"};
     my hash %__icr_b1 = ();
     my array @__icr_k1 = keys($__icr_saved);
     my int $__icr_i1 = 0;
@@ -7004,11 +7028,13 @@ func gen_if_capture_return(scalar $cg, scalar $node, str $ret_var) void {
         }
         $cg->{"closure_cell_mirror"} = \%__icr_b1_cm;
     }
+    if (defined($__icr_saved_cmd)) { $cg->{"cells_malloc_d"} = _cg_copy_int_hash($__icr_saved_cmd); }
     _gen_block_stmts_capture_return($cg, $node->{$body_key}, $ret_var);
     $cg->{"declared_vars"} = $__icr_saved;
     $cg->{"same_scope_decls"} = $__icr_saved_ssd;
     $cg->{"shared_cells_emitted"} = $__icr_saved_sc;
     $cg->{"closure_cell_mirror"} = $__icr_saved_cm;
+    $cg->{"cells_malloc_d"} = $__icr_saved_cmd;
     $cg->{"indent"} = $cg->{"indent"} - 1;
     ind($cg); emit($cg, "}");
     if (defined($node->{"else"})) {
@@ -7059,11 +7085,13 @@ func gen_if_capture_return(scalar $cg, scalar $node, str $ret_var) void {
             }
             $cg->{"closure_cell_mirror"} = \%__icr_b2_cm;
         }
+        if (defined($__icr_saved_cmd)) { $cg->{"cells_malloc_d"} = _cg_copy_int_hash($__icr_saved_cmd); }
         _gen_block_stmts_capture_return($cg, $node->{"else"}, $ret_var);
         $cg->{"declared_vars"} = $__icr_saved;
         $cg->{"same_scope_decls"} = $__icr_saved_ssd;
         $cg->{"shared_cells_emitted"} = $__icr_saved_sc;
         $cg->{"closure_cell_mirror"} = $__icr_saved_cm;
+        $cg->{"cells_malloc_d"} = $__icr_saved_cmd;
         $cg->{"indent"} = $cg->{"indent"} - 1;
         ind($cg); emit($cg, "}");
     }
@@ -8393,6 +8421,7 @@ func gen_expr(scalar $cg, scalar $node) void {
         my scalar $__db_saved_dv = $cg->{"declared_vars"};
         my scalar $__db_saved_ssd = $cg->{"same_scope_decls"};
         my scalar $__db_saved_sc = $cg->{"shared_cells_emitted"};
+        my scalar $__db_saved_cmd = $cg->{"cells_malloc_d"};
         my scalar $__db_saved_ml = $cg->{"my_lexicals"};
         my hash %__db_branch_dv = ();
         if (defined($__db_saved_dv)) {
@@ -8415,6 +8444,7 @@ func gen_expr(scalar $cg, scalar $node) void {
             }
         }
         $cg->{"shared_cells_emitted"} = \%__db_branch_sc;
+        if (defined($__db_saved_cmd)) { $cg->{"cells_malloc_d"} = _cg_copy_int_hash($__db_saved_cmd); }
         my array @__db_branch_ml = ();
         if (defined($__db_saved_ml)) {
             my int $__db_mli = 0;
@@ -8542,6 +8572,7 @@ func gen_expr(scalar $cg, scalar $node) void {
         $cg->{"declared_vars"} = $__db_saved_dv;
         $cg->{"same_scope_decls"} = $__db_saved_ssd;
         $cg->{"shared_cells_emitted"} = $__db_saved_sc;
+        $cg->{"cells_malloc_d"} = $__db_saved_cmd;
         $cg->{"my_lexicals"} = $__db_saved_ml;
         # Restore lexical pragmas (use integer/utf8/bytes) at do-block exit.
         $cg->{"use_integer"} = $db_save_use_integer;

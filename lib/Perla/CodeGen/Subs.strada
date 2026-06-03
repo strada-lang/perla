@@ -510,9 +510,14 @@ func gen_sub_def(scalar $cg, scalar $node) void {
     my scalar $__sub_sc_saved = $cg->{"shared_cells"};
     my int $__sub_ci_saved = defined($cg->{"cell_idx"}) ? $cg->{"cell_idx"} : 0;
     my scalar $__sub_sce_saved = $cg->{"shared_cells_emitted"};
+    my scalar $__sub_cmd_saved = $cg->{"cells_malloc_d"};
     $cg->{"shared_cells"} = {};
     $cg->{"cell_idx"} = 0;
     $cg->{"shared_cells_emitted"} = {};
+    # Reset cells_malloc_d per-sub in lockstep with shared_cells_emitted —
+    # the reuse-incref decision keys on it; a stale value from the previous
+    # sub would mis-decide a same-named var's cell ownership.
+    $cg->{"cells_malloc_d"} = {};
 
     # Check if this sub has known direct-arg params
     my scalar $pinfo = $cg->{"sub_params"}->{$qname};
@@ -1549,6 +1554,7 @@ func gen_sub_def(scalar $cg, scalar $node) void {
     $cg->{"shared_cells"} = $__sub_sc_saved;
     $cg->{"cell_idx"} = $__sub_ci_saved;
     $cg->{"shared_cells_emitted"} = $__sub_sce_saved;
+    $cg->{"cells_malloc_d"} = $__sub_cmd_saved;
     # Restore __SUB__ self-reference tracker.
     $cg->{"current_sub_fname"} = $__cs_saved_fname;
 }
