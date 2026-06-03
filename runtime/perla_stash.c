@@ -561,6 +561,274 @@ static void perla_install_stack_guard(void) {
     sigaction(SIGSEGV, &sa, NULL);
 }
 
+/* ===================================================================
+ * Params::Util natives.
+ *
+ * Params::Util is a pure-XS module (its .pm has ZERO pure-Perl sub
+ * fallbacks and does an unconditional `XSLoader::load`). Under perla the
+ * XS bootstrap fails, which — without a native backing — is a FATAL
+ * strada_die during `use Params::Util`, aborting the whole program
+ * (hit via Moose -> Class::Load -> Data::OptList -> Params::Util while
+ * loading Abe::Bootstrap for e.pl). We register the full type-check API
+ * natively and add Params::Util to the XSLoader native-lie allowlist so
+ * its .pm.so init finishes and Exporter copies these subs to callers.
+ *
+ * Each function takes @_ as an array SV and returns the FIRST argument
+ * (the conventional Params::Util "return the value if it matches, else
+ * undef" contract). =================================================== */
+static int _perla_looks_numeric(const char *s);     /* fwd (defined later) */
+int perla_isa_check(const char *pkg, const char *target); /* fwd */
+
+static StradaValue *_pu_arg(StradaValue *args, int i) {
+    StradaArray *av = args ? strada_deref_array(args) : NULL;
+    if (!av || (int)av->size <= i) return NULL;
+    return strada_array_get(av, i);
+}
+static StradaValue *_pu_ret(StradaValue *v) {
+    if (v) { strada_incref(v); return v; }
+    return strada_new_undef();
+}
+static StradaValue *_pu_undef(void) { return strada_new_undef(); }
+/* deref'd referent type, or -1 if not a reference */
+static int _pu_reftype(StradaValue *v) {
+    if (!v || STRADA_IS_TAGGED_INT(v)) return -1;
+    /* perla represents coderefs as either STRADA_CLOSURE (anon subs) or
+     * STRADA_CPOINTER (\&named / native subs); normalize both to CLOSURE. */
+    if (v->type == STRADA_CLOSURE || v->type == STRADA_CPOINTER) return STRADA_CLOSURE;
+    if (v->type == STRADA_REGEX) return STRADA_REGEX;
+    if (v->type == STRADA_REF && v->value.rv) {
+        int rt = v->value.rv->type;
+        if (rt == STRADA_CPOINTER) return STRADA_CLOSURE;
+        return rt;
+    }
+    return -1;
+}
+static int _pu_is_blessed(StradaValue *v) {
+    return (v && !STRADA_IS_TAGGED_INT(v) && v->meta && v->meta->blessed_package);
+}
+/* /^[^\W\d]\w*$/ — a bareword identifier */
+static int _pu_is_ident(const char *s) {
+    if (!s || !s[0]) return 0;
+    const unsigned char *p = (const unsigned char *)s;
+    if (!(isalpha(*p) || *p == '_')) return 0;
+    for (p++; *p; p++) if (!(isalnum(*p) || *p == '_')) return 0;
+    return 1;
+}
+/* /^[^\W\d]\w*(?:(?:::|')\w+)*$/ — a class name */
+static int _pu_is_class(const char *s) {
+    if (!s || !s[0]) return 0;
+    const unsigned char *p = (const unsigned char *)s;
+    if (!(isalpha(*p) || *p == '_')) return 0;
+    p++;
+    while (*p) {
+        if (isalnum(*p) || *p == '_') { p++; continue; }
+        if (p[0] == ':' && p[1] == ':') { p += 2; if (!(isalpha(*p) || *p == '_')) return 0; continue; }
+        if (p[0] == '\'')               { p += 1; if (!(isalpha(*p) || *p == '_')) return 0; continue; }
+        return 0;
+    }
+    return 1;
+}
+
+static StradaValue *perla_pu_STRING(StradaValue *args) {
+    StradaValue *v = _pu_arg(args, 0);
+    if (!v) return _pu_undef();
+    if (STRADA_IS_TAGGED_INT(v)) return _pu_ret(v);               /* number */
+    if (v->type == STRADA_INT || v->type == STRADA_NUM) return _pu_ret(v);
+    if (v->type == STRADA_STR && v->value.pv && v->value.pv[0]) return _pu_ret(v);
+    return _pu_undef();
+}
+static StradaValue *perla_pu_IDENTIFIER(StradaValue *args) {
+    StradaValue *v = _pu_arg(args, 0);
+    if (!v || STRADA_IS_TAGGED_INT(v) || v->type != STRADA_STR || !v->value.pv) return _pu_undef();
+    return _pu_is_ident(v->value.pv) ? _pu_ret(v) : _pu_undef();
+}
+static StradaValue *perla_pu_CLASS(StradaValue *args) {
+    StradaValue *v = _pu_arg(args, 0);
+    if (!v || STRADA_IS_TAGGED_INT(v) || v->type != STRADA_STR || !v->value.pv) return _pu_undef();
+    return _pu_is_class(v->value.pv) ? _pu_ret(v) : _pu_undef();
+}
+static StradaValue *perla_pu_CLASSISA(StradaValue *args) {
+    StradaValue *v = _pu_arg(args, 0); StradaValue *c = _pu_arg(args, 1);
+    if (!v || STRADA_IS_TAGGED_INT(v) || v->type != STRADA_STR || !v->value.pv) return _pu_undef();
+    if (!c || STRADA_IS_TAGGED_INT(c) || c->type != STRADA_STR || !c->value.pv) return _pu_undef();
+    if (!_pu_is_class(v->value.pv)) return _pu_undef();
+    return perla_isa_check(v->value.pv, c->value.pv) ? _pu_ret(v) : _pu_undef();
+}
+static StradaValue *perla_pu_SUBCLASS(StradaValue *args) {
+    StradaValue *v = _pu_arg(args, 0); StradaValue *c = _pu_arg(args, 1);
+    if (!v || STRADA_IS_TAGGED_INT(v) || v->type != STRADA_STR || !v->value.pv) return _pu_undef();
+    if (!c || STRADA_IS_TAGGED_INT(c) || c->type != STRADA_STR || !c->value.pv) return _pu_undef();
+    if (!_pu_is_class(v->value.pv) || strcmp(v->value.pv, c->value.pv) == 0) return _pu_undef();
+    return perla_isa_check(v->value.pv, c->value.pv) ? _pu_ret(v) : _pu_undef();
+}
+static StradaValue *perla_pu_NUMBER(StradaValue *args) {
+    StradaValue *v = _pu_arg(args, 0);
+    if (!v) return _pu_undef();
+    if (STRADA_IS_TAGGED_INT(v) || v->type == STRADA_INT || v->type == STRADA_NUM) return _pu_ret(v);
+    if (v->type == STRADA_STR && v->value.pv && _perla_looks_numeric(v->value.pv)) return _pu_ret(v);
+    return _pu_undef();
+}
+static StradaValue *perla_pu_POSINT(StradaValue *args) {
+    StradaValue *v = _pu_arg(args, 0);
+    if (!v) return _pu_undef();
+    int64_t iv; int ok = 0;
+    if (STRADA_IS_TAGGED_INT(v)) { iv = STRADA_TAGGED_INT_VAL(v); ok = 1; }
+    else if (v->type == STRADA_INT) { iv = (int64_t)strada_to_int(v); ok = 1; }
+    else if (v->type == STRADA_STR && v->value.pv) {
+        const char *s = v->value.pv; const char *p = s; if (*p=='+') p++;
+        if (!*p) return _pu_undef(); for (const char *q=p; *q; q++) if (!isdigit((unsigned char)*q)) return _pu_undef();
+        iv = strtoll(s, NULL, 10); ok = 1;
+    }
+    return (ok && iv > 0) ? _pu_ret(v) : _pu_undef();
+}
+static StradaValue *perla_pu_NONNEGINT(StradaValue *args) {
+    StradaValue *v = _pu_arg(args, 0);
+    if (!v) return _pu_undef();
+    int64_t iv; int ok = 0;
+    if (STRADA_IS_TAGGED_INT(v)) { iv = STRADA_TAGGED_INT_VAL(v); ok = 1; }
+    else if (v->type == STRADA_INT) { iv = (int64_t)strada_to_int(v); ok = 1; }
+    else if (v->type == STRADA_STR && v->value.pv) {
+        const char *s = v->value.pv; const char *p = s; if (*p=='+') p++;
+        if (!*p) return _pu_undef(); for (const char *q=p; *q; q++) if (!isdigit((unsigned char)*q)) return _pu_undef();
+        iv = strtoll(s, NULL, 10); ok = 1;
+    }
+    return (ok && iv >= 0) ? _pu_ret(v) : _pu_undef();
+}
+static StradaValue *perla_pu_SCALAR(StradaValue *args) {  /* ref to a DEFINED scalar */
+    StradaValue *v = _pu_arg(args, 0);
+    if (!v || STRADA_IS_TAGGED_INT(v) || v->type != STRADA_REF || !v->value.rv) return _pu_undef();
+    int rt = v->value.rv->type;
+    if (rt == STRADA_ARRAY || rt == STRADA_HASH || rt == STRADA_CLOSURE) return _pu_undef();
+    if (rt == STRADA_UNDEF) return _pu_undef();   /* _SCALAR requires defined target */
+    return _pu_ret(v);
+}
+static StradaValue *perla_pu_SCALAR0(StradaValue *args) { /* ref to ANY scalar (undef ok) */
+    StradaValue *v = _pu_arg(args, 0);
+    if (!v || STRADA_IS_TAGGED_INT(v) || v->type != STRADA_REF || !v->value.rv) return _pu_undef();
+    int rt = v->value.rv->type;
+    if (rt == STRADA_ARRAY || rt == STRADA_HASH || rt == STRADA_CLOSURE) return _pu_undef();
+    return _pu_ret(v);
+}
+static StradaValue *perla_pu_ARRAY(StradaValue *args) {   /* unblessed arrayref, non-empty */
+    StradaValue *v = _pu_arg(args, 0);
+    if (_pu_reftype(v) != STRADA_ARRAY || _pu_is_blessed(v)) return _pu_undef();
+    StradaArray *a = strada_deref_array(v);
+    return (a && a->size > 0) ? _pu_ret(v) : _pu_undef();
+}
+static StradaValue *perla_pu_ARRAY0(StradaValue *args) {  /* unblessed arrayref, may be empty */
+    StradaValue *v = _pu_arg(args, 0);
+    if (_pu_reftype(v) != STRADA_ARRAY || _pu_is_blessed(v)) return _pu_undef();
+    return _pu_ret(v);
+}
+static StradaValue *perla_pu_ARRAYLIKE(StradaValue *args) { /* arrayref or @{}-overloaded obj */
+    StradaValue *v = _pu_arg(args, 0);
+    return (_pu_reftype(v) == STRADA_ARRAY) ? _pu_ret(v) : _pu_undef();
+}
+static StradaValue *perla_pu_HASH(StradaValue *args) {    /* unblessed hashref, non-empty */
+    StradaValue *v = _pu_arg(args, 0);
+    if (_pu_reftype(v) != STRADA_HASH || _pu_is_blessed(v)) return _pu_undef();
+    StradaHash *h = strada_deref_hash(v);
+    return (h && h->num_entries > 0) ? _pu_ret(v) : _pu_undef();
+}
+static StradaValue *perla_pu_HASH0(StradaValue *args) {   /* unblessed hashref, may be empty */
+    StradaValue *v = _pu_arg(args, 0);
+    if (_pu_reftype(v) != STRADA_HASH || _pu_is_blessed(v)) return _pu_undef();
+    return _pu_ret(v);
+}
+static StradaValue *perla_pu_HASHLIKE(StradaValue *args) { /* hashref or %{}-overloaded obj */
+    StradaValue *v = _pu_arg(args, 0);
+    return (_pu_reftype(v) == STRADA_HASH) ? _pu_ret(v) : _pu_undef();
+}
+static StradaValue *perla_pu_CODE(StradaValue *args) {    /* unblessed coderef */
+    StradaValue *v = _pu_arg(args, 0);
+    if (_pu_reftype(v) != STRADA_CLOSURE) return _pu_undef();
+    return _pu_ret(v);
+}
+static StradaValue *perla_pu_CODELIKE(StradaValue *args) { /* coderef or &{}-overloaded obj */
+    StradaValue *v = _pu_arg(args, 0);
+    if (_pu_reftype(v) == STRADA_CLOSURE) return _pu_ret(v);
+    /* blessed object: lenient — treat as code-like (most callers only ever
+     * pass real coderefs here; overload detection would need a method probe). */
+    if (_pu_is_blessed(v)) return _pu_ret(v);
+    return _pu_undef();
+}
+static StradaValue *perla_pu_INSTANCE(StradaValue *args) { /* blessed obj isa class */
+    StradaValue *v = _pu_arg(args, 0); StradaValue *c = _pu_arg(args, 1);
+    if (!_pu_is_blessed(v)) return _pu_undef();
+    if (!c || STRADA_IS_TAGGED_INT(c) || c->type != STRADA_STR || !c->value.pv) return _pu_undef();
+    return perla_isa_check(v->meta->blessed_package, c->value.pv) ? _pu_ret(v) : _pu_undef();
+}
+static StradaValue *perla_pu_INSTANCEDOES(StradaValue *args) { /* approximate DOES via isa */
+    return perla_pu_INSTANCE(args);
+}
+static StradaValue *perla_pu_INVOCANT(StradaValue *args) { /* blessed obj OR existing class name */
+    StradaValue *v = _pu_arg(args, 0);
+    if (_pu_is_blessed(v)) return _pu_ret(v);
+    if (v && !STRADA_IS_TAGGED_INT(v) && v->type == STRADA_STR && v->value.pv && _pu_is_class(v->value.pv))
+        return _pu_ret(v);
+    return _pu_undef();
+}
+static StradaValue *perla_pu_REGEX(StradaValue *args) {
+    StradaValue *v = _pu_arg(args, 0);
+    if (v && !STRADA_IS_TAGGED_INT(v) && v->type == STRADA_REGEX) return _pu_ret(v);
+    if (_pu_is_blessed(v) && strcmp(v->meta->blessed_package, "Regexp") == 0) return _pu_ret(v);
+    return _pu_undef();
+}
+static StradaValue *perla_pu_SET(StradaValue *args) {     /* non-empty arrayref of all-blessed */
+    StradaValue *v = _pu_arg(args, 0);
+    if (_pu_reftype(v) != STRADA_ARRAY) return _pu_undef();
+    StradaArray *a = strada_deref_array(v);
+    if (!a || a->size == 0) return _pu_undef();
+    for (size_t i = 0; i < a->size; i++) if (!_pu_is_blessed(strada_array_get(a, (int)i))) return _pu_undef();
+    return _pu_ret(v);
+}
+static StradaValue *perla_pu_SET0(StradaValue *args) {    /* arrayref (maybe empty) of all-blessed */
+    StradaValue *v = _pu_arg(args, 0);
+    if (_pu_reftype(v) != STRADA_ARRAY) return _pu_undef();
+    StradaArray *a = strada_deref_array(v);
+    if (a) for (size_t i = 0; i < a->size; i++) if (!_pu_is_blessed(strada_array_get(a, (int)i))) return _pu_undef();
+    return _pu_ret(v);
+}
+static StradaValue *perla_pu_HANDLE(StradaValue *args) {
+    StradaValue *v = _pu_arg(args, 0);
+    if (v && !STRADA_IS_TAGGED_INT(v) && v->type == STRADA_FILEHANDLE) return _pu_ret(v);
+    return _pu_undef();
+}
+static StradaValue *perla_pu_DRIVER(StradaValue *args) {  /* _CLASS that isa base, loadable */
+    return perla_pu_SUBCLASS(args);  /* approximation: class && isa(base) && ne base */
+}
+static StradaValue *perla_pu_CLASSDOES(StradaValue *args) { return perla_pu_CLASSISA(args); }
+
+static void perla_register_params_util(void) {
+    perla_code_set("Params::Util", "_STRING",       strada_cpointer_new((void*)perla_pu_STRING));
+    perla_code_set("Params::Util", "_IDENTIFIER",   strada_cpointer_new((void*)perla_pu_IDENTIFIER));
+    perla_code_set("Params::Util", "_CLASS",        strada_cpointer_new((void*)perla_pu_CLASS));
+    perla_code_set("Params::Util", "_CLASSISA",     strada_cpointer_new((void*)perla_pu_CLASSISA));
+    perla_code_set("Params::Util", "_SUBCLASS",     strada_cpointer_new((void*)perla_pu_SUBCLASS));
+    perla_code_set("Params::Util", "_CLASSDOES",    strada_cpointer_new((void*)perla_pu_CLASSDOES));
+    perla_code_set("Params::Util", "_DRIVER",       strada_cpointer_new((void*)perla_pu_DRIVER));
+    perla_code_set("Params::Util", "_NUMBER",       strada_cpointer_new((void*)perla_pu_NUMBER));
+    perla_code_set("Params::Util", "_POSINT",       strada_cpointer_new((void*)perla_pu_POSINT));
+    perla_code_set("Params::Util", "_NONNEGINT",    strada_cpointer_new((void*)perla_pu_NONNEGINT));
+    perla_code_set("Params::Util", "_SCALAR",       strada_cpointer_new((void*)perla_pu_SCALAR));
+    perla_code_set("Params::Util", "_SCALAR0",      strada_cpointer_new((void*)perla_pu_SCALAR0));
+    perla_code_set("Params::Util", "_ARRAY",        strada_cpointer_new((void*)perla_pu_ARRAY));
+    perla_code_set("Params::Util", "_ARRAY0",       strada_cpointer_new((void*)perla_pu_ARRAY0));
+    perla_code_set("Params::Util", "_ARRAYLIKE",    strada_cpointer_new((void*)perla_pu_ARRAYLIKE));
+    perla_code_set("Params::Util", "_HASH",         strada_cpointer_new((void*)perla_pu_HASH));
+    perla_code_set("Params::Util", "_HASH0",        strada_cpointer_new((void*)perla_pu_HASH0));
+    perla_code_set("Params::Util", "_HASHLIKE",     strada_cpointer_new((void*)perla_pu_HASHLIKE));
+    perla_code_set("Params::Util", "_CODE",         strada_cpointer_new((void*)perla_pu_CODE));
+    perla_code_set("Params::Util", "_CODELIKE",     strada_cpointer_new((void*)perla_pu_CODELIKE));
+    perla_code_set("Params::Util", "_INVOCANT",     strada_cpointer_new((void*)perla_pu_INVOCANT));
+    perla_code_set("Params::Util", "_REGEX",        strada_cpointer_new((void*)perla_pu_REGEX));
+    perla_code_set("Params::Util", "_INSTANCE",     strada_cpointer_new((void*)perla_pu_INSTANCE));
+    perla_code_set("Params::Util", "_INSTANCEDOES", strada_cpointer_new((void*)perla_pu_INSTANCEDOES));
+    perla_code_set("Params::Util", "_SET",          strada_cpointer_new((void*)perla_pu_SET));
+    perla_code_set("Params::Util", "_SET0",         strada_cpointer_new((void*)perla_pu_SET0));
+    perla_code_set("Params::Util", "_HANDLE",       strada_cpointer_new((void*)perla_pu_HANDLE));
+}
+
 void perla_init(void) {
     if (g_initialized) return;
     g_initialized = 1;
@@ -1748,6 +2016,7 @@ void perla_init(void) {
      * blocked DBIC join generation. Native impls + seed @EXPORT_OK so
      * `use List::Util qw(first ...)` populates the caller's stash via
      * perla_exporter_import. */
+    perla_register_params_util();
     perla_code_set("List::Util", "first", strada_cpointer_new((void*)perla_list_util_first));
     perla_code_set("List::Util", "any",   strada_cpointer_new((void*)perla_list_util_any));
     perla_code_set("List::Util", "all",   strada_cpointer_new((void*)perla_list_util_all));

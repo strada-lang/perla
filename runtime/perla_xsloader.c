@@ -396,6 +396,14 @@ StradaValue *perla_xsloader_load(StradaValue *args) {
                 /* Time::HiRes: gettimeofday/tv_interval/time/sleep/usleep are
                  * registered natively. */
                 "Time::HiRes",
+                /* Params::Util is pure-XS with NO pure-Perl fallback in its
+                 * .pm (unconditional XSLoader::load). perla registers the full
+                 * type-check API natively (_STRING/_INSTANCE/_CODELIKE/
+                 * _HASHLIKE/_ARRAYLIKE/...), so a fatal XSLoader death during
+                 * `use Params::Util` would abort the program. Lie success: the
+                 * .pm.so finishes init, Exporter copies the native subs.
+                 * Hit via Moose -> Class::Load -> Data::OptList. */
+                "Params::Util",
                 NULL,
             };
             for (int ni = 0; native_lie_modules[ni]; ni++) {
