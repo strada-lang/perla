@@ -826,6 +826,71 @@ static StradaValue *perla_vm_const0(StradaValue *args)  { (void)args; return STR
 static StradaValue *perla_vm_const1(StradaValue *args)  { (void)args; return STRADA_MAKE_TAGGED_INT(1); }
 static StradaValue *perla_vm_const2(StradaValue *args)  { (void)args; return STRADA_MAKE_TAGGED_INT(2); }
 
+/* ===================================================================
+ * Class::MOP @ISA wiring + metaclass-compatibility methods.
+ *
+ * perla provides Class::MOP natively (flat perla_code_set registrations) and
+ * does NOT run the real Class/MOP/*.pm bodies — so the @ISA chain those .pm
+ * files build via `use parent` is never set, and pure-Perl methods defined on
+ * a base (e.g. Class::MOP::Object::_can_be_made_compatible_with) are missing
+ * from subclasses. `use Moose` reconciles metaclasses during bootstrap and
+ * calls $meta->_can_be_made_compatible_with(...), which died
+ * "Can't locate object method" on Class::MOP::Method::Constructor.
+ *
+ * Wire the hierarchy natively and register the small set of compatibility
+ * helpers. During a normal bootstrap the metaclasses are already compatible
+ * (the subclass metaclass isa the superclass one), so _is_compatible_with is
+ * true and _can_be_made_compatible_with is false (no reconciliation needed —
+ * which perla can't perform anyway). ================================== */
+static StradaValue *perla_mop_real_ref_name(StradaValue *args) {
+    StradaValue *self = _pu_arg(args, 0);
+    if (_pu_is_blessed(self)) return strada_new_str(self->meta->blessed_package);
+    return strada_new_undef();
+}
+static StradaValue *perla_mop_is_compatible_with(StradaValue *args) {
+    StradaValue *self = _pu_arg(args, 0);
+    StradaValue *other = _pu_arg(args, 1);
+    if (!_pu_is_blessed(self)) return strada_new_str(""); /* false */
+    char *on = other ? strada_to_str(other) : NULL;
+    int r = (on && perla_isa_check(self->meta->blessed_package, on)) ? 1 : 0;
+    if (on) free(on);
+    return r ? STRADA_MAKE_TAGGED_INT(1) : strada_new_str("");
+}
+static StradaValue *perla_mop_can_be_made_compatible_with(StradaValue *args) {
+    /* !_is_compatible_with && defined(_get_compatible_metaclass). perla cannot
+     * synthesize a compatible metaclass, so report "no reconciliation" (false).
+     * For an already-compatible pair the real method is false too, so the
+     * common bootstrap path is unaffected; genuinely-incompatible custom
+     * metaclasses (rare) would surface their own error downstream. */
+    return strada_new_str(""); /* false */
+}
+
+static void perla_register_class_mop_isa(void) {
+    /* parent links mirroring the Class/MOP/*.pm `use parent` declarations */
+    perla_isa_push("Class::MOP::Object",             "Class::MOP::Mixin");
+    perla_isa_push("Class::MOP::Method",             "Class::MOP::Object");
+    perla_isa_push("Class::MOP::Method::Generated",  "Class::MOP::Method");
+    perla_isa_push("Class::MOP::Method::Inlined",    "Class::MOP::Method::Generated");
+    perla_isa_push("Class::MOP::Method::Constructor","Class::MOP::Method::Inlined");
+    perla_isa_push("Class::MOP::Method::Accessor",   "Class::MOP::Method::Generated");
+    perla_isa_push("Class::MOP::Method::Wrapped",    "Class::MOP::Method");
+    perla_isa_push("Class::MOP::Package",            "Class::MOP::Object");
+    perla_isa_push("Class::MOP::Module",             "Class::MOP::Package");
+    perla_isa_push("Class::MOP::Class",              "Class::MOP::Module");
+    perla_isa_push("Class::MOP::Class",              "Class::MOP::Mixin::HasMethods");
+    perla_isa_push("Class::MOP::Class",              "Class::MOP::Mixin::HasAttributes");
+    perla_isa_push("Class::MOP::Attribute",          "Class::MOP::Mixin::AttributeCore");
+    perla_isa_push("Class::MOP::Attribute",          "Class::MOP::Object");
+    perla_isa_push("Class::MOP::Instance",           "Class::MOP::Object");
+    /* compatibility helpers live on Class::MOP::Object (inherited by all) */
+    perla_code_set("Class::MOP::Object", "_real_ref_name",
+                   strada_cpointer_new((void*)perla_mop_real_ref_name));
+    perla_code_set("Class::MOP::Object", "_is_compatible_with",
+                   strada_cpointer_new((void*)perla_mop_is_compatible_with));
+    perla_code_set("Class::MOP::Object", "_can_be_made_compatible_with",
+                   strada_cpointer_new((void*)perla_mop_can_be_made_compatible_with));
+}
+
 static void perla_register_variable_magic(void) {
     perla_code_set("Variable::Magic", "_wizard", strada_cpointer_new((void*)perla_vm_wizard_));
     perla_code_set("Variable::Magic", "cast",    strada_cpointer_new((void*)perla_vm_cast));
@@ -2068,6 +2133,7 @@ void perla_init(void) {
      * perla_exporter_import. */
     perla_register_params_util();
     perla_register_variable_magic();
+    perla_register_class_mop_isa();
     perla_code_set("List::Util", "first", strada_cpointer_new((void*)perla_list_util_first));
     perla_code_set("List::Util", "any",   strada_cpointer_new((void*)perla_list_util_any));
     perla_code_set("List::Util", "all",   strada_cpointer_new((void*)perla_list_util_all));
