@@ -1998,6 +1998,20 @@ func _parse_use(scalar $p) scalar {
         return Perla::AST::node(Perla::AST::N_USE());
     }
 
+    # use Errno — the E* constants are provided natively (perla_init
+    # PERLA_ERRNO_BIND). Skip the system Errno.pm whose FIRST statement is an
+    # architecture guard: `"$Config{archname}-$Config{osvers}" eq "<frozen
+    # build arch>" or die "Errno architecture ... does not match executable
+    # architecture (...)"`. perla's %Config is empty so that string is "-" and
+    # the guard dies the moment Errno is pulled in (transitively, e.g. via
+    # IO/Fcntl/POSIX). Consume the import list and skip the .pm; qualified
+    # `Errno::EEXIST` and `$!{EEXIST}` use the natives.
+    if ($module eq "Errno") {
+        while (_peek_type($p) ne "SEMI" && _peek_type($p) ne "RBRACE" && !_at_end($p)) { _advance($p); }
+        _match($p, "SEMI");
+        return Perla::AST::node(Perla::AST::N_USE());
+    }
+
     # use bigint / use bignum — provided natively (arbitrary-precision integer
     # arithmetic, routed through perla_bigint_binop under a codegen flag). The
     # system bigint.pm pulls in Math::BigInt + Carp and hangs the require
