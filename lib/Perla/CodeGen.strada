@@ -4238,6 +4238,18 @@ func gen_stmt(scalar $cg, scalar $node) void {
                     ind($cg); emit($cg, "extern int perla_call_depth;\n");
                     ind($cg); emit($cg, "const char *__sav_ucp = perla_use_caller_pkg;\n");
                     ind($cg); emit($cg, "int __sav_cd = perla_call_depth;\n");
+                    # Forcing perla_call_depth=0 (below) makes the import's own
+                    # perla_call_push calls (e.g. Sub::Exporter's
+                    # default_installer chain) OVERWRITE the existing call-stack
+                    # slots — including THIS module's own (init) frame. Restoring
+                    # only the depth afterwards leaves those slots holding the
+                    # import's stale frames, so a later `caller()` in this
+                    # module's top-level code reads the wrong package (e.g.
+                    # "Sub::Exporter" instead of the consuming module). Snapshot
+                    # the soon-to-be-clobbered slots [0,__sav_cd) and restore
+                    # their contents after the dispatch.
+                    ind($cg); emit($cg, "PerlaCallFrame __sav_cf[256]; int __sav_nf = (__sav_cd < 256) ? __sav_cd : 256;\n");
+                    ind($cg); emit($cg, "for (int __cfi = 0; __cfi < __sav_nf; __cfi++) __sav_cf[__cfi] = perla_call_stack[__cfi];\n");
                     ind($cg); emit($cg, "perla_use_caller_pkg = \"" . $cg->{"pkg"} . "\";\n");
                     ind($cg); emit($cg, "perla_call_depth = 0;\n");
                     ind($cg); emit($cg, "StradaValue *__ir = NULL;\n");
@@ -4267,6 +4279,7 @@ func gen_stmt(scalar $cg, scalar $node) void {
                     $cg->{"indent"} = $cg->{"indent"} - 1;
                     ind($cg); emit($cg, "}\n");
                     ind($cg); emit($cg, "perla_call_depth = __sav_cd;\n");
+                    ind($cg); emit($cg, "for (int __cfi2 = 0; __cfi2 < __sav_nf; __cfi2++) perla_call_stack[__cfi2] = __sav_cf[__cfi2];\n");
                     ind($cg); emit($cg, "perla_use_caller_pkg = __sav_ucp;\n");
                     ind($cg); emit($cg, "if (__ir) strada_decref(__ir);\n");
                     ind($cg); emit($cg, "strada_decref(__icls);\n");
