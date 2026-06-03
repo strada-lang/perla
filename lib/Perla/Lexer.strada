@@ -25,7 +25,7 @@ func lex(str $source) array {
         }
     }
     my array @tokens = ();
-    my int $len = length($source);
+    my int $len = core::byte_length($source);
     my hash %lx = ();
     $lx{"src"} = $source;
     $lx{"pos"} = 0;
@@ -1821,7 +1821,7 @@ func lex(str $source) array {
                     my str $after = "";
                     if ($body_end < $len) { $after = substr($source, $body_end); }
                     $source = $before . $after;
-                    $len = length($source);
+                    $len = core::byte_length($source);
                     $lx{"src"} = $source;
                     $lx{"len"} = $len;
                     # Push the heredoc body as a STRING/DQSTRING token at the
@@ -2221,7 +2221,7 @@ func _is_ident_start(str $ch) int {
 # Handles nested braces, C strings, C comments
 func _read_c_block(scalar $lx) str {
     my str $source = $lx->{"src"};
-    my int $len = length($source);
+    my int $len = core::byte_length($source);
 
     # Skip whitespace to opening {
     while ($lx->{"pos"} < $len) {

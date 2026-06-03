@@ -328,9 +328,15 @@ func expand_tr_charset(str $s) str {
 func escape_c_str(str $s) str {
     my str $out = "";
     my int $i = 0;
-    my int $len = length($s);
+    # Iterate BYTES, not codepoints: a value carrying multibyte UTF-8 (e.g. a
+    # `use utf8` literal with `Ḣ` = \xe1\xb8\xa8) must have every raw byte
+    # emitted into the C literal. `length()`/`substr()` are codepoint-oriented
+    # (strada_length_chars_sv ignores the byte flag), which dropped the trailing
+    # (bytelen - codepoints) bytes — truncating Locale::SubCountry::Codes' 530KB
+    # JSON blob and crashing its decode. byte_length/byte_substr are byte-exact.
+    my int $len = core::byte_length($s);
     while ($i < $len) {
-        my str $ch = substr($s, $i, 1);
+        my str $ch = core::byte_substr($s, $i, 1);
         if ($ch eq "\\") { $out = $out . "\\\\"; }
         elsif ($ch eq "\"") { $out = $out . "\\\""; }
         elsif ($ch eq "\n") { $out = $out . "\\n"; }

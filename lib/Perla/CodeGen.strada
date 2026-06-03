@@ -8285,7 +8285,12 @@ func gen_expr(scalar $cg, scalar $node) void {
         if ($__sl_utf8 == 1) {
             my str $__sl_val = $node->{"value"};
             my str $__sl_esc = Perla::CodeGen::Escape::escape_c_str($__sl_val);
-            emit($cg, "strada_new_str_len_utf8(\"" . $__sl_esc . "\", " . length($__sl_val) . ")");
+            # The length arg to strada_new_str_len_utf8 is the BYTE length of the
+            # emitted C literal — NOT the codepoint count. `length()` here is
+            # char-oriented (strada_length_chars_sv ignores the byte flag), so a
+            # multi-byte literal got truncated to its codepoint count of bytes
+            # (e.g. a `use utf8` string with `Ḩ` lost 2 bytes). Use byte length.
+            emit($cg, "strada_new_str_len_utf8(\"" . $__sl_esc . "\", " . core::byte_length($__sl_val) . ")");
         } else {
             emit($cg, "strada_new_str(\"" . Perla::CodeGen::Escape::escape_c_str($node->{"value"}) . "\")");
         }
