@@ -410,6 +410,22 @@ StradaValue *perla_xsloader_load(StradaValue *args) {
                  * B::Hooks::EndOfScope and namespace::clean LOAD (pulled in by
                  * Moose then Class::MOP). Scope-end cleanup silently no-ops. */
                 "Variable::Magic",
+                /* Moose ships a shared XS object (Moose.so) that Class::MOP
+                 * loads via `XSLoader::load("Moose")` for accelerated meta
+                 * accessors/type-checks. perla backs the Class::MOP/Moose
+                 * metaobject protocol natively (perla_mop_*), so the XS load
+                 * failing must be non-fatal — otherwise `use Moose` aborts the
+                 * program during Class::MOP init. Lie success: the .pm finishes,
+                 * calls land on perla's native MOP. */
+                "Moose",
+                /* Sub::Name is pure-XS (subname — names anon coderefs). perla
+                 * registers subname natively; Moose/Class::MOP::Mixin::
+                 * HasMethods name every generated method with it, so a fatal
+                 * XSLoader death during `use Sub::Name` aborts `use Moose`. */
+                "Sub::Name",
+                /* mro is a core pure-XS module (method resolution order). perla
+                 * registers mro::get_linear_isa/get_mro/set_mro/... natively. */
+                "mro",
                 NULL,
             };
             for (int ni = 0; native_lie_modules[ni]; ni++) {
