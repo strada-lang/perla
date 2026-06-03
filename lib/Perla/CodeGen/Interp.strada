@@ -1511,7 +1511,18 @@ func emit_interp_part(scalar $cg, str $p) void {
             Perla::CodeGen::emit($cg, "  const char *__lse = (perla_lse && !STRADA_IS_TAGGED_INT(perla_lse) && perla_lse->type == STRADA_STR && perla_lse->value.pv) ? perla_lse->value.pv : \" \"; ");
             Perla::CodeGen::emit($cg, "  StradaValue *__xs_arr = __xs_r; if (__xs_r->type == STRADA_REF) __xs_arr = __xs_r->value.rv; ");
             Perla::CodeGen::emit($cg, "  char *__js = strada_join(__lse, strada_deref_array(__xs_arr)); ");
-            Perla::CodeGen::emit($cg, "  strada_decref(__xs_r); __xs_r = strada_new_str(__js); free(__js); ");
+            # The inner expression's array is decref'd only when we OWN it
+            # (e.g. `map`/`grep`/a list literal produce a fresh array). When
+            # the inner is a borrowed aggregate — a bare `@arr`, `@$ref`, `%h`
+            # — gen_expr hands back the variable's own backbone WITHOUT an
+            # incref, so decref'ing it here drops its last ref and frees it,
+            # emptying the source. `@{[ @arr ]}` printed correctly but left
+            # @arr (and @$ref / %h) empty afterward.
+            if (Perla::CodeGen::expr_is_borrowed($__xs_expr_node) == 1) {
+                Perla::CodeGen::emit($cg, "  __xs_r = strada_new_str(__js); free(__js); ");
+            } else {
+                Perla::CodeGen::emit($cg, "  strada_decref(__xs_r); __xs_r = strada_new_str(__js); free(__js); ");
+            }
             Perla::CodeGen::emit($cg, "} __xs_r; })");
         } else {
             # Parser failed — fall back to runtime eval (with lexicals if
