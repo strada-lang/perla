@@ -19220,9 +19220,19 @@ func _gen_call(scalar $cg, scalar $node) void {
             # through to the default codegen which actually CALLS the
             # sub and checks its return — recursive subs that return
             # undef on entry then look "undefined" via this path.
+            # Only the AMPERSAND introspection form — `defined &$f` / `defined
+            # &{$ref}` (no parens) — is a stash lookup. The parser marks those
+            # with pass_caller_args=1. A real coderef CALL — `$f->($x)` (arrow)
+            # or `&$f($x)` (parens) — has no pass_caller_args and must be
+            # EVALUATED then checked for definedness. Without this guard,
+            # `defined($f->($x))` was compiled as `defined &$f`: it stringified
+            # the closure and did perla_code_get on the (garbage) name, so it
+            # never called $f and reported undef — broke Data::OptList's
+            # `defined($_->($value))` (Sub::Exporter → Moose::Util load).
             if (defined($arg0) && $arg0->{"type"} == Perla::AST::N_CALL()
                 && defined($arg0->{"name"}) && $arg0->{"name"} eq "__coderef__"
-                && defined($arg0->{"coderef"})) {
+                && defined($arg0->{"coderef"})
+                && defined($arg0->{"pass_caller_args"}) && $arg0->{"pass_caller_args"} == 1) {
                 my scalar $cref = $arg0->{"coderef"};
                 my int $is_stringy = 0;
                 my scalar $name_expr = undef;
