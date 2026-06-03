@@ -4313,7 +4313,20 @@ StradaValue *perla_call_code(StradaValue *code_val, StradaValue *args) {
                             }
                             strada_hv_store(target, attr_key, av->elements[1]);
                             free(fn_name);
-                            return av->elements[1];
+                            /* Return the value OWNED. strada_hv_store keeps its
+                             * own incref'd ref in the slot; av->elements[1] is
+                             * still owned by the args array. A method return is
+                             * owned by contract, so void/statement context will
+                             * decref it — without this incref that decref, plus
+                             * the args-array free, over-decref the value to 0
+                             * while the slot still points at it → dangling slot.
+                             * Surfaced as garbage reads from mk_group_accessors
+                             * 'simple' accessors (DBIx::Class _unique_constraints
+                             * / _relationships etc.) — use-after-free returning
+                             * reused memory. */
+                            { StradaValue *__rv = av->elements[1];
+                              if (__rv) strada_incref(__rv);
+                              return __rv ? __rv : strada_new_undef(); }
                         }
                         /* Getter: $obj->name. If the slot is empty/undef AND
                          * the attribute has a lazy default, invoke it now and
