@@ -1025,18 +1025,27 @@ static void perla_register_class_mop_isa(void) {
     static const char *const mop_meta_noop_methods[] = {
         "add_attribute", "add_method", "_add_meta_method", "clone_object",
         /* perla doesn't model metaclass reconciliation (upgrading a class's
-         * metaclass to a subclass's). Its machinery walks superclass
-         * metaclasses that are undef under perla and dies in
-         * _class_metaclass_can_be_made_compatible ($super_meta->_real_ref_name
-         * on undef). No-op the entry point — perla's metaclasses are already
-         * the right class. */
+         * metaclass to a subclass's). The whole compatibility/fix family walks
+         * superclass metaclasses that are undef under perla and dies (e.g.
+         * _class_metaclass_can_be_made_compatible -> $super_meta->_real_ref_name
+         * on undef). No-op the entire family — perla's metaclasses are already
+         * the right class, so nothing needs reconciling. */
         "_check_metaclass_compatibility",
+        "_can_be_made_compatible",
+        "_class_metaclass_can_be_made_compatible",
+        "_single_metaclass_can_be_made_compatible",
+        "_fix_metaclass_incompatibility",
+        "_fix_class_metaclass_incompatibility",
+        "_fix_single_metaclass_incompatibility",
         NULL
     };
     const char *const mc_pkgs[] = { "Moose::Meta::Class", "Class::MOP::Class", NULL };
+    /* PROTECTED: the compiled Class::MOP .pm.so loads after perla_init and
+     * otherwise overrides these with the real methods (whose reconciliation
+     * machinery dies on undef superclass metaclasses). */
     for (int p = 0; mc_pkgs[p]; p++)
         for (int m = 0; mop_meta_noop_methods[m]; m++)
-            perla_code_set(mc_pkgs[p], mop_meta_noop_methods[m], _aa_noop);
+            perla_code_set_protected(mc_pkgs[p], mop_meta_noop_methods[m], _aa_noop);
     /* meta-instance protocol (real, not no-op — its return is chained in new) */
     StradaValue *_gmi = strada_cpointer_new((void*)perla_mop_get_meta_instance);
     StradaValue *_ci  = strada_cpointer_new((void*)perla_mop_create_instance);
