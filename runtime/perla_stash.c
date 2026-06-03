@@ -1425,7 +1425,11 @@ void perla_init(void) {
 
         /* Class::MOP::Instance accessors */
         perla_code_set("Class::MOP::Instance", "associated_metaclass", strada_cpointer_new((void*)perla_mop_associated_metaclass));
-        perla_code_set("Class::MOP::Instance", "_class_name", strada_cpointer_new((void*)perla_mop_instance_class_name));
+        /* PROTECTED: the compiled Class::MOP .pm.so otherwise overrides this
+         * with `$_[0]->associated_metaclass->name`, where perla's meta-instance
+         * returns an unblessed associated_metaclass -> "name on unblessed
+         * reference". perla's native reads the class name directly. */
+        perla_code_set_protected("Class::MOP::Instance", "_class_name", strada_cpointer_new((void*)perla_mop_instance_class_name));
         perla_code_set("Class::MOP::Instance", "set_slot_value", strada_cpointer_new((void*)perla_mop_set_slot_value));
         perla_code_set("Class::MOP::Instance", "get_slot_value", strada_cpointer_new((void*)perla_mop_get_slot_value));
         perla_code_set("Class::MOP::Instance", "is_slot_initialized", strada_cpointer_new((void*)perla_mop_get_slot_value)); /* same as get */
