@@ -58,13 +58,40 @@ extern func Perla::CodeGen::expr_is_borrowed(scalar $node) int;
 # `my (...) = \@_;` pattern — that's the standard parameter unmarshal
 # already optimized to direct args, so its `\@_` reference doesn't
 # count as "uses \@_ in the body".
+# Does an interpolated-string value reference @_ or $_[N]? The @_ lives inside
+# the raw `value` of an N_INTERP_STR (interpolation is parsed at runtime, not
+# as child AST), so the structural AST walk in body_uses_at_underscore can't
+# see it. Needles are built with chr() so Strada doesn't itself interpolate
+# them. Conservative: a false positive only disables the shift-peel (slower,
+# still correct); a false negative reads the PRE-shift @_ (the actual bug).
+func _interp_str_uses_at_underscore(str $s) int {
+    my str $at = chr(64) . chr(95);              # @_
+    my str $elem = chr(36) . chr(95) . chr(91);  # $_[
+    if (index($s, $at) >= 0) { return 1; }
+    if (index($s, $elem) >= 0) { return 1; }
+    return 0;
+}
+
 func body_uses_at_underscore(scalar $node) int {
     if (!defined($node)) { return 0; }
     if (ref($node) ne "HASH") { return 0; }
     my int $t = $node->{"type"};
+    # @_ / $_[N] interpolated inside a double-quoted string. `my $x = shift;
+    # return "rest: @_"` must NOT peel the shift, else the interpolation reads
+    # the un-shifted @_. (Surfaced via Error::TypeTiny::throw's goto target.)
+    if ($t == Perla::AST::N_INTERP_STR() && defined($node->{"value"})
+        && _interp_str_uses_at_underscore("" . $node->{"value"}) == 1) { return 1; }
     # Direct @_ references that need perla_at_.
     if ($t == Perla::AST::N_ARRAY_VAR() && defined($node->{"name"}) && $node->{"name"} eq "_") { return 1; }
     if ($t == Perla::AST::N_HASH_VAR() && defined($node->{"name"}) && $node->{"name"} eq "_") { return 1; }
+    # `goto &EXPR` / `goto $coderef` (N_GOTO_SUB) tail-calls EXPR with the
+    # CURRENT @_, so the body observes @_ — the shift-peel must NOT elide the
+    # shift's effect on it. Without this, `my $x = shift; goto $code` peeled
+    # the shift to a direct param while goto still passed the FULL pre-shift
+    # @_, so the coderef/invocant leaked into the target's @_. Surfaced by
+    # Error::TypeTiny::throw (`splice(@_,1,0,undef); goto $next`) → Type::Tiny
+    # AUTOLOAD got a CODE invocant and croaked `method "" via package "CODE"`.
+    if ($t == Perla::AST::N_GOTO_SUB()) { return 1; }
     # `$_[N]` — element access on @_. The element's array node is the scalar
     # `$_` (N_SCALAR_VAR name "_"), which `$_[N]` uses to mean @_. The old
     # check compared `$node->{"array"}` (an AST HASH node) to the STRING "_"
