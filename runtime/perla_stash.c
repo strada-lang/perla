@@ -12234,6 +12234,41 @@ int perla_method_can_adapter(StradaValue *obj, const char *method) {
     return perla_can(pkg, method);
 }
 
+/* Lazy-run a precompiled module's init on demand. A module's init may
+ * dynamically dispatch into a `use`d dependency (e.g. Types::Standard does
+ * `Types::Standard::_Stringable->Type::Tiny::_install_overloads(...)` at the
+ * top level) BEFORE that dependency's perla_mod_init_<Dep> has run in the
+ * precompiled-init cascade — so the dependency's subs aren't registered yet
+ * and a fully-qualified dispatch fails with "Can't locate object method".
+ * Perl's `use` guarantees the dependency is fully loaded first; we mirror that
+ * by dlsym'ing and calling perla_mod_init_<pkg> on demand. Each init has its
+ * own `__perla_init_done` once-guard, so this is idempotent and re-entry-safe
+ * (perla links -export-dynamic, so RTLD_DEFAULT resolves the symbol). */
+static void perla_ensure_mod_init(const char *pkg) {
+    if (!pkg || !pkg[0]) return;
+    char sym[300];
+    size_t o = 0;
+    const char *pfx = "perla_mod_init_";
+    while (*pfx && o < sizeof(sym) - 1) sym[o++] = *pfx++;
+    for (const char *q = pkg; *q && o < sizeof(sym) - 1; q++) {
+        if (q[0] == ':' && q[1] == ':') { sym[o++] = '_'; q++; }
+        else sym[o++] = *q;
+    }
+    sym[o] = '\0';
+    void (*init_fn)(void) = (void (*)(void))dlsym(RTLD_DEFAULT, sym);
+    if (init_fn) { init_fn(); return; }
+    /* Not statically linked (precompiled as a runtime .pm.so, or not yet
+     * loaded) — fall back to the require machinery, which dlopens the
+     * .pm.so (RTLD_GLOBAL) and runs its init. */
+    {
+        extern StradaValue *perla_require_module(StradaValue *module_sv);
+        StradaValue *m = strada_new_str(pkg);
+        StradaValue *r = perla_require_module(m);
+        if (r) strada_decref(r);
+        strada_decref(m);
+    }
+}
+
 StradaValue *perla_method_dispatch(StradaValue *obj, const char *method, StradaValue *args) {
     if (!obj || !method) return strada_new_undef();
     /* Perl: `undef->method` dies with `Can't call method "X" on an undefined
@@ -12332,6 +12367,20 @@ StradaValue *perla_method_dispatch(StradaValue *obj, const char *method, StradaV
                 if (g && g->slots[PERLA_SLOT_CODE]) {
                     StradaValue *code = g->slots[PERLA_SLOT_CODE];
                     return perla_call_code(code, args);
+                }
+                /* Method not registered in pkg yet — most often because pkg is
+                 * a precompiled `use`d dependency whose perla_mod_init hasn't run
+                 * in the cascade before this top-level dispatch (Type::Tiny via
+                 * Types::Standard / Type::Coercion). Lazy-run its init, then retry
+                 * the glob and the code registry. */
+                perla_ensure_mod_init(pkg_buf);
+                g = perla_glob_get(perla_stash_get_or_create(pkg_buf), bare_method);
+                if (g && g->slots[PERLA_SLOT_CODE]) {
+                    return perla_call_code(g->slots[PERLA_SLOT_CODE], args);
+                }
+                {
+                    StradaValue *reg = perla_code_get(pkg_buf, bare_method);
+                    if (reg) return perla_call_code(reg, args);
                 }
             }
         }
