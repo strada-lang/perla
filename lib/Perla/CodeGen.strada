@@ -3879,6 +3879,34 @@ func gen_stmt(scalar $cg, scalar $node) void {
     }
     if ($type == Perla::AST::N_USE()) {
         my str $mod = $node->{"module"};
+        # Pragma-scope markers bracketing an inlined use'd module's statements
+        # (see Parser.strada). Save the lexical-pragma flags before the inlined
+        # block and restore them after, so the dependency's `use strict` /
+        # `use warnings` / etc. don't leak into the consuming file.
+        if (defined($mod) && $mod eq "__pragma_save__") {
+            if (!defined($cg->{"pragma_stack"})) { $cg->{"pragma_stack"} = []; }
+            my hash %__psnap = ();
+            $__psnap{"strict_vars"} = defined($cg->{"strict_vars"}) ? $cg->{"strict_vars"} : 0;
+            $__psnap{"strict_refs"} = defined($cg->{"strict_refs"}) ? $cg->{"strict_refs"} : 0;
+            $__psnap{"strict_subs"} = defined($cg->{"strict_subs"}) ? $cg->{"strict_subs"} : 0;
+            $__psnap{"use_warnings"} = defined($cg->{"use_warnings"}) ? $cg->{"use_warnings"} : 0;
+            $__psnap{"use_integer"} = defined($cg->{"use_integer"}) ? $cg->{"use_integer"} : 0;
+            $__psnap{"use_utf8"} = defined($cg->{"use_utf8"}) ? $cg->{"use_utf8"} : 0;
+            push(@{$cg->{"pragma_stack"}}, \%__psnap);
+            return;
+        }
+        if (defined($mod) && $mod eq "__pragma_restore__") {
+            if (defined($cg->{"pragma_stack"}) && scalar(@{$cg->{"pragma_stack"}}) > 0) {
+                my scalar $__psnap = pop(@{$cg->{"pragma_stack"}});
+                $cg->{"strict_vars"} = $__psnap->{"strict_vars"};
+                $cg->{"strict_refs"} = $__psnap->{"strict_refs"};
+                $cg->{"strict_subs"} = $__psnap->{"strict_subs"};
+                $cg->{"use_warnings"} = $__psnap->{"use_warnings"};
+                $cg->{"use_integer"} = $__psnap->{"use_integer"};
+                $cg->{"use_utf8"} = $__psnap->{"use_utf8"};
+            }
+            return;
+        }
         # Register the package as "imported" so perla_code_get_walking
         # can prefer it for unqualified bareword sub calls. This makes
         # `use Encode; encode(...)` resolve to Encode::encode instead

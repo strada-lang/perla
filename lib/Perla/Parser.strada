@@ -2327,8 +2327,22 @@ func _parse_use(scalar $p) scalar {
     my scalar $prog_stmts = $p->{"prog"}->{"stmts"};
     my str $saved_pkg = $p->{"pkg"};
     $p->{"last_load_succeeded"} = 0;
+    # Lexical pragmas (use strict/warnings/integer/utf8) are FILE-scoped in
+    # Perl. perla inlines a use'd module's statements into the consuming
+    # program, which flattens scopes — so the dependency's `use strict` would
+    # leak forward and wrongly enforce strict on the consumer's later code
+    # (e.g. Abe::Bootstrap `use Abe::App;` then a bare `$lazy_load` died with
+    # "Global symbol requires explicit package name"). Bracket the inlined
+    # statements with save/restore markers the codegen honours so the
+    # dependency's pragmas don't escape it.
+    my scalar $prag_save = Perla::AST::node(Perla::AST::N_USE());
+    $prag_save->{"module"} = "__pragma_save__";
+    push(@{$prog_stmts}, $prag_save);
     _push_module_stmts($p, $prog_stmts, $module);
     my int $loaded_at_compile = $p->{"last_load_succeeded"};
+    my scalar $prag_restore = Perla::AST::node(Perla::AST::N_USE());
+    $prag_restore->{"module"} = "__pragma_restore__";
+    push(@{$prog_stmts}, $prag_restore);
 
     # Always restore original package context after module inclusion
     # (the inlined module likely changed the package context)
