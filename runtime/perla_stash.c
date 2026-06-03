@@ -23033,6 +23033,30 @@ StradaValue *perla_require_module(StradaValue *module_sv) {
     char *module = strada_to_str(module_sv);
     if (!module || !module[0]) { free(module); return strada_new_undef(); }
 
+    /* Never try to load a snake_case method name as a module. During MRO /
+     * method resolution (perla_method_resolve lazy-load) perla can hand a
+     * bareword like DBIx::Class's `add_relationship_accessor` to require();
+     * loading "add_relationship_accessor.pm" always fails, sets $@ to
+     * "Can't locate ... in @INC", and breaks the calling method (the
+     * ResultSourceProxy has_column proxy died exactly this way). Real Perl
+     * never require()s a method name. A class/module name is CamelCase or
+     * has "::"; a snake_case bareword (has '_', no "::"/"/", no uppercase —
+     * after dropping a trailing ".pm") is a method name, never a real
+     * top-level module (strict/mro/base/parent have no underscore). Skip it. */
+    {
+        size_t __ml = strlen(module);
+        const char *__chk_end = module + __ml;
+        if (__ml > 3 && strcmp(module + __ml - 3, ".pm") == 0) __chk_end = module + __ml - 3;
+        if (__chk_end > module && !strstr(module, "::") && !strchr(module, '/')) {
+            int __has_us = 0, __has_uc = 0;
+            for (const char *__p = module; __p < __chk_end; __p++) {
+                if (*__p == '_') __has_us = 1;
+                if (*__p >= 'A' && *__p <= 'Z') __has_uc = 1;
+            }
+            if (__has_us && !__has_uc) { free(module); return strada_new_undef(); }
+        }
+    }
+
     /* Perl allows `require "Foo/Bar.pm"` and `require Foo::Bar` as
      * equivalents. Class::C3::Componentised::ensure_class_loaded
      * computes a slash-form path and calls require() with it; without
