@@ -1092,7 +1092,12 @@ static void perla_register_class_mop_isa(void) {
         "Moose::Meta::Class", "Moose::Meta::Role", NULL
     };
     for (int p = 0; ps_pkgs[p]; p++)
-        perla_code_set(ps_pkgs[p], "_package_stash", _ps);
+        /* PROTECTED: the compiled Class::MOP::Package .pm.so otherwise overrides
+         * this with `$_[0]->{_package_stash} ||= Package::Stash->new($_[0]->name)`,
+         * whose cached slot is an unblessed ref under perla, so the chained
+         * `->has_symbol`/`->add_symbol`/`->get_or_add_symbol` die "on unblessed
+         * reference". perla's native always returns a fresh blessed Package::Stash. */
+        perla_code_set_protected(ps_pkgs[p], "_package_stash", _ps);
     /* make_immutable is otherwise only registered in perla_init_moose_stubs
      * (runs at `use Moose` setup) — but Class/MOP.pm's bootstrap calls
      * `->meta->make_immutable` on its own metaclasses *before* that, so wire
