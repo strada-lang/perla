@@ -1907,6 +1907,19 @@ void perla_init(void) {
         perla_hash_set("Config", "Config", cfg);
         strada_decref(cfg);
 
+        /* Config.pm does `tie %Config, 'Config', {BIG_HASH}` where TIEHASH just
+         * blesses the hash into Config — but the Config class defines NO FETCH
+         * (only TIEHASH/DESTROY/AUTOLOAD). So `$Config{key}` triggers AUTOLOAD,
+         * which `require 'Config_heavy.pl'; goto \&launcher` — and launcher
+         * never gets defined under perla, so AUTOLOAD falls through to `die
+         * "&Config::AUTOLOAD failed"`. Register a native Config::FETCH/EXISTS
+         * that just read the blessed tied hash ($_[0]) directly, so the tied
+         * %Config works without the Config_heavy.pl/launcher machinery. */
+        extern StradaValue *perla_config_fetch(StradaValue *args);
+        extern StradaValue *perla_config_exists(StradaValue *args);
+        perla_code_set("Config", "FETCH",  strada_cpointer_new((void*)perla_config_fetch));
+        perla_code_set("Config", "EXISTS", strada_cpointer_new((void*)perla_config_exists));
+
         /* @EXPORT default-imports %Config to caller. @ISA = (Exporter)
          * so `use Config` chains through perla_exporter_import. */
         StradaValue *exp = strada_new_array();
@@ -19379,6 +19392,45 @@ StradaValue *perla_gettimeofday(StradaValue *args) {
     strada_array_push_take(av, strada_new_int(sec));
     strada_array_push_take(av, strada_new_int(usec));
     return arr;
+}
+
+/* Config::FETCH($self, $key) — the tied %Config read. $self is the blessed
+ * config hash (Config.pm's TIEHASH blesses the big {archname=>...,...} hash
+ * into Config). Return $self->{$key}, or "" for unknown keys (Perl's Config
+ * returns undef, but "" is safer for the common `$Config{key} eq ...` checks
+ * and avoids uninit warnings). */
+StradaValue *perla_config_fetch(StradaValue *args) {
+    StradaArray *av = args ? strada_deref_array(args) : NULL;
+    if (!av || strada_array_length(av) < 2) return strada_new_str("");
+    StradaValue *self = strada_array_get(av, 0);
+    StradaValue *key_sv = strada_array_get(av, 1);
+    char *key = key_sv ? strada_to_str(key_sv) : NULL;
+    StradaValue *result = NULL;
+    if (self && key) {
+        StradaValue *v = strada_hv_fetch(self, key);
+        if (v && (STRADA_IS_TAGGED_INT(v) || v->type != STRADA_UNDEF)) {
+            strada_incref(v);
+            result = v;
+        }
+    }
+    if (key) free(key);
+    return result ? result : strada_new_str("");
+}
+
+/* Config::EXISTS($self, $key) — exists $Config{$key}. */
+StradaValue *perla_config_exists(StradaValue *args) {
+    StradaArray *av = args ? strada_deref_array(args) : NULL;
+    if (!av || strada_array_length(av) < 2) return STRADA_MAKE_TAGGED_INT(0);
+    StradaValue *self = strada_array_get(av, 0);
+    StradaValue *key_sv = strada_array_get(av, 1);
+    char *key = key_sv ? strada_to_str(key_sv) : NULL;
+    int found = 0;
+    if (self && key) {
+        StradaValue *v = strada_hv_fetch(self, key);
+        if (v && (STRADA_IS_TAGGED_INT(v) || v->type != STRADA_UNDEF)) found = 1;
+    }
+    if (key) free(key);
+    return STRADA_MAKE_TAGGED_INT(found);
 }
 
 /* Time::HiRes::time — current time as a float with sub-second precision
