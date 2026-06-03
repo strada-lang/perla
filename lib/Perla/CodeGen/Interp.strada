@@ -1739,6 +1739,38 @@ func scan_balanced(str $raw, int $start, str $open, str $close) int {
     return $rlen;
 }
 
+# Consume a trailing interpolation subscript chain starting at $pos: zero or
+# more of `(->)? [ BALANCED ]` or `(->)? { BALANCED }`. Returns a 2-element
+# array [chain_text, new_pos]. chain_text normalizes every element to an
+# explicit `->` (e.g. "->[0]->{b}->[1]") so the runtime-eval (X:) path parses
+# it as an ordinary deref chain. Empty string + unchanged pos if none follow.
+# Perl interpolates a full subscript chain after a `${...}[i]` / `$$ref[i]`
+# leading element; perla previously stopped after the first subscript, leaving
+# the rest as literal text (`"${$c->{a}}[0]->{b}->[1]"` printed the hashref
+# then `->{b}->[1]` verbatim). A trailing `->` not followed by a subscript
+# (e.g. `->method`) is left unconsumed, matching Perl (no method calls in
+# interpolation).
+func interp_scan_chain(str $raw, int $pos, int $len) array {
+    my str $chain = "";
+    my int $i = $pos;
+    while ($i < $len) {
+        my int $j = $i;
+        if ($j + 1 < $len && substr($raw, $j, 2) eq "->") { $j = $j + 2; }
+        if ($j >= $len) { last; }
+        my str $cc = substr($raw, $j, 1);
+        if ($cc ne "[" && $cc ne "{") { last; }
+        my str $clc = "]";
+        if ($cc eq "{") { $clc = "}"; }
+        my int $cs = $j + 1;
+        my int $ce = scan_balanced($raw, $cs, $cc, $clc);
+        if ($ce >= $len) { last; }
+        $chain = $chain . "->" . $cc . substr($raw, $cs, $ce - $cs) . $clc;
+        $i = $ce + 1;
+    }
+    my array @res = ($chain, $i);
+    return @res;
+}
+
 # Filter out _CU/_CL/_C1U/_C1L/_CE case markers from parts, build a
 # parallel wrap-state array, and emit each remaining part wrapped with
 # strada_uc/strada_lc as the markers indicate. Used by gen_interp_str
@@ -2259,8 +2291,18 @@ func gen_interp_str(scalar $cg, str $raw) void {
                             my int $ke = $ks;
                             $ke = scan_balanced($raw, $ke, "[", "]");
                             if ($ke < $len) {
-                                push(@parts, "Z:A" . chr(1) . $deref_name . chr(1) . substr($raw, $ks, $ke - $ks));
-                                $i = $ke + 1;
+                                # A further subscript chain (`${$ar}[0]->{b}[1]`)
+                                # must be carried too — switch to the X: eval
+                                # path with the full deref expression. Plain
+                                # single-subscript keeps the lighter Z: encoding.
+                                my array @__ch = interp_scan_chain($raw, $ke + 1, $len);
+                                if (length($__ch[0]) > 0) {
+                                    push(@parts, "X:" . "($" . $deref_name . ")->[" . substr($raw, $ks, $ke - $ks) . "]" . $__ch[0]);
+                                    $i = $__ch[1];
+                                } else {
+                                    push(@parts, "Z:A" . chr(1) . $deref_name . chr(1) . substr($raw, $ks, $ke - $ks));
+                                    $i = $ke + 1;
+                                }
                                 next;
                             }
                         } elsif ($tc eq "{") {
@@ -2268,8 +2310,14 @@ func gen_interp_str(scalar $cg, str $raw) void {
                             my int $ke = $ks;
                             $ke = scan_balanced($raw, $ke, "{", "}");
                             if ($ke < $len) {
-                                push(@parts, "Z:H" . chr(1) . $deref_name . chr(1) . strip_quoted_key(substr($raw, $ks, $ke - $ks)));
-                                $i = $ke + 1;
+                                my array @__ch = interp_scan_chain($raw, $ke + 1, $len);
+                                if (length($__ch[0]) > 0) {
+                                    push(@parts, "X:" . "($" . $deref_name . ")->{" . substr($raw, $ks, $ke - $ks) . "}" . $__ch[0]);
+                                    $i = $__ch[1];
+                                } else {
+                                    push(@parts, "Z:H" . chr(1) . $deref_name . chr(1) . strip_quoted_key(substr($raw, $ks, $ke - $ks)));
+                                    $i = $ke + 1;
+                                }
                                 next;
                             }
                         }
@@ -2287,11 +2335,14 @@ func gen_interp_str(scalar $cg, str $raw) void {
                             my int $sub_end = scan_balanced($raw, $sub_start, $open_ch, $close_ch);
                             if ($sub_end < $len) {
                                 my str $sub_text = substr($raw, $sub_start, $sub_end - $sub_start);
-                                # Emit `(VNAME)->[SUB]` or `->{SUB}`.
+                                # Emit `(VNAME)->[SUB]` or `->{SUB}`, then carry
+                                # any further subscript chain (`->{b}->[1]`).
                                 my str $arrow_op = ($tc eq "[") ? "->[" : "->{";
                                 my str $expr_text = "(" . $vname . ")" . $arrow_op . $sub_text . $close_ch;
+                                my array @__ch = interp_scan_chain($raw, $sub_end + 1, $len);
+                                $expr_text = $expr_text . $__ch[0];
                                 push(@parts, "X:" . $expr_text);
-                                $i = $sub_end + 1;
+                                $i = $__ch[1];
                                 next;
                             }
                         }
@@ -2365,8 +2416,17 @@ func gen_interp_str(scalar $cg, str $raw) void {
                             $ke = scan_balanced($raw, $ke, "[", "]");
                             if ($ke < $len) {
                                 if (length($buf) > 0) { push(@parts, "S:" . $buf); $buf = ""; }
-                                push(@parts, "Z:A" . chr(1) . $deref_name2 . chr(1) . substr($raw, $ks, $ke - $ks));
-                                $i = $ke + 1;
+                                # Carry a further subscript chain (`$$ar[0]->{b}[1]`)
+                                # via the X: eval path; plain single subscript
+                                # keeps the lighter Z: encoding.
+                                my array @__ch = interp_scan_chain($raw, $ke + 1, $len);
+                                if (length($__ch[0]) > 0) {
+                                    push(@parts, "X:" . "($" . $deref_name2 . ")->[" . substr($raw, $ks, $ke - $ks) . "]" . $__ch[0]);
+                                    $i = $__ch[1];
+                                } else {
+                                    push(@parts, "Z:A" . chr(1) . $deref_name2 . chr(1) . substr($raw, $ks, $ke - $ks));
+                                    $i = $ke + 1;
+                                }
                                 next;
                             }
                         } elsif ($tc2 eq "{" && $dollar_run == 1) {
@@ -2375,8 +2435,14 @@ func gen_interp_str(scalar $cg, str $raw) void {
                             $ke = scan_balanced($raw, $ke, "{", "}");
                             if ($ke < $len) {
                                 if (length($buf) > 0) { push(@parts, "S:" . $buf); $buf = ""; }
-                                push(@parts, "Z:H" . chr(1) . $deref_name2 . chr(1) . strip_quoted_key(substr($raw, $ks, $ke - $ks)));
-                                $i = $ke + 1;
+                                my array @__ch = interp_scan_chain($raw, $ke + 1, $len);
+                                if (length($__ch[0]) > 0) {
+                                    push(@parts, "X:" . "($" . $deref_name2 . ")->{" . substr($raw, $ks, $ke - $ks) . "}" . $__ch[0]);
+                                    $i = $__ch[1];
+                                } else {
+                                    push(@parts, "Z:H" . chr(1) . $deref_name2 . chr(1) . strip_quoted_key(substr($raw, $ks, $ke - $ks)));
+                                    $i = $ke + 1;
+                                }
                                 next;
                             }
                         } else {
