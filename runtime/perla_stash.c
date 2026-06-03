@@ -966,7 +966,30 @@ static StradaValue *perla_mop_create_instance(StradaValue *args) {
     return ref;
 }
 
+/* `use metaclass;` (Class::MOP — used by Moose::Meta::* internals, NOT `use
+ * Moose`) makes the consuming package a Class::MOP class and installs a `meta`
+ * method. perla had no handler, so `__PACKAGE__->meta` returned undef and
+ * `__PACKAGE__->meta->add_attribute(...)` (e.g. Moose::Meta::TypeCoercion init)
+ * died "on an undefined value". Register `meta` (-> perla_moose_meta) on the
+ * consuming package; add_attribute on the returned Moose::Meta::Class is the
+ * existing no-op. Target resolution mirrors perla_moose_import. */
+static StradaValue *perla_metaclass_import(StradaValue *args) {
+    (void)args;
+    const char *target = NULL;
+    extern const char *perla_use_caller_pkg;
+    if (perla_use_caller_pkg && perla_use_caller_pkg[0]) target = perla_use_caller_pkg;
+    if (!target && perla_call_depth > 0) {
+        const char *pkg = perla_call_stack[perla_call_depth - 1].package;
+        if (pkg && pkg[0]) target = pkg;
+    }
+    if (!target || !target[0]) target = "main";
+    perla_code_set(target, "meta", strada_cpointer_new((void*)perla_moose_meta));
+    return strada_new_undef();
+}
+
 static void perla_register_class_mop_isa(void) {
+    perla_code_set_protected("metaclass", "import",
+                             strada_cpointer_new((void*)perla_metaclass_import));
     /* parent links mirroring the Class/MOP/*.pm `use parent` declarations */
     perla_isa_push("Class::MOP::Object",             "Class::MOP::Mixin");
     perla_isa_push("Class::MOP::Method",             "Class::MOP::Object");
