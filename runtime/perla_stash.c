@@ -2090,8 +2090,11 @@ void perla_init(void) {
      * component init. Protected so the loaded Carp.pm.so doesn't
      * replace the stub with its broken impl. */
     extern StradaValue *perla_carp_longmess(StradaValue *args);
+    extern StradaValue *perla_carp_short_error_loc(StradaValue *args);
     perla_code_set_protected("Carp", "longmess", strada_cpointer_new((void*)perla_carp_longmess));
     perla_code_set_protected("Carp", "longmess_heavy", strada_cpointer_new((void*)perla_carp_longmess));
+    /* warnings.pm's _error_loc tail-calls Carp::short_error_loc at runtime. */
+    perla_code_set_protected("Carp", "short_error_loc", strada_cpointer_new((void*)perla_carp_short_error_loc));
     perla_code_set_protected("Carp", "shortmess", strada_cpointer_new((void*)perla_carp_msg_only));
     perla_code_set_protected("Carp", "shortmess_heavy", strada_cpointer_new((void*)perla_carp_msg_only));
     perla_code_set_protected("Carp", "ret_backtrace", strada_cpointer_new((void*)perla_carp_msg_only));
@@ -10553,6 +10556,33 @@ StradaValue *perla_carp_longmess(StradaValue *args) {
     StradaValue *r = strada_new_str(out);
     free(out);
     return r;
+}
+
+/* Carp::short_error_loc — internal Carp helper that warnings.pm's _error_loc
+ * tail-calls (`goto &Carp::short_error_loc`) to find the caller level whose
+ * ${^WARNING_BITS} (caller(N))[9] to consult. Real Carp lives in the
+ * unparseable-by-perla system Carp.pm, so perla supplies native Carp (see the
+ * Carp registrations near perla_stash_init); without short_error_loc the
+ * runtime warnings-category functions (warnings::enabled/warnif/warn, used at
+ * runtime by Moose, DBIx::Class, etc.) died with
+ *   "Undefined subroutine &Carp::short_error_loc called".
+ * We return the level (in perla_caller terms) of the first reportable caller
+ * by skipping leading Carp/warnings-internal frames. perla's caller() does not
+ * populate the [9] warning-bits slot, so warnings.pm falls back to $DEFAULT
+ * regardless of the exact value — but skipping internal frames keeps the
+ * returned level semantically aligned with real Carp. */
+StradaValue *perla_carp_short_error_loc(StradaValue *args) {
+    (void)args;
+    int lvl = 0;
+    for (int i = perla_call_depth - 1; i >= 0; i--) {
+        const char *pkg = perla_call_stack[i].package;
+        if (pkg && (strcmp(pkg, "warnings") == 0 || strcmp(pkg, "Carp") == 0)) {
+            lvl++;
+            continue;
+        }
+        break;
+    }
+    return STRADA_MAKE_TAGGED_INT((int64_t)lvl);
 }
 
 /* croak / confess — die() with a Carp-style message (caller location +
