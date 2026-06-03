@@ -44,4 +44,15 @@ my @src = (1, 2, 3);
 is("@{[ map { $_ * 2 } @src ]}", "2 4 6", 'babycart over map still works');
 is(scalar(@src), 3, 'map source intact');
 
+# hash babycart: flattens to k/v pairs and does NOT empty %h (order is
+# hash-implementation-defined, so compare the sorted token set, not the string).
+my %hh = (a => 1, b => 2, c => 3);
+my $hs = "@{[ %hh ]}";
+is(scalar(keys %hh), 3, '%h not emptied by babycart');
+is(join(" ", sort split / /, $hs), "1 2 3 a b c", 'babycart over %h flattens to all k/v');
+my $href = { x => 9, y => 8 };
+my $hds = "@{[ %$href ]}";
+is(scalar(keys %$href), 2, '%$ref not emptied by babycart');
+is(join(" ", sort split / /, $hds), "8 9 x y", 'babycart over %$ref flattens');
+
 done_testing;

@@ -1523,6 +1523,25 @@ func emit_interp_part(scalar $cg, str $p) void {
             } else {
                 Perla::CodeGen::emit($cg, "  strada_decref(__xs_r); __xs_r = strada_new_str(__js); free(__js); ");
             }
+            # Hash result (`@{[ %h ]}`): Perl flattens %h to (k,v,k,v,...) in
+            # list context. gen_expr hands back the raw STRADA_HASH, so flatten
+            # it into a temp array (incref'ing each k/v, mirroring the list-
+            # assign flatten in CodeGen.strada) then join. Same borrowed-gate
+            # as the array branch so a bare %h / %$ref is not emptied.
+            Perla::CodeGen::emit($cg, "} else if (__xs_r && !STRADA_IS_TAGGED_INT(__xs_r) && (__xs_r->type == STRADA_HASH || (__xs_r->type == STRADA_REF && __xs_r->value.rv && __xs_r->value.rv->type == STRADA_HASH))) { ");
+            Perla::CodeGen::emit($cg, "  const char *__lse = (perla_lse && !STRADA_IS_TAGGED_INT(perla_lse) && perla_lse->type == STRADA_STR && perla_lse->value.pv) ? perla_lse->value.pv : \" \"; ");
+            Perla::CodeGen::emit($cg, "  StradaHash *__xs_hv = (__xs_r->type == STRADA_REF) ? __xs_r->value.rv->value.hv : __xs_r->value.hv; ");
+            Perla::CodeGen::emit($cg, "  StradaValue *__xs_tmp = strada_new_array(); StradaArray *__xs_flat = strada_deref_array(__xs_tmp); ");
+            Perla::CodeGen::emit($cg, "  if (__xs_hv) { StradaArray *__xs_hk = strada_hash_keys(__xs_hv); if (__xs_hk) { for (size_t __xs_hi = 0; __xs_hi < __xs_hk->size; __xs_hi++) { ");
+            Perla::CodeGen::emit($cg, "    StradaValue *__xs_kk = __xs_hk->elements[__xs_hk->head + __xs_hi]; char *__xs_ks = strada_to_str(__xs_kk); StradaValue *__xs_hvv = strada_hash_get(__xs_hv, __xs_ks); free(__xs_ks); ");
+            Perla::CodeGen::emit($cg, "    if (__xs_kk) strada_incref(__xs_kk); strada_array_push_take(__xs_flat, __xs_kk); if (__xs_hvv) strada_incref(__xs_hvv); strada_array_push_take(__xs_flat, __xs_hvv); ");
+            Perla::CodeGen::emit($cg, "  } strada_free_array(__xs_hk); } } ");
+            Perla::CodeGen::emit($cg, "  char *__js = strada_join(__lse, __xs_flat); strada_decref(__xs_tmp); ");
+            if (Perla::CodeGen::expr_is_borrowed($__xs_expr_node) == 1) {
+                Perla::CodeGen::emit($cg, "  __xs_r = strada_new_str(__js); free(__js); ");
+            } else {
+                Perla::CodeGen::emit($cg, "  strada_decref(__xs_r); __xs_r = strada_new_str(__js); free(__js); ");
+            }
             Perla::CodeGen::emit($cg, "} __xs_r; })");
         } else {
             # Parser failed — fall back to runtime eval (with lexicals if
