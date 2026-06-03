@@ -2380,6 +2380,14 @@ void perla_init(void) {
     perla_register_params_util();
     perla_register_variable_magic();
     perla_register_class_mop_isa();
+    /* GD::Image->trueColor($bool) is an XS-only class method (sets whether new
+     * images default to truecolor). perla can't run XS GD, so the call dies
+     * "Can't locate object method trueColor". It's invoked at FILE scope in
+     * Image/Resize.pm (`GD::Image->trueColor(1);`), so merely `use`ing
+     * Image::Resize — pulled in transitively by Abe::Bootstrap, which never
+     * actually renders graphics — aborts the program. Register a no-op stub
+     * (returns 1) so the load succeeds; perla has no GD graphics regardless. */
+    perla_code_set("GD::Image", "trueColor", strada_cpointer_new((void*)perla_vm_const1));
     perla_code_set("List::Util", "first", strada_cpointer_new((void*)perla_list_util_first));
     perla_code_set("List::Util", "any",   strada_cpointer_new((void*)perla_list_util_any));
     perla_code_set("List::Util", "all",   strada_cpointer_new((void*)perla_list_util_all));
