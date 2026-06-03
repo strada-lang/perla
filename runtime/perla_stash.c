@@ -1917,8 +1917,12 @@ void perla_init(void) {
          * %Config works without the Config_heavy.pl/launcher machinery. */
         extern StradaValue *perla_config_fetch(StradaValue *args);
         extern StradaValue *perla_config_exists(StradaValue *args);
-        perla_code_set("Config", "FETCH",  strada_cpointer_new((void*)perla_config_fetch));
-        perla_code_set("Config", "EXISTS", strada_cpointer_new((void*)perla_config_exists));
+        /* _protected so the baked Config.pm.o load (which under --precompile-deps
+         * installs a compiled Config::FETCH shim that delegates to the broken
+         * AUTOLOAD) does NOT override our native FETCH — otherwise the tied
+         * %Config dispatch finds the shim → AUTOLOAD → die. */
+        perla_code_set_protected("Config", "FETCH",  strada_cpointer_new((void*)perla_config_fetch));
+        perla_code_set_protected("Config", "EXISTS", strada_cpointer_new((void*)perla_config_exists));
 
         /* @EXPORT default-imports %Config to caller. @ISA = (Exporter)
          * so `use Config` chains through perla_exporter_import. */
