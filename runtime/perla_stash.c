@@ -19382,10 +19382,8 @@ StradaValue *perla_hash_util_lock_keys(StradaValue *args) {
      * as a StradaArray attached to meta->locked_keys. */
     if (av->size > 1) {
         if (meta->locked_keys) {
-            StradaValue *old_arr = strada_new_undef();
-            old_arr->type = STRADA_ARRAY;
-            old_arr->value.av = (StradaArray *)meta->locked_keys;
-            strada_decref(old_arr);
+            strada_free_array((StradaArray *)meta->locked_keys);
+            meta->locked_keys = NULL;
         }
         StradaValue *ak_sv = strada_new_array();
         StradaArray *ak = strada_deref_array(ak_sv);
@@ -19419,11 +19417,16 @@ StradaValue *perla_hash_util_lock_keys(StradaValue *args) {
         }
         /* Stash the bare StradaArray pointer (not wrapped in SV) for
          * cheap iteration in the hot-path check. Lifetime: until
-         * unlock. */
+         * unlock. Bump the backbone's own refcount and release the SV
+         * wrapper, so the array is owned solely by meta->locked_keys
+         * (refcount 1) and freed exactly once when the hash's metadata
+         * is released or on unlock. */
+        ak->refcount++;
         meta->locked_keys = (void *)ak;
-        /* Increment the SV's refcount so it sticks around past
-         * function return. */
-        strada_incref(ak_sv);
+        strada_decref(ak_sv);
+    } else if (meta->locked_keys) {
+        strada_free_array((StradaArray *)meta->locked_keys);
+        meta->locked_keys = NULL;
     }
     meta->is_hash_locked = 1;
     strada_incref(hv);
@@ -19445,10 +19448,10 @@ StradaValue *perla_hash_util_unlock_keys(StradaValue *args) {
     if (target->type != STRADA_HASH) return strada_new_undef();
     if (target->meta) {
         target->meta->is_hash_locked = 0;
-        /* Leak the locked_keys array — acceptable since lock/unlock
-         * cycles are rare. Setting to NULL would orphan its refcount;
-         * we don't track the wrapper SV separately. */
-        target->meta->locked_keys = NULL;
+        if (target->meta->locked_keys) {
+            strada_free_array((StradaArray *)target->meta->locked_keys);
+            target->meta->locked_keys = NULL;
+        }
     }
     strada_incref(hv);
     return hv;

@@ -12640,7 +12640,7 @@ func _gen_anon_array(scalar $cg, scalar $node) void {
             emit($cg, "for (int __hi = 0; __hi < (int)strada_array_length(__hk); __hi++) { ");
             emit($cg, "StradaValue *__key = strada_array_get(__hk, __hi); ");
             emit($cg, "strada_array_push(__av, __key); ");
-            emit($cg, "char *__ks = strada_to_str(__key); strada_array_push(__av, strada_hv_fetch_owned(__hv, __ks)); free(__ks); ");
+            emit($cg, "char *__ks = strada_to_str(__key); strada_array_push_take(__av, strada_hv_fetch_owned(__hv, __ks)); free(__ks); ");
             emit($cg, "} strada_decref(strada_new_array_from_av(__hk)); } ");
         } elsif (($arg_type == Perla::AST::N_CALL() && !defined($arg->{"coderef"}))
                  || $arg_type == Perla::AST::N_METHOD()
@@ -24413,6 +24413,27 @@ func _gen_call_args_inline(scalar $cg, scalar $args, int $argc) void {
     }
 }
 
+# Push a single scalar call-argument onto the __av args array with the
+# correct ownership transfer. strada_array_push INCREFS its value, so an
+# OWNED temp (string/number literal, a \ref, a call/hash-access result, a
+# capture var) pushed that way is left at refcount 1 after the args array is
+# decref'd at the end of the call — one leaked ref per argument, and for a
+# \%hash / \@array ref that orphaned ref pins the whole container alive. Use
+# strada_array_push_take for owned temps (the args array assumes their single
+# ref) and the increfing strada_array_push only for BORROWED operands (plain
+# $var, $arr[i], derefs) which keep their own ref.
+func _gen_push_arg_scalar(scalar $cg, scalar $arg) void {
+    if (expr_is_borrowed($arg) == 1) {
+        emit($cg, "strada_array_push(__av, ");
+        gen_expr($cg, $arg);
+        emit($cg, "); ");
+    } else {
+        emit($cg, "strada_array_push_take(__av, ");
+        gen_expr($cg, $arg);
+        emit($cg, "); ");
+    }
+}
+
 func _gen_push_args(scalar $cg, scalar $args, int $argc) void {
     my int $ai = 0;
     while ($ai < $argc) {
@@ -24442,7 +24463,7 @@ func _gen_push_args(scalar $cg, scalar $args, int $argc) void {
             emit($cg, "for (int __hi = 0; __hi < (int)__hka->size; __hi++) { ");
             emit($cg, "StradaValue *__key = __hka->elements[__hi]; ");
             emit($cg, "strada_array_push(__av, __key); ");
-            emit($cg, "char *__ks = strada_to_str(__key); strada_array_push(__av, strada_hv_fetch_owned(__hv, __ks)); free(__ks); ");
+            emit($cg, "char *__ks = strada_to_str(__key); strada_array_push_take(__av, strada_hv_fetch_owned(__hv, __ks)); free(__ks); ");
             emit($cg, "} strada_free_array(__hka); } } ");
         } elsif ($arg->{"type"} == Perla::AST::N_ARRAY_VAR() || $arg->{"type"} == Perla::AST::N_DEREF_ARRAY()
                  || $arg->{"type"} == Perla::AST::N_ARRAY_SLICE() || $arg->{"type"} == Perla::AST::N_HASH_SLICE()
@@ -24471,9 +24492,7 @@ func _gen_push_args(scalar $cg, scalar $args, int $argc) void {
             my scalar $elems = $arg->{"elems"};
             my int $ei = 0;
             while ($ei < scalar(@{$elems})) {
-                emit($cg, "strada_array_push(__av, ");
-                gen_expr($cg, $elems->[$ei]);
-                emit($cg, "); ");
+                _gen_push_arg_scalar($cg, $elems->[$ei]);
                 $ei++;
             }
         } elsif ($arg->{"type"} == Perla::AST::N_ANON_ARRAY() && defined($arg->{"elems"}) && $arg->{"is_ref"} != 1) {
@@ -24496,20 +24515,18 @@ func _gen_push_args(scalar $cg, scalar $args, int $argc) void {
                     emit($cg, "strada_array_push(__av, strada_array_get(__fca, __fci)); ");
                     emit($cg, "} else { strada_array_push(__av, __fcr); } strada_decref(__fcr); } ");
                 } else {
-                    emit($cg, "strada_array_push(__av, ");
-                    gen_expr($cg, $elem);
-                    emit($cg, "); ");
+                    _gen_push_arg_scalar($cg, $elem);
                 }
                 $ei++;
             }
         } elsif ($arg->{"type"} == Perla::AST::N_CALL() && defined($arg->{"name"}) && ($arg->{"name"} eq "_definition_context" || $arg->{"name"} eq "Class::MOP::_definition_context")) {
             # Special: _definition_context returns (key => value) that must be flattened
-            emit($cg, "strada_array_push(__av, strada_new_str(\"definition_context\")); ");
+            emit($cg, "strada_array_push_take(__av, strada_new_str(\"definition_context\")); ");
             emit($cg, "{ StradaValue *__dch = strada_new_hash(); ");
             emit($cg, "strada_hv_store(__dch, \"package\", strada_new_str(\"" . $cg->{"pkg"} . "\")); ");
             emit($cg, "strada_hv_store(__dch, \"file\", strada_new_str(\"" . $cg->{"filename"} . "\")); ");
             emit($cg, "strada_hv_store(__dch, \"line\", STRADA_MAKE_TAGGED_INT(0)); ");
-            emit($cg, "strada_array_push(__av, strada_new_ref(__dch, '%')); } ");
+            emit($cg, "strada_array_push_take(__av, strada_new_ref(__dch, '%')); } ");
         } elsif (($arg->{"type"} == Perla::AST::N_CALL() && !defined($arg->{"coderef"}))
                  || $arg->{"type"} == Perla::AST::N_METHOD()
                  || $arg->{"type"} == Perla::AST::N_BINOP()
@@ -24557,9 +24574,7 @@ func _gen_push_args(scalar $cg, scalar $args, int $argc) void {
             emit($cg, "strada_array_push(__av, strada_array_get(__mcav, __mci)); ");
             emit($cg, "} else { strada_array_push(__av, __mca); } strada_decref(__mca); } ");
         } else {
-            emit($cg, "strada_array_push(__av, ");
-            gen_expr($cg, $arg);
-            emit($cg, "); ");
+            _gen_push_arg_scalar($cg, $arg);
         }
         $ai++;
     }

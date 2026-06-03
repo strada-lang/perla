@@ -54,11 +54,13 @@ for test_file in "$TEST_DIR"/*.pl; do
     # Compile with GCC. Link against perla_runtime.a (pre-built) so
     # we pick up perla_xsloader.o and everything else that's now in
     # the archive without listing each .c by name. Add -lssl/-lcrypto
-    # for the OpenSSL symbols pulled in by perla_xsloader / digest code.
+    # for the OpenSSL symbols pulled in by perla_xsloader / digest code,
+    # and -lz/-lsqlite3 for the compress/DBI symbols pulled in when a test
+    # `use`s a module (e.g. Hash::Util) that drags in perla_xsloader/perla_dbi.
     gcc -g -O0 -w -Wl,--allow-multiple-definition \
         -o "$exe" "$c_file" "$PERLA_DIR/runtime/perla_runtime.a" \
         -I"$STRADA_DIR/runtime" -I"$PERLA_DIR/runtime" \
-        -rdynamic -ldl -lm -lpthread -lmysqlclient -lssl -lcrypto \
+        -rdynamic -ldl -lm -lpthread -lmysqlclient -lssl -lcrypto -lz -lsqlite3 \
         $PCRE2_FLAGS 2>/dev/null
 
     if [ ! -f "$exe" ]; then
