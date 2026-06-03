@@ -6145,7 +6145,18 @@ func _parse_primary(scalar $p) scalar {
             # off as a sibling. `defined my $x = …` works because
             # `defined` is in the named-unary list; this rescues
             # user-defined wrappers.
-            $nt eq "MY") {
+            $nt eq "MY" ||
+            # Keyword-constant terms as the first no-paren arg:
+            # `quote_sub __PACKAGE__."::$m", ...` (DBIx::Class
+            # ResultSourceProxy installs all its proxy methods —
+            # columns/has_column/etc — exactly this way), and the
+            # analogous `func __FILE__, ...` / `__LINE__` / `__SUB__`.
+            # Without these, perla parsed the call as 0-arg and the
+            # `__PACKAGE__."..."` expression floated off as a dropped
+            # sibling, so quote_sub never installed the methods →
+            # `Can't locate object method "has_column"`.
+            $nt eq "PACKAGE_CONST" || $nt eq "FILE_CONST" ||
+            $nt eq "LINE_CONST" || $nt eq "SUB_CONST") {
             push(@{$node->{"args"}}, _parse_assign($p));
             while (_peek_type($p) eq "COMMA" || _peek_type($p) eq "FAT_ARROW") {
                 _advance($p);
