@@ -17946,7 +17946,7 @@ func _gen_hash_compound_assign(scalar $cg, scalar $target, str $op, scalar $valu
             _gen_autoviv_outer_hash($cg, $hash_expr, $hash_ctx);
             emit($cg, "; StradaValue **__slot = strada_hv_fetch_lvalue_sv(__ch, \"" . $lit_key . "\", 1); StradaValue *__cv = __slot ? *__slot : strada_hv_fetch_owned(__ch, \"" . $lit_key . "\"); ");
             _emit_hash_cmpd_nv($cg, $op, $value);
-            emit($cg, "if (__slot) { *__slot = __nv; strada_incref(__nv); if (__cv && __cv != __nv) strada_decref(__cv); } else { strada_decref(__cv); strada_hv_store(__ch, \"" . $lit_key . "\", __nv); } __nv; })");
+            emit($cg, "if (__slot) { *__slot = __nv; strada_incref(__nv); if (__cv && __cv != __nv) strada_decref(__cv); } else { strada_hv_store(__ch, \"" . $lit_key . "\", __nv); if (__cv && __cv != __nv) strada_decref(__cv); } __nv; })");
         } else {
             emit($cg, "({ StradaValue *__ch = ");
             _gen_autoviv_outer_hash($cg, $hash_expr, $hash_ctx);
@@ -17956,7 +17956,16 @@ func _gen_hash_compound_assign(scalar $cg, scalar $target, str $op, scalar $valu
             # strada_hv_store's incref); consumers take the create-ref and the
             # void-statement emitter decrefs it. _emit_hash_cmpd_nv already released
             # the owned RHS temp (previously emitted inline and leaked).
-            emit($cg, "strada_decref(__cv); strada_hv_store(__ch, \"" . $lit_key . "\", __nv); __nv; })");
+            # CRITICAL: store BEFORE decref'ing __cv, and only decref when __cv is
+            # NOT the yielded value. For `||=`/`//=` short-circuit KEEP (__nv==__cv)
+            # the old unconditional `strada_decref(__cv)` dropped the fetch_owned
+            # ref, leaving the kept element BORROWED (rc=1, hash-owned) — but the
+            # compound result is contracted OWNED, so a void/return consumer
+            # decref'd it to 0 and FREED a live hash value (slot recycled → wrong
+            # code). Mirror the lvalue path's `if (__cv && __cv != __nv)` guard.
+            # (For non-short-circuit ops __nv is always a fresh value != __cv, so
+            # the guard is always true and behavior is unchanged.)
+            emit($cg, "strada_hv_store(__ch, \"" . $lit_key . "\", __nv); if (__cv && __cv != __nv) strada_decref(__cv); __nv; })");
         }
     } else {
         # Fast path: when the key is a borrowed scalar var, use the _sv
@@ -17981,7 +17990,7 @@ func _gen_hash_compound_assign(scalar $cg, scalar $target, str $op, scalar $valu
             _gen_autoviv_outer_hash($cg, $hash_expr, $hash_ctx);
             emit($cg, "; StradaValue **__slot = strada_hv_fetch_lvalue_sv_key(__ch, __ck_sv, 1); StradaValue *__cv = __slot ? *__slot : strada_hv_fetch_owned_sv(__ch, __ck_sv); ");
             _emit_hash_cmpd_nv($cg, $op, $value);
-            emit($cg, "if (__slot) { *__slot = __nv; strada_incref(__nv); if (__cv && __cv != __nv) strada_decref(__cv); } else { strada_decref(__cv); strada_hv_store_sv(__ch, __ck_sv, __nv); } __nv; })");
+            emit($cg, "if (__slot) { *__slot = __nv; strada_incref(__nv); if (__cv && __cv != __nv) strada_decref(__cv); } else { strada_hv_store_sv(__ch, __ck_sv, __nv); if (__cv && __cv != __nv) strada_decref(__cv); } __nv; })");
         } elsif ($rhs_safe == 1) {
             emit($cg, "({ char *__ck = strada_to_str(");
             gen_expr($cg, $key_expr);
@@ -17989,7 +17998,7 @@ func _gen_hash_compound_assign(scalar $cg, scalar $target, str $op, scalar $valu
             _gen_autoviv_outer_hash($cg, $hash_expr, $hash_ctx);
             emit($cg, "; StradaValue **__slot = strada_hv_fetch_lvalue_sv(__ch, __ck, 1); StradaValue *__cv = __slot ? *__slot : strada_hv_fetch_owned(__ch, __ck); ");
             _emit_hash_cmpd_nv($cg, $op, $value);
-            emit($cg, "if (__slot) { *__slot = __nv; strada_incref(__nv); if (__cv && __cv != __nv) strada_decref(__cv); } else { strada_decref(__cv); strada_hv_store(__ch, __ck, __nv); } free(__ck); __nv; })");
+            emit($cg, "if (__slot) { *__slot = __nv; strada_incref(__nv); if (__cv && __cv != __nv) strada_decref(__cv); } else { strada_hv_store(__ch, __ck, __nv); if (__cv && __cv != __nv) strada_decref(__cv); } free(__ck); __nv; })");
         } else {
             if ($key_simple == 1) {
                 emit($cg, "({ StradaValue *__ck_sv = ");
@@ -18007,10 +18016,13 @@ func _gen_hash_compound_assign(scalar $cg, scalar $target, str $op, scalar $valu
             _emit_hash_cmpd_nv($cg, $op, $value);
             # __nv yielded OWNED (see literal-key path); _emit_hash_cmpd_nv already
             # released the owned RHS temp.
+            # Store before the conditional decref (see literal-key path): for the
+            # `||=`/`//=` KEEP case (__nv==__cv) the old unconditional decref left
+            # the kept element borrowed → void/return consumer freed a live value.
             if ($key_simple == 1) {
-                emit($cg, "strada_decref(__cv); strada_hv_store_sv(__ch, __ck_sv, __nv); __nv; })");
+                emit($cg, "strada_hv_store_sv(__ch, __ck_sv, __nv); if (__cv && __cv != __nv) strada_decref(__cv); __nv; })");
             } else {
-                emit($cg, "strada_decref(__cv); strada_hv_store(__ch, __ck, __nv); free(__ck); __nv; })");
+                emit($cg, "strada_hv_store(__ch, __ck, __nv); if (__cv && __cv != __nv) strada_decref(__cv); free(__ck); __nv; })");
             }
         }
     }
