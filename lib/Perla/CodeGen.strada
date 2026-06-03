@@ -787,6 +787,17 @@ func generate(scalar $ast) str {
     emit(\%cg, "}\n\n");
     $cg{"in_main"} = 0;
 
+    # Hoisted sub bodies must be emitted under THIS module's own strict state,
+    # not whatever strict_vars an inlined dependency's `use strict` left behind
+    # after the statement pass (that leak caused nondeterministic
+    # "Global symbol requires explicit package name" on no-strict modules that
+    # use a strict dependency). module_own_strict is set only by a top-level
+    # (non-inlined) use/no strict; default off.
+    my int $__mos = defined($cg{"module_own_strict"}) ? $cg{"module_own_strict"} : 0;
+    $cg{"strict_vars"} = $__mos;
+    $cg{"strict_subs"} = $__mos;
+    $cg{"strict_refs"} = $__mos;
+
     # Generate sub bodies (including from nested blocks)
     Perla::CodeGen::Subs::gen_sub_bodies_from_stmts(\%cg, $stmts);
 
@@ -1489,6 +1500,17 @@ func generate_module(scalar $ast, str $mod_name) str {
 
     emit(\%cg, "}\n\n");
     $cg{"in_main"} = 0;
+
+    # Hoisted sub bodies must be emitted under THIS module's own strict state,
+    # not whatever strict_vars an inlined dependency's `use strict` left behind
+    # after the statement pass (that leak caused nondeterministic
+    # "Global symbol requires explicit package name" on no-strict modules that
+    # use a strict dependency). module_own_strict is set only by a top-level
+    # (non-inlined) use/no strict; default off.
+    my int $__mos = defined($cg{"module_own_strict"}) ? $cg{"module_own_strict"} : 0;
+    $cg{"strict_vars"} = $__mos;
+    $cg{"strict_subs"} = $__mos;
+    $cg{"strict_refs"} = $__mos;
 
     # Generate sub bodies (including from nested blocks)
     Perla::CodeGen::Subs::gen_sub_bodies_from_stmts(\%cg, $stmts);
@@ -3997,15 +4019,28 @@ func gen_stmt(scalar $cg, scalar $node) void {
         # three subsets when `use strict;` is in scope (the most
         # common case). `no strict;` toggles all three back off.
         if (defined($mod) && $mod eq "strict") {
+            # Is this `use strict` the FILE's own (pragma-stack empty), or an
+            # inlined dependency's (inside a __pragma_save__ bracket)? Only the
+            # file's own determines the strict state for this module's hoisted
+            # sub bodies (emitted after all statements). Inlined deps' strict
+            # is restored by the brackets, but the LAST inlined `use strict`
+            # before a bracket boundary can transiently leak into the final
+            # strict_vars; sub bodies are emitted under that final value, which
+            # caused nondeterministic "Global symbol $x requires explicit
+            # package name" on no-strict modules that use a strict dependency.
+            my int $__ps_depth = 0;
+            if (defined($cg->{"pragma_stack"})) { $__ps_depth = scalar(@{$cg->{"pragma_stack"}}); }
             if (defined($node->{"is_no"}) && $node->{"is_no"} == 1) {
                 $cg->{"strict_vars"} = 0;
                 $cg->{"strict_subs"} = 0;
                 $cg->{"strict_refs"} = 0;
+                if ($__ps_depth == 0) { $cg->{"module_own_strict"} = 0; }
                 ind($cg); emit($cg, "/* no strict; */\n");
             } else {
                 $cg->{"strict_vars"} = 1;
                 $cg->{"strict_subs"} = 1;
                 $cg->{"strict_refs"} = 1;
+                if ($__ps_depth == 0) { $cg->{"module_own_strict"} = 1; }
                 ind($cg); emit($cg, "/* use strict; */\n");
             }
             return;
