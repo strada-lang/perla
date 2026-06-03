@@ -3167,6 +3167,25 @@ func gen_stmt(scalar $cg, scalar $node) void {
                 $bb_ki++;
             }
         }
+        # Lexical-shadow save/restore: a top-level `my $x` in this block that
+        # SHADOWS an outer in-scope lexical of the same C slot (sub param or
+        # sub-local) reuses v_x via `decref(v_x); v_x=new` — with no save the
+        # block permanently clobbers the outer var. (`sub f{ my($x)=@_;
+        # { my $x={%$x}; $x->{c}=3 } return [keys %$x] }` returned [a b c],
+        # not [a b].) Most block my-vars are renamed to __blk slots by Collect
+        # and don't collide; a same-name shadow that escapes renaming lands
+        # here. Save the outer pointer (incref to compensate for the body's
+        # reassignment-decref), let the body run — its RHS self-reference
+        # `{%$x}` still reads the intact outer slot — then at block exit decref
+        # the shadow and restore the outer. Saved BEFORE the redo label so the
+        # save runs once; $ll in the save-var name avoids sibling collisions.
+        my array @__bb_shadows = _block_shadow_cnames($cg, $node);
+        my int $__bsv_i = 0;
+        while ($__bsv_i < scalar(@__bb_shadows)) {
+            my str $__bsv_cn = $__bb_shadows[$__bsv_i];
+            ind($cg); emit($cg, "StradaValue *__shadowsav_" . $ll . "_" . $__bsv_cn . " = " . $__bsv_cn . "; if (" . $__bsv_cn . ") strada_incref(" . $__bsv_cn . ");\n");
+            $__bsv_i = $__bsv_i + 1;
+        }
         ind($cg); emit($cg, "__perla_redo_" . $ll . ": ;\n");
         # Capture local-chain head so `local $h{k} = v` inside this block
         # restores at block exit (Perl `local` is dynamic-block-scoped).
@@ -3275,6 +3294,16 @@ func gen_stmt(scalar $cg, scalar $node) void {
             my str $__bb_dv = $__bb_blk_vars[$__bb_di];
             ind($cg); emit($cg, "if (" . $__bb_dv . ") { strada_decref(" . $__bb_dv . "); " . $__bb_dv . " = NULL; }\n");
             $__bb_di = $__bb_di - 1;
+        }
+        # Restore lexical shadows (reverse declaration order). decref whatever
+        # the body left in the slot (the shadow value), then point the slot
+        # back at the saved outer pointer (its refcount was pre-incref'd, and
+        # the body's reassignment-decref consumed exactly that incref).
+        my int $__bsr_i = scalar(@__bb_shadows) - 1;
+        while ($__bsr_i >= 0) {
+            my str $__bsr_cn = $__bb_shadows[$__bsr_i];
+            ind($cg); emit($cg, "if (" . $__bsr_cn . " != __shadowsav_" . $ll . "_" . $__bsr_cn . ") { if (" . $__bsr_cn . ") strada_decref(" . $__bsr_cn . "); } " . $__bsr_cn . " = __shadowsav_" . $ll . "_" . $__bsr_cn . ";\n");
+            $__bsr_i = $__bsr_i - 1;
         }
         $cg->{"redo_label"} = $prev_redo;
         $cg->{"in_loop"} = $prev_in_loop;
@@ -6299,6 +6328,51 @@ func _gen_state(scalar $cg, scalar $node) void {
 }
 
 # --- Sub definition ---
+# Return the C-slot names of top-level `my $X` declarations in this block
+# that SHADOW an already-declared in-scope lexical of the same slot. These
+# need save/restore around the block (see _gen_block). Order = declaration
+# order; deduped. Only same-slot shadows (declared_vars already has the
+# cname) qualify — a fresh decl gets a new slot and needs no save.
+func _block_shadow_cnames(scalar $cg, scalar $node) array {
+    my array @out = ();
+    my scalar $stmts = $node->{"stmts"};
+    if (!defined($stmts)) { return @out; }
+    my scalar $seen = {};
+    my int $i = 0;
+    while ($i < scalar(@{$stmts})) {
+        my scalar $s = $stmts->[$i];
+        if (defined($s) && $s->{"type"} == Perla::AST::N_MY()) {
+            if (defined($s->{"var"})) {
+                my str $vn = $s->{"var"}->{"value"};
+                my str $vt = "" . $s->{"var"}->{"type"};
+                if (length($vt) == 0) { $vt = "SCALAR_VAR"; }
+                my str $cn = c_var_for_vtype($vt, $vn);
+                if (defined($cg->{"declared_vars"}->{$cn}) && !defined($seen->{$cn})) {
+                    $seen->{$cn} = 1;
+                    push(@out, $cn);
+                }
+            }
+            if (defined($s->{"vars"})) {
+                my scalar $vars = $s->{"vars"};
+                my int $vi = 0;
+                while ($vi < scalar(@{$vars})) {
+                    my str $vn2 = $vars->[$vi]->{"value"};
+                    my str $vt2 = "" . $vars->[$vi]->{"type"};
+                    if (length($vt2) == 0) { $vt2 = "SCALAR_VAR"; }
+                    my str $cn2 = c_var_for_vtype($vt2, $vn2);
+                    if (defined($cg->{"declared_vars"}->{$cn2}) && !defined($seen->{$cn2})) {
+                        $seen->{$cn2} = 1;
+                        push(@out, $cn2);
+                    }
+                    $vi = $vi + 1;
+                }
+            }
+        }
+        $i = $i + 1;
+    }
+    return @out;
+}
+
 func _gen_block(scalar $cg, scalar $node) void {
     ind($cg); emit($cg, "{\n");
     $cg->{"indent"} = $cg->{"indent"} + 1;
@@ -6320,7 +6394,32 @@ func _gen_block(scalar $cg, scalar $node) void {
     # against an outer-scope `my $x`.
     my scalar $__bb_saved_ssd = $cg->{"same_scope_decls"};
     $cg->{"same_scope_decls"} = {};
+    # Lexical-shadow save/restore for `my $x` decls that SHADOW an outer
+    # in-scope lexical (sub param or sub-local) of the same C slot. perla
+    # reuses the C slot v_x for the shadow, emitting `decref(v_x); v_x=new`
+    # with no save — so the block permanently clobbers the outer var
+    # (`sub f{ my($x)=@_; { my $x={%$x}; $x->{c}=3 } return [keys %$x] }`
+    # returned [a b c] instead of [a b]). Save the outer pointer (incref to
+    # compensate for the body's reassignment-decref), let the body run — its
+    # RHS self-reference `{%$x}` still reads the intact outer slot — then at
+    # block exit decref whatever the shadow left and restore the outer.
+    # File-scope shadows are handled separately (do-while/eval paths); this
+    # covers the bare-block sub-local/param case.
+    my array @__bb_shadows = _block_shadow_cnames($cg, $node);
+    my int $__bs_i = 0;
+    while ($__bs_i < scalar(@__bb_shadows)) {
+        my str $__bs_cn = $__bb_shadows[$__bs_i];
+        ind($cg); emit($cg, "StradaValue *__shadowsav_" . $__bs_cn . " = " . $__bs_cn . "; if (" . $__bs_cn . ") strada_incref(" . $__bs_cn . ");\n");
+        $__bs_i = $__bs_i + 1;
+    }
     gen_block_stmts($cg, $node);
+    # Restore shadows in reverse declaration order.
+    my int $__br_i = scalar(@__bb_shadows) - 1;
+    while ($__br_i >= 0) {
+        my str $__br_cn = $__bb_shadows[$__br_i];
+        ind($cg); emit($cg, "if (" . $__br_cn . " != __shadowsav_" . $__br_cn . ") { if (" . $__br_cn . ") strada_decref(" . $__br_cn . "); } " . $__br_cn . " = __shadowsav_" . $__br_cn . ";\n");
+        $__br_i = $__br_i - 1;
+    }
     $cg->{"same_scope_decls"} = $__bb_saved_ssd;
     # Restore any `local $g = ...` whose save record was created in this
     # block (not present on entry). The save var __local_save_NAME was
