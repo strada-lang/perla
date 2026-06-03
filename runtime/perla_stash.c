@@ -865,6 +865,74 @@ static StradaValue *perla_mop_can_be_made_compatible_with(StradaValue *args) {
     return strada_new_str(""); /* false */
 }
 
+static StradaValue *perla_moose_meta(StradaValue *args); /* fwd */
+/* find_attribute_by_name($meta, $name) — return the attribute metaobject named
+ * $name from the metaclass's "attributes" map (keyed by name in
+ * perla_moose_meta), or undef. Called during has/accessor-install and
+ * make_immutable. (Local lookup only; a single-level Moose class keeps its own
+ * attributes here, which covers the common case.) */
+static StradaValue *perla_mop_find_attribute_by_name(StradaValue *args) {
+    StradaValue *self = _pu_arg(args, 0);
+    StradaValue *name_sv = _pu_arg(args, 1);
+    if (!self || !name_sv) return strada_new_undef();
+    char *name = strada_to_str(name_sv);
+    if (!name) return strada_new_undef();
+    StradaValue *target = self;
+    if (!STRADA_IS_TAGGED_INT(self) && self->type == STRADA_REF && self->value.rv)
+        target = self->value.rv;
+    StradaValue *result = strada_new_undef();
+    if (target && !STRADA_IS_TAGGED_INT(target) && target->type == STRADA_HASH) {
+        StradaValue *attrs = strada_hv_fetch_owned(target, "attributes");
+        if (attrs && !STRADA_IS_TAGGED_INT(attrs)) {
+            StradaValue *hash = attrs;
+            if (attrs->type == STRADA_REF && attrs->value.rv) hash = attrs->value.rv;
+            if (hash && !STRADA_IS_TAGGED_INT(hash) && hash->type == STRADA_HASH && hash->value.hv) {
+                StradaValue *v = strada_hv_fetch_owned(hash, name);
+                if (v) { strada_decref(result); result = v; }
+            }
+            strada_decref(attrs);
+        }
+    }
+    free(name);
+    return result;
+}
+/* Class/MOP.pm's bootstrap calls `Pkg->meta->add_attribute(...)` to define the
+ * metaclasses' own structural attributes. perla provides those as native
+ * accessors (perla_mop_*), so the calls are redundant — but `->meta` returned
+ * undef for the Class::MOP::* packages (meta is only registered on Moose user
+ * classes), so add_attribute was called on undef and aborted Class::MOP init.
+ * A no-op add_attribute lets the redundant bootstrap pass. perla's real `has`
+ * goes through perla_moose_native_has, never this method. */
+static StradaValue *perla_mop_add_attribute_noop(StradaValue *args) {
+    (void)args; return strada_new_undef();
+}
+/* get_meta_instance($meta) — the meta-instance object knows how to build an
+ * instance. perla doesn't model the full meta-instance protocol; return the
+ * metaclass itself (it carries "package"), and implement create_instance on it
+ * directly. Covers `$meta->get_meta_instance->create_instance` in the Moose
+ * object-construction path that perla_moose_object_new doesn't intercept. */
+static StradaValue *perla_mop_get_meta_instance(StradaValue *args) {
+    StradaValue *self = _pu_arg(args, 0);
+    return self ? _pu_ret(self) : strada_new_undef();
+}
+/* create_instance($self) — bless a fresh empty hash into the metaclass's
+ * package (the un-slotted instance; slots are filled by the caller). */
+static StradaValue *perla_mop_create_instance(StradaValue *args) {
+    StradaValue *self = _pu_arg(args, 0);
+    StradaValue *target = self;
+    if (self && !STRADA_IS_TAGGED_INT(self) && self->type == STRADA_REF && self->value.rv)
+        target = self->value.rv;
+    char *pkg = NULL;
+    if (target && !STRADA_IS_TAGGED_INT(target) && target->type == STRADA_HASH) {
+        StradaValue *p = strada_hv_fetch_owned(target, "package");
+        if (p) { pkg = strada_to_str(p); strada_decref(p); }
+    }
+    StradaValue *ref = strada_ref_create(strada_new_hash());
+    perla_bless(ref, pkg ? pkg : "main");
+    if (pkg) free(pkg);
+    return ref;
+}
+
 static void perla_register_class_mop_isa(void) {
     /* parent links mirroring the Class/MOP/*.pm `use parent` declarations */
     perla_isa_push("Class::MOP::Object",             "Class::MOP::Mixin");
@@ -882,13 +950,78 @@ static void perla_register_class_mop_isa(void) {
     perla_isa_push("Class::MOP::Attribute",          "Class::MOP::Mixin::AttributeCore");
     perla_isa_push("Class::MOP::Attribute",          "Class::MOP::Object");
     perla_isa_push("Class::MOP::Instance",           "Class::MOP::Object");
-    /* compatibility helpers live on Class::MOP::Object (inherited by all) */
-    perla_code_set("Class::MOP::Object", "_real_ref_name",
-                   strada_cpointer_new((void*)perla_mop_real_ref_name));
-    perla_code_set("Class::MOP::Object", "_is_compatible_with",
-                   strada_cpointer_new((void*)perla_mop_is_compatible_with));
-    perla_code_set("Class::MOP::Object", "_can_be_made_compatible_with",
-                   strada_cpointer_new((void*)perla_mop_can_be_made_compatible_with));
+    /* Moose's metaclasses descend from the Class::MOP ones. perla blesses all
+     * metaclass objects as Moose::Meta::Class, so wire it into the chain and
+     * register the compat helpers directly on the metaclass packages too
+     * (perla's flat dispatch doesn't always reach Object via @ISA for these). */
+    perla_isa_push("Moose::Meta::Class",     "Class::MOP::Class");
+    perla_isa_push("Moose::Meta::Attribute", "Class::MOP::Attribute");
+    perla_isa_push("Moose::Meta::Method",    "Class::MOP::Method");
+    perla_isa_push("Moose::Object",          "Class::MOP::Object");
+    /* compatibility helpers — on Object (inherited) and the metaclass packages */
+    StradaValue *_rrn = strada_cpointer_new((void*)perla_mop_real_ref_name);
+    StradaValue *_icw = strada_cpointer_new((void*)perla_mop_is_compatible_with);
+    StradaValue *_cbmcw = strada_cpointer_new((void*)perla_mop_can_be_made_compatible_with);
+    const char *const compat_pkgs[] = {
+        "Class::MOP::Object", "Class::MOP::Class", "Moose::Meta::Class",
+        "Class::MOP::Attribute", "Class::MOP::Method", NULL
+    };
+    for (int i = 0; compat_pkgs[i]; i++) {
+        perla_code_set(compat_pkgs[i], "_real_ref_name", _rrn);
+        perla_code_set(compat_pkgs[i], "_is_compatible_with", _icw);
+        perla_code_set(compat_pkgs[i], "_can_be_made_compatible_with", _cbmcw);
+    }
+
+    /* `Pkg->meta` for the Class::MOP bootstrap packages (Class/MOP.pm calls it
+     * during init to define their structural attributes). Provide perla's
+     * metaclass object; add_attribute on it is a no-op (redundant). */
+    StradaValue *_meta_fn = strada_cpointer_new((void*)perla_moose_meta);
+    StradaValue *_aa_noop = strada_cpointer_new((void*)perla_mop_add_attribute_noop);
+    static const char *const mop_meta_pkgs[] = {
+        "Class::MOP::Mixin", "Class::MOP::Mixin::HasMethods",
+        "Class::MOP::Mixin::HasAttributes", "Class::MOP::Mixin::HasOverloads",
+        "Class::MOP::Mixin::AttributeCore", "Class::MOP::Object",
+        "Class::MOP::Package", "Class::MOP::Module", "Class::MOP::Class",
+        "Class::MOP::Attribute", "Class::MOP::Method", "Class::MOP::Instance",
+        "Class::MOP::Method::Generated", "Class::MOP::Method::Inlined",
+        "Class::MOP::Method::Constructor", "Class::MOP::Method::Accessor",
+        "Class::MOP::Method::Wrapped", NULL
+    };
+    for (int i = 0; mop_meta_pkgs[i]; i++) {
+        perla_code_set(mop_meta_pkgs[i], "meta", _meta_fn);
+        perla_code_set(mop_meta_pkgs[i], "add_attribute", _aa_noop);
+    }
+    /* the metaclass object perla_moose_meta returns is blessed Moose::Meta::Class.
+     * Class/MOP.pm's bootstrap also calls add_method/_add_meta_method/
+     * get_meta_instance/clone_object on `->meta` to self-construct; all are
+     * redundant under perla's native MOP (returns discarded or define methods
+     * perla already provides), so no-op them. */
+    static const char *const mop_meta_noop_methods[] = {
+        "add_attribute", "add_method", "_add_meta_method", "clone_object", NULL
+    };
+    const char *const mc_pkgs[] = { "Moose::Meta::Class", "Class::MOP::Class", NULL };
+    for (int p = 0; mc_pkgs[p]; p++)
+        for (int m = 0; mop_meta_noop_methods[m]; m++)
+            perla_code_set(mc_pkgs[p], mop_meta_noop_methods[m], _aa_noop);
+    /* meta-instance protocol (real, not no-op — its return is chained in new) */
+    StradaValue *_gmi = strada_cpointer_new((void*)perla_mop_get_meta_instance);
+    StradaValue *_ci  = strada_cpointer_new((void*)perla_mop_create_instance);
+    for (int p = 0; mc_pkgs[p]; p++) {
+        perla_code_set(mc_pkgs[p], "get_meta_instance", _gmi);
+        perla_code_set(mc_pkgs[p], "create_instance", _ci);
+    }
+    perla_code_set("Class::MOP::Instance", "create_instance", _ci);
+    /* make_immutable is otherwise only registered in perla_init_moose_stubs
+     * (runs at `use Moose` setup) — but Class/MOP.pm's bootstrap calls
+     * `->meta->make_immutable` on its own metaclasses *before* that, so wire
+     * the real impl here too (perla_init runs first). */
+    StradaValue *_mi_fn = strada_cpointer_new((void*)perla_moose_make_immutable);
+    perla_code_set("Moose::Meta::Class", "make_immutable", _mi_fn);
+    perla_code_set("Class::MOP::Class",  "make_immutable", _mi_fn);
+    StradaValue *_fabn_fn = strada_cpointer_new((void*)perla_mop_find_attribute_by_name);
+    perla_code_set("Moose::Meta::Class", "find_attribute_by_name", _fabn_fn);
+    perla_code_set("Class::MOP::Class",  "find_attribute_by_name", _fabn_fn);
+    perla_code_set("Class::MOP::Class::Immutable::Trait", "find_attribute_by_name", _fabn_fn);
 }
 
 static void perla_register_variable_magic(void) {
