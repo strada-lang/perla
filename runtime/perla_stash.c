@@ -6901,13 +6901,28 @@ static StradaValue *perla_specio_t_stub(StradaValue *args) {
         ? perla_call_stack[perla_call_depth - 1].package : NULL;
     StradaValue *types = specio_t_types_for(pkg);
     StradaValue *result = strada_new_undef();
-    if (types) {
-        StradaValue *found = strada_hv_fetch(types, name);
-        if (found && (STRADA_IS_TAGGED_INT(found) || found->type != STRADA_UNDEF)) {
-            strada_incref(found);
-            strada_decref(result);
-            result = found;
+    StradaValue *found = types ? strada_hv_fetch(types, name) : NULL;
+    /* Fall back to scanning every registered package's types for the name.
+     * Handles (a) caller-package detection landing on a frame without its own
+     * types map, and (b) --precompile-deps init ordering where a module's
+     * file-scope `my $X = t('Name')` runs before its `use SomeLibrary`'s
+     * install_t_sub populated this package's map — the name is still
+     * registered under the library package, and Specio type names are
+     * consistent across the packages that import them. */
+    if (!found || (!STRADA_IS_TAGGED_INT(found) && found->type == STRADA_UNDEF)) {
+        for (int i = 0; i < g_specio_t_n; i++) {
+            if (!g_specio_t_map[i].types) continue;
+            StradaValue *f2 = strada_hv_fetch(g_specio_t_map[i].types, name);
+            if (f2 && (STRADA_IS_TAGGED_INT(f2) || f2->type != STRADA_UNDEF)) {
+                found = f2;
+                break;
+            }
         }
+    }
+    if (found && (STRADA_IS_TAGGED_INT(found) || found->type != STRADA_UNDEF)) {
+        strada_incref(found);
+        strada_decref(result);
+        result = found;
     }
     free(name);
     return result;
