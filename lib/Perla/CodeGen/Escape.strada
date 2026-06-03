@@ -336,13 +336,27 @@ func escape_c_str(str $s) str {
     # JSON blob and crashing its decode. byte_length/byte_substr are byte-exact.
     my int $len = core::byte_length($s);
     while ($i < $len) {
-        my str $ch = core::byte_substr($s, $i, 1);
-        if ($ch eq "\\") { $out = $out . "\\\\"; }
-        elsif ($ch eq "\"") { $out = $out . "\\\""; }
-        elsif ($ch eq "\n") { $out = $out . "\\n"; }
-        elsif ($ch eq "\t") { $out = $out . "\\t"; }
-        elsif ($ch eq "\r") { $out = $out . "\\r"; }
-        else { $out = $out . $ch; }
+        my int $bv = core::get_byte($s, $i);
+        if ($bv == 92) { $out = $out . "\\\\"; }
+        elsif ($bv == 34) { $out = $out . "\\\""; }
+        elsif ($bv == 10) { $out = $out . "\\n"; }
+        elsif ($bv == 9) { $out = $out . "\\t"; }
+        elsif ($bv == 13) { $out = $out . "\\r"; }
+        elsif ($bv >= 32 && $bv < 127) { $out = $out . core::byte_substr($s, $i, 1); }
+        else {
+            # High (>=128) or control (<32) byte → 3-digit octal escape so the
+            # generated C source stays pure ASCII (runtime bytes are identical).
+            # A raw high byte (e.g. 0xA5 from Net::Config's Mac config string
+            # "...\xa5UsePassiveMode") would otherwise land in the emitted C
+            # ($code) and make substr()/index() re-flag their results UTF-8 —
+            # the post-codegen byte-offset rewrite passes then mis-index on the
+            # codepoint/byte mismatch and loop forever, hanging the compiler.
+            # Also fixes embedded NUL (0x00) silently truncating the C literal.
+            my int $o1 = ($bv / 64) % 8;
+            my int $o2 = ($bv / 8) % 8;
+            my int $o3 = $bv % 8;
+            $out = $out . "\\" . $o1 . $o2 . $o3;
+        }
         $i++;
     }
     return $out;
@@ -353,6 +367,14 @@ func escape_c_str(str $s) str {
 # Used by literal-context emissions of N_INTERP_STR when there are no runtime
 # variables to interpolate.
 func perl_interp_literal_to_c(str $s) str {
+    # Byte-orient the scan: an invalid UTF-8 byte (e.g. 0xA5) in the literal
+    # makes char-based length()/substr() mis-index and the loop hang. The
+    # escape syntax processed here is all ASCII, so byte semantics are correct.
+    __C__ {
+        if (s && !STRADA_IS_TAGGED_INT(s) && s->type == STRADA_STR) {
+            strada_set_utf8_flag(s, 0);
+        }
+    }
     my str $out = "";
     my int $i = 0;
     my int $len = length($s);
@@ -417,7 +439,16 @@ func perl_interp_literal_to_c(str $s) str {
         elsif ($ch eq "\n") { $out = $out . "\\n"; }
         elsif ($ch eq "\t") { $out = $out . "\\t"; }
         elsif ($ch eq "\r") { $out = $out . "\\r"; }
-        else { $out = $out . $ch; }
+        else {
+            # Octal-escape high/control bytes so the emitted C is pure ASCII
+            # (see escape_c_str — raw high bytes hang the post-codegen passes).
+            my int $bv = core::get_byte($s, $i);
+            if ($bv >= 128 || $bv < 32) {
+                $out = $out . "\\" . (($bv / 64) % 8) . (($bv / 8) % 8) . ($bv % 8);
+            } else {
+                $out = $out . $ch;
+            }
+        }
         $i++;
     }
     return $out;
