@@ -1,0 +1,16 @@
+package Counter;
+func new(str $class) scalar { return bless({"count" => 0}, $class); }
+func increment(scalar $self) void { $self->{"count"} = $self->{"count"} + 1; }
+func get(scalar $self) int { return $self->{"count"}; }
+package main;
+func main() int {
+    my int $it = 5000000;
+    my scalar $c = Counter::new("Counter");
+    my int $i = 0;
+    while ($i < $it) {
+        $c->increment();
+        $i = $i + 1;
+    }
+    print("oop: " . $it . " method calls, count=" . $c->get() . "\n");
+    return 0;
+}

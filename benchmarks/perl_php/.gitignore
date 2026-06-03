@@ -1,0 +1,6 @@
+# build artifacts (native binaries + generated C)
+bin_*
+*_bin
+perla_*
+*.c
+*.xs.c

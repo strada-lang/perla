@@ -1,0 +1,14 @@
+package main;
+func main() int {
+    my int $it = 1000000;
+    my str $r = "";
+    my int $i = 0;
+    while ($i < $it) {
+        my str $s = "Hello, World! " . $i;
+        $s =~ s/World/Perl/;
+        if ($i == $it - 1) { $r = $s; }
+        $i = $i + 1;
+    }
+    print("strings: " . $it . ", last=" . $r . "\n");
+    return 0;
+}
