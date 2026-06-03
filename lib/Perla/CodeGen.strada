@@ -3094,6 +3094,46 @@ func _gen_cond(scalar $cg, scalar $node) void {
 func gen_stmt(scalar $cg, scalar $node) void {
     my int $type = $node->{"type"};
 
+    # Statement-context pre-declaration for an inline `my` buried in a
+    # list-destructure assignment LHS: `($h->{k}, my $x) = LIST;`. _gen_assign
+    # rewrites the inline N_MY to a plain scalar/array/hash assignment but never
+    # emits the C declaration or registers the var, so a later reference trips
+    # strict 'vars' and the C variable is undeclared. At file scope the static
+    # file_scope_vars pass covers this; inside a sub we emit the local decl here
+    # (statement context — safe to prepend declarations). Surfaced by DBIC
+    # ResultSet: `($attrs->{group_by}, my $new_order) = $source->storage->...`.
+    if ($type == Perla::AST::N_ASSIGN() && defined($node->{"op"}) && $node->{"op"} eq "="
+        && defined($node->{"target"}) && $node->{"target"}->{"type"} == Perla::AST::N_ANON_ARRAY()
+        && defined($node->{"target"}->{"elems"})
+        && (!defined($cg->{"in_main"}) || $cg->{"in_main"} != 1)) {
+        my scalar $__lae = $node->{"target"}->{"elems"};
+        my int $__lai = 0;
+        while ($__lai < scalar(@{$__lae})) {
+            my scalar $__lael = $__lae->[$__lai];
+            if (defined($__lael) && $__lael->{"type"} == Perla::AST::N_MY()) {
+                my array @__lavars = ();
+                if (defined($__lael->{"vars"})) { @__lavars = @{$__lael->{"vars"}}; }
+                elsif (defined($__lael->{"var"})) { push(@__lavars, $__lael->{"var"}); }
+                my int $__lavi = 0;
+                while ($__lavi < scalar(@__lavars)) {
+                    my scalar $__lav = $__lavars[$__lavi];
+                    my str $__lavt = "" . $__lav->{"type"};
+                    if (length($__lavt) == 0) { $__lavt = "SCALAR_VAR"; }
+                    my str $__lavcn = c_var_for_vtype($__lavt, $__lav->{"value"});
+                    if (!defined($cg->{"declared_vars"}->{$__lavcn})) {
+                        my str $__lavinit = "NULL";
+                        if ($__lavt eq "ARRAY_VAR") { $__lavinit = "strada_new_array()"; }
+                        elsif ($__lavt eq "HASH_VAR") { $__lavinit = "strada_new_hash()"; }
+                        ind($cg); emit($cg, "StradaValue *" . $__lavcn . " = " . $__lavinit . ";\n");
+                        $cg->{"declared_vars"}->{$__lavcn} = 1;
+                    }
+                    $__lavi = $__lavi + 1;
+                }
+            }
+            $__lai = $__lai + 1;
+        }
+    }
+
     # Labeled bare block: LABEL: { ... }
     # Emits a C block with goto targets at both ends, so `last LABEL` jumps
     # out and `redo LABEL` restarts the block. Without a label this case

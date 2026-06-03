@@ -705,6 +705,28 @@ func _record_file_scope_my(scalar $cg, scalar $node) void {
     }
 }
 
+# Record each inline `my` var appearing as an element of a list-destructure
+# assignment LHS (`($foo, my $x, my @y) = LIST`). Both N_MY shapes — single
+# (->{"var"}) and plural (->{"vars"}) — are handled.
+func _record_list_assign_mys(scalar $cg, scalar $elems) void {
+    my int $ei = 0;
+    while ($ei < scalar(@{$elems})) {
+        my scalar $el = $elems->[$ei];
+        if (defined($el) && $el->{"type"} == Perla::AST::N_MY()) {
+            if (defined($el->{"vars"})) {
+                my int $vi = 0;
+                while ($vi < scalar(@{$el->{"vars"}})) {
+                    $cg->{"file_scope_vars"}->{$el->{"vars"}->[$vi]->{"value"}} = $el->{"vars"}->[$vi]->{"type"};
+                    $vi = $vi + 1;
+                }
+            } elsif (defined($el->{"var"})) {
+                $cg->{"file_scope_vars"}->{$el->{"var"}->{"value"}} = $el->{"var"}->{"type"};
+            }
+        }
+        $ei = $ei + 1;
+    }
+}
+
 func collect_file_scope_vars_from_stmts(scalar $cg, scalar $stmts) void {
     my int $i = 0;
     while ($i < scalar(@{$stmts})) {
@@ -735,6 +757,15 @@ func collect_file_scope_vars_from_stmts(scalar $cg, scalar $stmts) void {
                         && !defined($cg->{"file_scope_vars"}->{$as_n})) {
                         $cg->{"file_scope_vars"}->{$as_n} = "IMPLICIT_GLOBAL";
                     }
+                }
+                # List-destructure assignment with an inline `my` element:
+                # `($h->{k}, my $x) = LIST`. The `my` is buried in the
+                # N_ANON_ARRAY target, so the plain N_MY scan above misses it
+                # and a later reference to `$x` trips strict 'vars'. Walk the
+                # tuple and record each inline-`my` var. (Surfaced by DBIC's
+                # `($attrs->{group_by}, my $new_order) = $source->...`.)
+                elsif ($as_ty == Perla::AST::N_ANON_ARRAY() && defined($as_t->{"elems"})) {
+                    _record_list_assign_mys($cg, $as_t->{"elems"});
                 }
             }
         }
