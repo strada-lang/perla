@@ -19416,15 +19416,30 @@ func _gen_call(scalar $cg, scalar $node) void {
                     $name_expr = $cref;
                 }
                 if ($is_stringy == 1) {
-                    emit($cg, "({ char *__dn = strada_to_str(");
+                    emit($cg, "({ StradaValue *__dv = ");
                     gen_expr($cg, $name_expr);
-                    emit($cg, "); StradaValue *__dr; if (!__dn || !__dn[0]) { __dr = strada_new_str(\"\"); } ");
+                    emit($cg, "; StradaValue *__dr; ");
+                    # A real CODE ref (`\\&sub`, `\\&{name}`, or a coderef held
+                    # in $var) is itself a defined sub — `defined &$f` must be
+                    # true without stringifying it to "CODE(0x..)" and failing
+                    # the by-name stash lookup. Only a STRING operand (`&{"P::n"}`
+                    # / a $var holding a name) is a by-name probe. This fixes
+                    # Moose::Exporter::_sub_from_package (`\\&{P::n}; defined &$sub`)
+                    # which mis-reported every TypeConstraints sugar sub (type,
+                    # subtype, as, where, coerce, ...) as undefined.
+                    # A reference to a COMPILED named sub is a STRADA_CPOINTER
+                    # (raw C function pointer); a reference to an anon/closure
+                    # sub is a STRADA_CLOSURE — either, bare or wrapped in a
+                    # (possibly slot-) REF, means a defined code ref.
+                    emit($cg, "int __discode = 0; if (__dv && !STRADA_IS_TAGGED_INT(__dv)) { if (__dv->type == STRADA_CLOSURE || __dv->type == STRADA_CPOINTER) __discode = 1; else if (__dv->type == STRADA_REF) { StradaValue *__drr = strada_is_slot_ref(__dv) ? (((StradaValue**)__dv->value.ptr) ? *((StradaValue**)__dv->value.ptr) : (StradaValue*)NULL) : __dv->value.rv; if (__drr && !STRADA_IS_TAGGED_INT(__drr) && (__drr->type == STRADA_CLOSURE || __drr->type == STRADA_CPOINTER)) __discode = 1; } } ");
+                    emit($cg, "if (__discode) { __dr = STRADA_MAKE_TAGGED_INT(1); } ");
+                    emit($cg, "else { char *__dn = strada_to_str(__dv); if (!__dn || !__dn[0]) { __dr = strada_new_str(\"\"); } ");
                     emit($cg, "else { const char *__dsep = NULL; for (const char *__dp = __dn; *__dp; __dp++) { if (__dp[0]==':' && __dp[1]==':') __dsep = __dp; } ");
                     emit($cg, "  StradaValue *__dfn; ");
                     emit($cg, "  if (__dsep) { size_t __dpl = (size_t)(__dsep - __dn); char __dpkg[256]; if (__dpl >= sizeof(__dpkg)) __dpl = sizeof(__dpkg)-1; memcpy(__dpkg, __dn, __dpl); __dpkg[__dpl] = 0; __dfn = perla_code_get(__dpkg, __dsep + 2); } ");
                     emit($cg, "  else { __dfn = perla_code_get(\"" . $cg->{"pkg"} . "\", __dn); if (!__dfn) __dfn = perla_code_get(\"main\", __dn); } ");
                     emit($cg, "  __dr = __dfn ? STRADA_MAKE_TAGGED_INT(1) : strada_new_str(\"\"); } ");
-                    emit($cg, "free(__dn); __dr; })");
+                    emit($cg, "free(__dn); } __dr; })");
                     return;
                 }
             }
