@@ -866,6 +866,32 @@ static StradaValue *perla_mop_can_be_made_compatible_with(StradaValue *args) {
 }
 
 static StradaValue *perla_moose_meta(StradaValue *args); /* fwd */
+/* _package_stash($meta) — Class::MOP::Package delegates all symbol-table ops
+ * (get_or_add_package_symbol -> $self->_package_stash->get_or_add_symbol, etc.)
+ * to a Package::Stash. Under perla `$self->_package_stash` came back as an
+ * unblessed value, so the chained ->get_or_add_symbol died "on unblessed
+ * reference". Return a real blessed Package::Stash for the metaclass's package
+ * (perla's native Package::Stash::* methods then operate on the live stash). */
+static StradaValue *perla_mop_package_stash(StradaValue *args) {
+    StradaValue *self = _pu_arg(args, 0);
+    const char *pkg = "main";
+    StradaValue *target = self;
+    if (self && !STRADA_IS_TAGGED_INT(self) && self->type == STRADA_REF && self->value.rv)
+        target = self->value.rv;
+    char *pkgbuf = NULL;
+    if (target && !STRADA_IS_TAGGED_INT(target) && target->type == STRADA_HASH) {
+        StradaValue *p = strada_hv_fetch_owned(target, "package");
+        if (p) { pkgbuf = strada_to_str(p); if (pkgbuf && pkgbuf[0]) pkg = pkgbuf; strada_decref(p); }
+    } else if (target && !STRADA_IS_TAGGED_INT(target) && target->type == STRADA_STR && target->value.pv) {
+        pkg = target->value.pv;  /* invoked as a class method on the pkg name */
+    }
+    perla_stash_get_or_create(pkg);
+    StradaValue *h = strada_new_hash();
+    strada_hash_set(h->value.hv, "package", strada_new_str(pkg));
+    StradaValue *ref = perla_bless(strada_ref_create_take(h), "Package::Stash");
+    if (pkgbuf) free(pkgbuf);
+    return ref;
+}
 /* find_attribute_by_name($meta, $name) — return the attribute metaobject named
  * $name from the metaclass's "attributes" map (keyed by name in
  * perla_moose_meta), or undef. Called during has/accessor-install and
@@ -997,7 +1023,15 @@ static void perla_register_class_mop_isa(void) {
      * redundant under perla's native MOP (returns discarded or define methods
      * perla already provides), so no-op them. */
     static const char *const mop_meta_noop_methods[] = {
-        "add_attribute", "add_method", "_add_meta_method", "clone_object", NULL
+        "add_attribute", "add_method", "_add_meta_method", "clone_object",
+        /* perla doesn't model metaclass reconciliation (upgrading a class's
+         * metaclass to a subclass's). Its machinery walks superclass
+         * metaclasses that are undef under perla and dies in
+         * _class_metaclass_can_be_made_compatible ($super_meta->_real_ref_name
+         * on undef). No-op the entry point — perla's metaclasses are already
+         * the right class. */
+        "_check_metaclass_compatibility",
+        NULL
     };
     const char *const mc_pkgs[] = { "Moose::Meta::Class", "Class::MOP::Class", NULL };
     for (int p = 0; mc_pkgs[p]; p++)
@@ -1011,6 +1045,15 @@ static void perla_register_class_mop_isa(void) {
         perla_code_set(mc_pkgs[p], "create_instance", _ci);
     }
     perla_code_set("Class::MOP::Instance", "create_instance", _ci);
+    /* _package_stash for the metaclass packages — returns a blessed
+     * Package::Stash so Class::MOP::Package's symbol-table delegation works. */
+    StradaValue *_ps = strada_cpointer_new((void*)perla_mop_package_stash);
+    const char *const ps_pkgs[] = {
+        "Class::MOP::Package", "Class::MOP::Module", "Class::MOP::Class",
+        "Moose::Meta::Class", "Moose::Meta::Role", NULL
+    };
+    for (int p = 0; ps_pkgs[p]; p++)
+        perla_code_set(ps_pkgs[p], "_package_stash", _ps);
     /* make_immutable is otherwise only registered in perla_init_moose_stubs
      * (runs at `use Moose` setup) — but Class/MOP.pm's bootstrap calls
      * `->meta->make_immutable` on its own metaclasses *before* that, so wire
