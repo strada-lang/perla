@@ -2024,6 +2024,24 @@ func _parse_use(scalar $p) scalar {
         return Perla::AST::node(Perla::AST::N_USE());
     }
 
+    # use Carp — croak/carp/confess/cluck/longmess/shortmess are provided
+    # natively (perla_init registers Carp::* plus @Carp::EXPORT/@EXPORT_OK).
+    # The SYSTEM Carp.pm (/usr/lib/.../perl-base/Carp.pm) uses modern sub
+    # signatures / attributes the parser can't read, so compile-time
+    # _load_module on it spews `expected RPAREN, got OP ':'` parse errors and
+    # leaves a half-parsed module that trips a spurious `$mess requires
+    # explicit package name`. Skip loading the .pm; keep module="Carp" so the
+    # codegen emits register_imported + Carp->import (the @EXPORT-driven import
+    # of croak/carp/etc still works), and the runtime require short-circuits
+    # because the native Carp stash is already populated.
+    if ($module eq "Carp") {
+        while (_peek_type($p) ne "SEMI" && _peek_type($p) ne "RBRACE" && !_at_end($p)) { _advance($p); }
+        _match($p, "SEMI");
+        my scalar $node = Perla::AST::node(Perla::AST::N_USE());
+        $node->{"module"} = "Carp";
+        return $node;
+    }
+
     # use bigint / use bignum — provided natively (arbitrary-precision integer
     # arithmetic, routed through perla_bigint_binop under a codegen flag). The
     # system bigint.pm pulls in Math::BigInt + Carp and hangs the require
