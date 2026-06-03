@@ -2840,10 +2840,24 @@ func _gen_autoviv_outer_hash(scalar $cg, scalar $node, int $hash_context) void {
 # Mirrors _gen_autoviv_hash but emits autoviv-to-ARRAY at the leaf step.
 func _gen_autoviv_array_value(scalar $cg, scalar $node) void {
     my int $t = $node->{"type"};
+    # `$_` as the REF of an array deref (`@{$_} = LIST`, `push @{$_}, X`) is the
+    # scalar topic holding an array REFERENCE — NEVER the `@_` args array (that's
+    # spelled `@_`). The old code emitted `perla_at_` here, so `@{$_} = LIST`
+    # wrongly operated on @_ and dropped the write (Sub::Exporter::Progressive's
+    # `@{$_} = map {...} @{$_} for \@defaults` lost the `-all` group expansion).
+    #
+    # We must NOT use the c_var("_")==v__ scalar-var path below either: `$_`
+    # does NOT live in `v__`. Scalar assignment to `$_` writes the canonical
+    # global `perla_dollar_underscore` (and the `main::_` glob slot); `v__` is
+    # a vestigial local that stays NULL. Reading `v__` makes the autoviv think
+    # `$_` is undef → it fabricates a throwaway array and assigns into that.
+    # Use plain gen_expr (exactly what the working hash-deref path does), which
+    # reads `$_` from its real storage. No autoviv-on-undef here, but `@{$_}`
+    # on an undef $_ is a rare strict-refs error anyway; correct READ is what
+    # matters for the for-modifier-aliased-arrayref idiom.
     if ($t == Perla::AST::N_SCALAR_VAR()
         && defined($node->{"name"}) && $node->{"name"} eq "_") {
-        # @_ is always a valid array (perla_at_) — no autoviv needed.
-        emit($cg, "perla_at_");
+        gen_expr($cg, $node);
         return;
     }
     if ($t == Perla::AST::N_SCALAR_VAR()
