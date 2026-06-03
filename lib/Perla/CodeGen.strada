@@ -2985,23 +2985,32 @@ func _gen_cond(scalar $cg, scalar $node) void {
                 _gen_expr_scalar($cg, $node->{"left"});
                 emit($cg, "; StradaValue *__cr = ");
                 _gen_expr_scalar($cg, $node->{"right"});
-                emit($cg, "; int __cbr_set = 0; int __cres = 0; ");
-                emit($cg, "if (((__cl && !STRADA_IS_TAGGED_INT(__cl) && __cl->type == STRADA_REF) || ");
-                emit($cg, "     (__cr && !STRADA_IS_TAGGED_INT(__cr) && __cr->type == STRADA_REF))) { ");
-                emit($cg, "  StradaValue *__cbr = perla_overload_binary(__cl, __cr, \"" . $op . "\"); ");
-                emit($cg, "  if (__cbr) { __cres = strada_to_bool(__cbr); __cbr_set = 1; strada_decref(__cbr); } } ");
-                emit($cg, "int __cres_final = __cbr_set ? __cres : ");
+                emit($cg, "; int __cres_final; ");
+                # FAST PATH: two tagged integers — skip the REF/overload check
+                # and the operand decrefs (tagged ints are immortal). Mirrors
+                # the arithmetic fast path; this comparison runs every loop
+                # iteration / recursion guard (`$n <= 1`).
+                emit($cg, "if (STRADA_IS_TAGGED_INT(__cl) && STRADA_IS_TAGGED_INT(__cr)) { ");
+                emit($cg, "  __cres_final = (STRADA_TAGGED_INT_VAL(__cl) " . $op . " STRADA_TAGGED_INT_VAL(__cr)); ");
+                emit($cg, "} else { ");
+                emit($cg, "  int __cbr_set = 0; int __cres = 0; ");
+                emit($cg, "  if (((__cl && !STRADA_IS_TAGGED_INT(__cl) && __cl->type == STRADA_REF) || ");
+                emit($cg, "       (__cr && !STRADA_IS_TAGGED_INT(__cr) && __cr->type == STRADA_REF))) { ");
+                emit($cg, "    StradaValue *__cbr = perla_overload_binary(__cl, __cr, \"" . $op . "\"); ");
+                emit($cg, "    if (__cbr) { __cres = strada_to_bool(__cbr); __cbr_set = 1; strada_decref(__cbr); } } ");
+                emit($cg, "  __cres_final = __cbr_set ? __cres : ");
                 emit($cg, "(STRADA_IS_TAGGED_INT(__cl) && STRADA_IS_TAGGED_INT(__cr) ? ");
                 emit($cg, "(STRADA_TAGGED_INT_VAL(__cl) " . $op . " STRADA_TAGGED_INT_VAL(__cr)) : ");
                 emit($cg, "(strada_to_num(__cl) " . $op . " strada_to_num(__cr))); ");
                 # Decref owned operand temps so e.g. `$i == -1` doesn't
                 # leak the fresh strada_new_num(-1) per call.
                 if ($cl_borrowed_if == 0) {
-                    emit($cg, "if (__cl) strada_decref(__cl); ");
+                    emit($cg, "  if (__cl) strada_decref(__cl); ");
                 }
                 if ($cr_borrowed_if == 0) {
-                    emit($cg, "if (__cr) strada_decref(__cr); ");
+                    emit($cg, "  if (__cr) strada_decref(__cr); ");
                 }
+                emit($cg, "} ");
                 emit($cg, "__cres_final; })");
             }
             return;
@@ -13366,7 +13375,20 @@ func _gen_binop(scalar $cg, scalar $node) void {
             _gen_expr_scalar($cg, $node->{"left"});
             emit($cg, "; StradaValue *__ar = ");
             _gen_expr_scalar($cg, $node->{"right"});
-            emit($cg, "; StradaValue *__abr = NULL; ");
+            emit($cg, "; StradaValue *__abr = NULL; StradaValue *__ares; ");
+            # FAST PATH: two tagged integers — the overwhelmingly common case
+            # (loop counters, indices, fib-style int arithmetic). Skips the
+            # REF/overload check and the two non-inlined strada_sv_is_uint
+            # calls, and reads operands via the STRADA_TAGGED_INT_VAL shift
+            # instead of strada_to_int. Identical overflow/range/tag semantics
+            # to the general signed-int branch below; tagged ints are immortal
+            # so no operand decref is needed. (fib35: most of the 0.45s vs a
+            # 0.04s hand-written tagged-int floor was this per-op overhead.)
+            emit($cg, "if (STRADA_IS_TAGGED_INT(__al) && STRADA_IS_TAGGED_INT(__ar)) { ");
+            emit($cg, "  int64_t __opl = STRADA_TAGGED_INT_VAL(__al); int64_t __opr = STRADA_TAGGED_INT_VAL(__ar); int64_t __opres; ");
+            emit($cg, "  __ares = __builtin_" . $op_builtin . "_overflow(__opl, __opr, &__opres) ? (" . $uv_ovf . ") ");
+            emit($cg, "          : ((__opres > STRADA_TAGGED_INT_MAX || __opres < STRADA_TAGGED_INT_MIN) ? strada_new_int(__opres) : STRADA_MAKE_TAGGED_INT(__opres)); ");
+            emit($cg, "} else { ");
             emit($cg, "if (((__al && !STRADA_IS_TAGGED_INT(__al) && __al->type == STRADA_REF) || ");
             emit($cg, "     (__ar && !STRADA_IS_TAGGED_INT(__ar) && __ar->type == STRADA_REF))) { ");
             emit($cg, "  __abr = perla_overload_binary(__al, __ar, \"" . $op . "\"); } ");
@@ -13375,7 +13397,6 @@ func _gen_binop(scalar $cg, scalar $node) void {
             # used to silently wrap. __builtin_*_overflow returns true
             # on overflow without UB; on overflow OR out-of-tagged-int-
             # range, promote to a float via strada_new_num.
-            emit($cg, "StradaValue *__ares; ");
             emit($cg, "if (__abr) { __ares = __abr; } ");
             # UV-aware path FIRST: when either operand is an unsigned-64 (UV)
             # heap int, do the arithmetic in uint64 so `$uv - 1`, `~0 - 5`,
@@ -13439,6 +13460,7 @@ func _gen_binop(scalar $cg, scalar $node) void {
             if ($ar_borrowed == 0) {
                 emit($cg, "if (__ar) strada_decref(__ar); ");
             }
+            emit($cg, "} ");  # close the `else` of the tagged-int fast path
             emit($cg, "__ares; })");
         }
         return;

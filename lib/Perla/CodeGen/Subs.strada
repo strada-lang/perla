@@ -662,8 +662,14 @@ func gen_sub_def(scalar $cg, scalar $node) void {
         $pi = 0;
         while ($pi < $arity) {
             my str $pn = Perla::CodeGen::c_var($pnames->[$pi]);
-            Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "strada_incref(" . $pn . ");\n");
-            Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "strada_cleanup_push(" . $pn . ");\n");
+            # Tagged-int params are immortal: incref/decref are no-ops and they
+            # never need cleanup-stack tracking. Skipping the push (the drain is
+            # mark-based, so this stays balanced) removes a real array store +
+            # drain per call — a large win for integer-arg recursion/loops.
+            # Subst-writeback stays correct: it tracks param_vars at compile
+            # time and pushes the NEW value on `$param =~ s///`, identical in
+            # both cases; only the (refcount-free) original is no longer pushed.
+            Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "if (!STRADA_IS_TAGGED_INT(" . $pn . ")) { strada_incref(" . $pn . "); strada_cleanup_push(" . $pn . "); }\n");
             $cg->{"param_vars"}->{$pnames->[$pi]} = 1;
             $pi++;
         }
