@@ -369,6 +369,30 @@ StradaValue *perla_xsloader_load(StradaValue *args) {
                  * Exporter copies the native subs into the caller, and all calls
                  * land on perla's natives. */
                 "List::Util",
+                /* Fcntl is pure-XS (constants from C's fcntl.h). perla
+                 * registers the O_xxx, SEEK_xxx, LOCK_xxx and S_xxx constants
+                 * natively, so a fatal XSLoader death during `use Fcntl`
+                 * (Fcntl.pm calls the no-arg `XSLoader::load()`) would abort
+                 * the program. Lie success: the .pm finishes, Exporter copies
+                 * the native constants. Hit loading DateTime's dep chain. */
+                "Fcntl",
+                /* POSIX is pure-XS; perla registers the commonly-used POSIX
+                 * functions/constants natively (floor/ceil/strftime/setlocale/
+                 * INT_MAX/...). Same rationale as Fcntl — `use POSIX` calls
+                 * XSLoader and would die fatally otherwise. Lie success; calls
+                 * land on perla's natives (unimplemented ones return undef
+                 * rather than aborting the whole program). */
+                "POSIX",
+                /* More pure-XS core modules perla backs natively: B (perlstring
+                 * /cstring/class/svref_2object), Cwd (getcwd/abs_path/...),
+                 * Encode (encode/decode/...). `use`ing them calls XSLoader and
+                 * would die fatally; lie success so the .pm finishes and calls
+                 * land on perla's natives. (Time::HiRes/Hash::Util/Sub::Util are
+                 * NOT listed — perla has no natives for them, so a clear failure
+                 * beats silently-undef subs.) */
+                "B",
+                "Cwd",
+                "Encode",
                 NULL,
             };
             for (int ni = 0; native_lie_modules[ni]; ni++) {
