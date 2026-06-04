@@ -2125,6 +2125,35 @@ func _parse_use(scalar $p) scalar {
         return $node;
     }
 
+    # `use vars qw($x @y %z)` — the deprecated pre-`our` way to declare
+    # package variables. NOT a no-op: it must register the names so strict
+    # 'vars' doesn't fire on later uses (incl. interpolation). Capture the
+    # qw list into the N_USE's imports; codegen/collect treat them like `our`.
+    if ($module eq "vars") {
+        my array @var_imps = ();
+        if (_peek_type($p) eq "QW") {
+            _advance($p);
+            _expect($p, "LPAREN");
+            while (_peek_type($p) ne "RPAREN" && !_at_end($p)) {
+                push(@var_imps, "" . _advance($p)->{"value"});
+            }
+            _expect($p, "RPAREN");
+        } else {
+            # `use vars '$x', '$y';` (string-list form)
+            while (_peek_type($p) ne "SEMI" && !_at_end($p)) {
+                my scalar $vt = _advance($p);
+                if ($vt->{"type"} eq "STRING" || $vt->{"type"} eq "DQSTRING") {
+                    push(@var_imps, "" . $vt->{"value"});
+                }
+            }
+        }
+        _match($p, "SEMI");
+        my scalar $vu = Perla::AST::node(Perla::AST::N_USE());
+        $vu->{"module"} = "vars";
+        $vu->{"imports"} = \@var_imps;
+        return $vu;
+    }
+
     # use <pragma> - skip. ONLY real compile-time pragmas whose semantics
     # are about the parser / language itself (strict / warnings / feature /
     # utf8 / integer / bytes) and for which Perla has matching behavior
@@ -2134,7 +2163,7 @@ func _parse_use(scalar $p) scalar {
     if ($module eq "strict" || $module eq "warnings" ||
         $module eq "warnings::register" ||
         $module eq "utf8" || $module eq "bytes" ||
-        $module eq "feature" || $module eq "vars" ||
+        $module eq "feature" ||
         $module eq "attributes" || $module eq "re" ||
         $module eq "autouse" || $module eq "subs" || $module eq "sigtrap" ||
         $module eq "sort" || $module eq "fields" || $module eq "if" ||

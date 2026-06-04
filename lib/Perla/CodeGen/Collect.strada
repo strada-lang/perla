@@ -605,9 +605,42 @@ func collect_our_vars_from_stmts(scalar $cg, scalar $stmts) void {
                     $iv = $iv->{"init"};
                 }
             }
+            # `use vars qw($x @y %z)` declares package vars (the deprecated
+            # pre-`our` mechanism). Treat each like an `our` so strict 'vars'
+            # doesn't fire on it — e.g. Date::ParseAccurate's `use vars qw($obj)`
+            # then `"...$obj..."` interpolation in an eval'd template.
+            if ($s->{"type"} == Perla::AST::N_USE()
+                && defined($s->{"module"}) && $s->{"module"} eq "vars"
+                && defined($s->{"imports"})) {
+                my scalar $vimps = $s->{"imports"};
+                if (ref($vimps) eq "ARRAY") {
+                    my int $vii = 0;
+                    while ($vii < scalar(@{$vimps})) {
+                        my str $vimp = "" . $vimps->[$vii];
+                        if (length($vimp) > 1) {
+                            my str $vsig = substr($vimp, 0, 1);
+                            if ($vsig eq "\$" || $vsig eq "@" || $vsig eq "%" || $vsig eq "&" || $vsig eq "*") {
+                                my str $vnm = substr($vimp, 1, length($vimp) - 1);
+                                my str $vtype = "SCALAR_VAR";
+                                if ($vsig eq "@") { $vtype = "ARRAY_VAR"; }
+                                elsif ($vsig eq "%") { $vtype = "HASH_VAR"; }
+                                $cg->{"our_vars"}->{$vnm} = $vtype;
+                            }
+                        }
+                        $vii = $vii + 1;
+                    }
+                }
+            }
             # Recurse into blocks
             if ($s->{"type"} == Perla::AST::N_BLOCK() && defined($s->{"stmts"})) {
                 collect_our_vars_from_stmts($cg, $s->{"stmts"});
+            }
+            # Recurse into BEGIN/END bodies — `use vars`/`our` are commonly
+            # BEGIN-wrapped by the parser (file-init hoist), so their decls
+            # would otherwise be missed by this top-level walk.
+            if (($s->{"type"} == Perla::AST::N_BEGIN() || $s->{"type"} == Perla::AST::N_END())
+                && defined($s->{"body"}) && defined($s->{"body"}->{"stmts"})) {
+                collect_our_vars_from_stmts($cg, $s->{"body"}->{"stmts"});
             }
             # Recurse into sub bodies — `our $x = N` inside a sub
             # declares a package var visible to the rest of the file.
