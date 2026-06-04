@@ -9532,8 +9532,15 @@ func gen_expr(scalar $cg, scalar $node) void {
                         emit($cg, "} else { ");
                         emit($cg, $slot_var . " = __new_sv; ");
                         emit($cg, "if (__old_sv != " . $slot_var . ") strada_decref(__old_sv); ");
-                        emit($cg, "{ PerlGlob *__og = perla_glob_get_or_create(perla_stash_get_or_create(\"" . $cg->{"pkg"} . "\"), \"" . $exp_mname . "\"); ");
-                        emit($cg, "perla_glob_store(__og, PERLA_SLOT_SCALAR, " . $slot_var . "); } ");
+                        # Cache the stash-mirror glob: perla_glob_get_or_create
+                        # (perla_stash_get_or_create(pkg), name) returns the SAME
+                        # glob every time, so re-looking it up on every write was
+                        # two hash lookups per assignment — pathological for a
+                        # file-scope var written in a tight loop (`$c=$i` over
+                        # 200M iters: 22.5s -> fast). The block-static is looked
+                        # up once and reused.
+                        emit($cg, "{ static PerlGlob *__ogc = (PerlGlob*)0; if (__builtin_expect(!__ogc, 0)) __ogc = perla_glob_get_or_create(perla_stash_get_or_create(\"" . $cg->{"pkg"} . "\"), \"" . $exp_mname . "\"); ");
+                        emit($cg, "perla_glob_store(__ogc, PERLA_SLOT_SCALAR, " . $slot_var . "); } ");
                         emit($cg, "} ");
                         # If a closure has already captured this var, also
                         # write the new value through to the capture cell
