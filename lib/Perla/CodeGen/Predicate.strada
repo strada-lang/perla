@@ -171,3 +171,196 @@ func idx_is_list_expr(scalar $node) int {
     if ($t == Perla::AST::N_ARRAY_SLICE()) { return 1; }
     return 0;
 }
+
+# ===================================================================
+# int type-inference: sound int-eligibility analysis for `my` scalars.
+# A `my $x = <int>` is int-eligible iff it provably always holds an
+# integer AND is never aliased/ref'd/captured, so it can be stored as a
+# native int64. SOUND/conservative: any write that could make it non-int,
+# any alias-creating construct, or any in-place mutator => NOT eligible.
+# False negatives are fine; false positives are correctness bugs.
+# ===================================================================
+
+# Does this node directly name scalar $varname?
+func _is_scalar_named(scalar $n, str $varname) int {
+    if (!defined($n) || ref($n) ne "HASH") { return 0; }
+    if ($n->{"type"} == Perla::AST::N_SCALAR_VAR()
+        && defined($n->{"name"}) && ("" . $n->{"name"}) eq $varname) { return 1; }
+    return 0;
+}
+
+# The AST child fields walked by the recursive helpers below.
+func _int_child_fields() array {
+    my array @f = ("body", "stmts", "then", "else", "init", "cond", "step",
+                   "expr", "value", "target", "ref", "object", "key", "index",
+                   "array", "hash", "left", "right", "operand", "from", "to",
+                   "lhs", "rhs", "true_branch", "false_branch", "block", "args",
+                   "elems", "keys_list", "indices", "vars", "var", "list", "pairs");
+    return @f;
+}
+
+# Does any node in this subtree name scalar $varname (read or write)?
+func pred_subtree_names_scalar(scalar $node, str $varname) int {
+    if (!defined($node) || ref($node) ne "HASH") { return 0; }
+    if (_is_scalar_named($node, $varname) == 1) { return 1; }
+    my array @fields = _int_child_fields();
+    my int $fi = 0;
+    while ($fi < scalar(@fields)) {
+        my str $fn = $fields[$fi];
+        if (exists($node->{$fn})) {
+            my scalar $child = $node->{$fn};
+            if (defined($child)) {
+                if (ref($child) eq "ARRAY") {
+                    my int $ai = 0;
+                    while ($ai < scalar(@{$child})) {
+                        if (pred_subtree_names_scalar($child->[$ai], $varname) == 1) { return 1; }
+                        $ai = $ai + 1;
+                    }
+                } elsif (ref($child) eq "HASH") {
+                    if (pred_subtree_names_scalar($child, $varname) == 1) { return 1; }
+                }
+            }
+        }
+        $fi = $fi + 1;
+    }
+    return 0;
+}
+
+# Does an assignment TARGET write scalar $varname (as opposed to only using
+# it as an array/hash index, which is a read)? Recurses through element
+# accessors into the container only.
+func _target_writes_scalar(scalar $tgt, str $varname) int {
+    if (!defined($tgt) || ref($tgt) ne "HASH") { return 0; }
+    my int $t = $tgt->{"type"};
+    if (_is_scalar_named($tgt, $varname) == 1) { return 1; }
+    # Element accessors: $x in the index is a READ; recurse the container only.
+    if ($t == Perla::AST::N_ARRAY_ELEM() || $t == Perla::AST::N_HASH_ELEM()
+        || $t == Perla::AST::N_ARROW_ARRAY() || $t == Perla::AST::N_ARROW_HASH()) {
+        if (defined($tgt->{"object"})) { return _target_writes_scalar($tgt->{"object"}, $varname); }
+        if (defined($tgt->{"array"})) { return _target_writes_scalar($tgt->{"array"}, $varname); }
+        if (defined($tgt->{"hash"})) { return _target_writes_scalar($tgt->{"hash"}, $varname); }
+        return 0;
+    }
+    # Any other target shape (list, paren, slice, deref, ...) that mentions $x
+    # is a write/alias of $x => unsafe.
+    if (pred_subtree_names_scalar($tgt, $varname) == 1) { return 1; }
+    return 0;
+}
+
+# Is the foreach loop variable scalar $varname?
+func _foreach_var_is(scalar $node, str $varname) int {
+    my scalar $fv = $node->{"var"};
+    if (!defined($fv)) { return 0; }
+    my str $fvn = "";
+    if (ref($fv) eq "HASH") {
+        if (defined($fv->{"name"})) { $fvn = "" . $fv->{"name"}; }
+        elsif (defined($fv->{"value"})) { $fvn = "" . $fv->{"value"}; }
+    }
+    if (length($fvn) > 0 && substr($fvn, 0, 1) eq "$") { $fvn = substr($fvn, 1, length($fvn) - 1); }
+    if ($fvn eq $varname) { return 1; }
+    return 0;
+}
+
+# Does an N_MY node declare scalar $varname?
+func _my_decl_names(scalar $node, str $varname) int {
+    if (defined($node->{"vars"})) {
+        my int $vi = 0;
+        while ($vi < scalar(@{$node->{"vars"}})) {
+            my scalar $v = $node->{"vars"}->[$vi];
+            if (defined($v) && ref($v) eq "HASH" && defined($v->{"value"})
+                && ("" . $v->{"value"}) eq $varname) { return 1; }
+            $vi = $vi + 1;
+        }
+    }
+    if (defined($node->{"var"}) && ref($node->{"var"}) eq "HASH"
+        && defined($node->{"var"}->{"value"}) && ("" . $node->{"var"}->{"value"}) eq $varname) { return 1; }
+    return 0;
+}
+
+# Returns 1 if $node contains an UNSAFE use of scalar $varname for int-typing.
+func scalar_int_unsafe(scalar $node, str $varname) int {
+    if (!defined($node) || ref($node) ne "HASH") { return 0; }
+    my int $t = $node->{"type"};
+    # \$x — reference (can't address a native int; could write non-int via ref)
+    if ($t == Perla::AST::N_REF() && _is_scalar_named($node->{"operand"}, $varname) == 1) { return 1; }
+    # closure capture: $x inside a nested sub needs a shared cell
+    if ($t == Perla::AST::N_SUB() || $t == Perla::AST::N_ANON_SUB()) {
+        if (pred_subtree_names_scalar($node, $varname) == 1) { return 1; }
+        return 0;
+    }
+    # re-declaration (shadowing)
+    if ($t == Perla::AST::N_MY() && _my_decl_names($node, $varname) == 1) { return 1; }
+    # assignment
+    if ($t == Perla::AST::N_ASSIGN()) {
+        my scalar $tgt = $node->{"target"};
+        my str $op = defined($node->{"op"}) ? ("" . $node->{"op"}) : "=";
+        if (_is_scalar_named($tgt, $varname) == 1) {
+            if (!($op eq "=" || $op eq "+=" || $op eq "-=" || $op eq "*=" || $op eq "%="
+                  || $op eq "&=" || $op eq "|=" || $op eq "^=" || $op eq "<<=" || $op eq ">>=")) {
+                return 1;
+            }
+            if (Perla::CodeGen::Predicate::expr_is_int($node->{"value"}) == 0) { return 1; }
+            return scalar_int_unsafe($node->{"value"}, $varname);
+        }
+        if (_target_writes_scalar($tgt, $varname) == 1) { return 1; }
+        if (scalar_int_unsafe($tgt, $varname) == 1) { return 1; }
+        return scalar_int_unsafe($node->{"value"}, $varname);
+    }
+    # foreach loop var $x (alias)
+    if ($t == Perla::AST::N_FOREACH() && _foreach_var_is($node, $varname) == 1) { return 1; }
+    # local $x
+    if ($t == Perla::AST::N_LOCAL()) {
+        if (pred_subtree_names_scalar($node, $varname) == 1) { return 1; }
+        return 0;
+    }
+    # $x as a direct call/method argument (@_ aliasing) or method invocant
+    if ($t == Perla::AST::N_CALL() || $t == Perla::AST::N_METHOD()) {
+        if (defined($node->{"args"})) {
+            my int $ai = 0;
+            while ($ai < scalar(@{$node->{"args"}})) {
+                if (_is_scalar_named($node->{"args"}->[$ai], $varname) == 1) { return 1; }
+                $ai = $ai + 1;
+            }
+        }
+        if ($t == Perla::AST::N_METHOD() && _is_scalar_named($node->{"object"}, $varname) == 1) { return 1; }
+    }
+    # $x =~ s/// or tr/// (in-place mutate) — bail on any =~ with $x on the left
+    if ($t == Perla::AST::N_BINOP() && defined($node->{"op"}) && ("" . $node->{"op"}) eq "=~"
+        && _is_scalar_named($node->{"left"}, $varname) == 1) { return 1; }
+    # recurse into all children
+    my array @fields = _int_child_fields();
+    my int $fi = 0;
+    while ($fi < scalar(@fields)) {
+        my str $fn = $fields[$fi];
+        if (exists($node->{$fn})) {
+            my scalar $child = $node->{$fn};
+            if (defined($child)) {
+                if (ref($child) eq "ARRAY") {
+                    my int $ai = 0;
+                    while ($ai < scalar(@{$child})) {
+                        if (scalar_int_unsafe($child->[$ai], $varname) == 1) { return 1; }
+                        $ai = $ai + 1;
+                    }
+                } elsif (ref($child) eq "HASH") {
+                    if (scalar_int_unsafe($child, $varname) == 1) { return 1; }
+                }
+            }
+        }
+        $fi = $fi + 1;
+    }
+    return 0;
+}
+
+# Entry point: is `my $varname = $init` int-eligible across $stmts (array of
+# statement nodes)? Conservative.
+func local_int_eligible(scalar $stmts, str $varname, scalar $init) int {
+    if (!defined($init)) { return 0; }
+    if (Perla::CodeGen::Predicate::expr_is_int($init) == 0) { return 0; }
+    if (!defined($stmts) || ref($stmts) ne "ARRAY") { return 0; }
+    my int $i = 0;
+    while ($i < scalar(@{$stmts})) {
+        if (scalar_int_unsafe($stmts->[$i], $varname) == 1) { return 0; }
+        $i = $i + 1;
+    }
+    return 1;
+}
