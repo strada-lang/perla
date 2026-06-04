@@ -8080,6 +8080,19 @@ func _gen_foreach_inner(scalar $cg, scalar $node) void {
         emit($cg, ")) {\n");
         $cg->{"indent"} = $cg->{"indent"} + 1;
     }
+    # Snapshot the closure-cell counter before the body so we can invalidate
+    # any cells the body's closures allocate. __perla_cell[] caches a non-owning
+    # pointer to each capture cell; when a closure that captured the cell dies at
+    # iteration end (its my-decl is decref'd below), strada_cell_decref frees the
+    # cell — but the cache pointer lingers. The next iteration's cell-init check
+    # (`*__perla_cell[N] != v_x`) would then DEREFERENCE that freed cell — a
+    # use-after-free that corrupts the heap (seen crashing DBIx::Class::Core's
+    # load via Class::C3::Componentised::inject_base's `for my $comp` closure).
+    # Resetting the slots to NULL at iteration end makes the next iteration
+    # allocate fresh cells instead of reading freed memory; intra-iteration cell
+    # sharing (two closures, same var, same iteration) is unaffected.
+    my int $__fe_cell_snap = 0;
+    if (defined($cg->{"cell_idx"})) { $__fe_cell_snap = $cg->{"cell_idx"}; }
     gen_block_stmts($cg, $node->{"body"});
     if ($fe_grep_lvalue == 1) {
         $cg->{"indent"} = $cg->{"indent"} - 1;
@@ -8093,6 +8106,16 @@ func _gen_foreach_inner(scalar $cg, scalar $node) void {
         my str $__febl_cv = c_var($__fe_body_locals[$__febl_i]);
         ind($cg); emit($cg, "if (" . $__febl_cv . ") { strada_decref(" . $__febl_cv . "); " . $__febl_cv . " = NULL; }\n");
         $__febl_i = $__febl_i + 1;
+    }
+    # Invalidate body-allocated closure-cell cache slots (see snapshot above).
+    # NULL only — the cells were already freed when their capturing closures
+    # were decref'd, so this drops a dangling pointer, never a live ref.
+    my int $__fe_cell_now = 0;
+    if (defined($cg->{"cell_idx"})) { $__fe_cell_now = $cg->{"cell_idx"}; }
+    my int $__fe_ci = $__fe_cell_snap;
+    while ($__fe_ci < $__fe_cell_now) {
+        ind($cg); emit($cg, "__perla_cell[" . $__fe_ci . "] = (StradaValue**)0;\n");
+        $__fe_ci = $__fe_ci + 1;
     }
     if ($__fe_pushed_lex == 1) {
         pop(@{$cg->{"my_lexicals"}});
