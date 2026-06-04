@@ -158,10 +158,14 @@ PERLA_CODEGEN_MODS = \
     lib/Perla/CodeGen/Interp.o \
     lib/Perla/CodeGen/Subs.o
 
-# CodeGen sub-modules: package name (Perla::CodeGen::X) matches the nested
-# directory layout, so the lib-root auto-deduce works without -L.
+# CodeGen sub-modules: need -L pointing at the lib root so cross-module `use`
+# (e.g. Interp.strada's `use Perla::CodeGen::Escape;`) resolves. Without it the
+# sibling-module functions are neither defined nor declared in the generated C,
+# so gcc assumes an implicit `int` return and TRUNCATES the 64-bit StradaValue*
+# they actually return — corrupting any interpolation that calls
+# escape_perl_only_bslash() (crashes strada_concat_cstr_sv with a 32-bit ptr).
 lib/Perla/CodeGen/%.o: lib/Perla/CodeGen/%.strada $(STRADAC)
-	$(STRADA) $(STRADA_OPT) -M $<
+	$(STRADA) $(STRADA_OPT) -L lib -M $<
 
 # CodeGen / Perla / Parser / StradaGen need -L pointing at the lib root:
 # Perla.strada is the top-level package `Perla` (not Perla::Perla), so the
