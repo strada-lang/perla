@@ -1014,6 +1014,20 @@ func rewrite_var_refs(scalar $node, scalar $renames) void {
             $node->{"name"} = $effective_renames->{$node->{"name"}};
         }
     }
+    # `for $x (LIST)` (no `my`) loops over the pre-declared $x. Its loop var
+    # is a raw TOKEN (`$node->{"var"}`), not an N_SCALAR_VAR, so the rename
+    # above misses it — the loop's element assignment then targeted the
+    # UN-renamed C var while the body read the renamed one, so the body never
+    # saw the loop value (`for $x (10,2.5){ $x*2 }` gave 10,10 not 20,5).
+    # `for my $x` declares a FRESH loop var and must NOT be rewritten to the
+    # outer name.
+    if ($t == Perla::AST::N_FOREACH()
+        && (!defined($node->{"my"}) || $node->{"my"} == 0)
+        && defined($node->{"var"}) && ref($node->{"var"}) eq "HASH"
+        && defined($node->{"var"}->{"value"})
+        && defined($effective_renames->{$node->{"var"}->{"value"}})) {
+        $node->{"var"}->{"value"} = $effective_renames->{$node->{"var"}->{"value"}};
+    }
     # N_ARRAY_SLICE: `array` field is a NAME STRING (not an AST node) for
     # the sigil form `@arr[1,2]`. Rename it directly here so the slice
     # reads the renamed C var. The deref form `@$ref[...]` has `array`
