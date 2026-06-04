@@ -703,6 +703,8 @@ func generate(scalar $ast) str {
     # `BEGIN { ...A... } CODE BEGIN { ...B... }` ran A, then CODE, then
     # B, while Perl runs A, B, then CODE.
     my scalar $stmts = $ast->{"stmts"};
+    # int type-inference (M1): compute int-eligible locals for main scope.
+    _compute_int_vars(\%cg, $stmts);
     my int $i = 0;
     # Perl phase ordering: BEGIN (source order) → CHECK/UNITCHECK (reverse
     # declaration order) → INIT (source order) → main. perla runs them all at
@@ -2967,7 +2969,7 @@ func _gen_cond(scalar $cg, scalar $node) void {
     if ($t == Perla::AST::N_BINOP()) {
         my str $op = $node->{"op"};
         if ($op eq "==" || $op eq "!=" || $op eq "<" || $op eq ">" || $op eq "<=" || $op eq ">=") {
-            if (Perla::CodeGen::Predicate::expr_is_int($node->{"left"}) == 1 && Perla::CodeGen::Predicate::expr_is_int($node->{"right"}) == 1) {
+            if (_node_is_int($cg, $node->{"left"}) == 1 && _node_is_int($cg, $node->{"right"}) == 1) {
                 emit($cg, "(strada_to_int(");
                 _gen_expr_scalar($cg, $node->{"left"});
                 emit($cg, ") " . $op . " strada_to_int(");
@@ -6560,6 +6562,99 @@ func _gen_block(scalar $cg, scalar $node) void {
     }
     $cg->{"indent"} = $cg->{"indent"} - 1;
     ind($cg); emit($cg, "}\n");
+}
+
+# int type-inference (M1 wiring): collect `my $x = <int>` single-scalar decls
+# anywhere in the subtree into $out as [name, init] pairs.
+func _collect_my_scalar_decls(scalar $node, scalar $out) void {
+    if (!defined($node)) { return; }
+    if (ref($node) eq "ARRAY") {
+        my int $ai = 0;
+        while ($ai < scalar(@{$node})) { _collect_my_scalar_decls($node->[$ai], $out); $ai = $ai + 1; }
+        return;
+    }
+    if (ref($node) ne "HASH") { return; }
+    if ($node->{"type"} == Perla::AST::N_MY() && defined($node->{"init"})) {
+        my str $nm = "";
+        if (defined($node->{"vars"}) && scalar(@{$node->{"vars"}}) == 1) {
+            my scalar $v = $node->{"vars"}->[0];
+            if (defined($v) && ref($v) eq "HASH" && defined($v->{"type"})
+                && ("" . $v->{"type"}) eq "SCALAR_VAR" && defined($v->{"value"})) {
+                $nm = "" . $v->{"value"};
+            }
+        } elsif (defined($node->{"var"}) && ref($node->{"var"}) eq "HASH"
+                 && defined($node->{"var"}->{"type"}) && ("" . $node->{"var"}->{"type"}) eq "SCALAR_VAR"
+                 && defined($node->{"var"}->{"value"})) {
+            $nm = "" . $node->{"var"}->{"value"};
+        }
+        if (length($nm) > 0) { push(@{$out}, [$nm, $node->{"init"}]); }
+    }
+    my array @cf = ("body", "stmts", "then", "else", "init", "cond", "step",
+                    "expr", "value", "target", "block", "args", "elems", "list",
+                    "true_branch", "false_branch");
+    my int $fi = 0;
+    while ($fi < scalar(@cf)) {
+        my str $fn = $cf[$fi];
+        if (exists($node->{$fn})) { _collect_my_scalar_decls($node->{$fn}, $out); }
+        $fi = $fi + 1;
+    }
+}
+
+# Compute the set of int-eligible local scalars for a function body and store
+# it in $cg->{"int_vars"} (name => 1). Called fresh per function scope.
+func _compute_int_vars(scalar $cg, scalar $stmts) void {
+    $cg->{"int_vars"} = {};
+    if (!defined($stmts) || ref($stmts) ne "ARRAY") { return; }
+    my array @cands = ();
+    _collect_my_scalar_decls($stmts, \@cands);
+    # Shadowing guard: a name declared with `my` more than once in this scope
+    # could refer to different (possibly non-int) variables — exclude it.
+    my hash %__decl_count = ();
+    my int $ci = 0;
+    while ($ci < scalar(@cands)) {
+        my str $cn = "" . $cands[$ci]->[0];
+        $__decl_count{$cn} = (defined($__decl_count{$cn}) ? $__decl_count{$cn} : 0) + 1;
+        $ci = $ci + 1;
+    }
+    my int $i = 0;
+    while ($i < scalar(@cands)) {
+        my str $nm = "" . $cands[$i]->[0];
+        if ($__decl_count{$nm} == 1 && !defined($cg->{"int_vars"}->{$nm})
+            && Perla::CodeGen::Predicate::local_int_eligible($stmts, $nm, $cands[$i]->[1]) == 1) {
+            $cg->{"int_vars"}->{$nm} = 1;
+        }
+        $i = $i + 1;
+    }
+}
+
+# int-var-aware variant of Predicate::expr_is_int: an N_SCALAR_VAR that the
+# analysis proved int-eligible counts as int, and that flows through nested
+# arithmetic. Everything else delegates to the pure predicate.
+func _node_is_int(scalar $cg, scalar $node) int {
+    if (!defined($node)) { return 0; }
+    my int $t = $node->{"type"};
+    if ($t == Perla::AST::N_SCALAR_VAR()) {
+        if (defined($cg->{"int_vars"}) && defined($node->{"name"})
+            && defined($cg->{"int_vars"}->{"" . $node->{"name"}})) { return 1; }
+        return 0;
+    }
+    if ($t == Perla::AST::N_BINOP()) {
+        my str $op = "" . $node->{"op"};
+        if ($op eq "==" || $op eq "!=" || $op eq "<" || $op eq ">" || $op eq "<=" || $op eq ">="
+            || $op eq "<=>" || $op eq "%"
+            || $op eq "&" || $op eq "|" || $op eq "^" || $op eq "<<" || $op eq ">>") { return 1; }
+        if ($op eq "+" || $op eq "-" || $op eq "*") {
+            if (_node_is_int($cg, $node->{"left"}) == 1 && _node_is_int($cg, $node->{"right"}) == 1) { return 1; }
+            return 0;
+        }
+        return 0;
+    }
+    if ($t == Perla::AST::N_UNOP()) {
+        my str $op = "" . $node->{"op"};
+        if ($op eq "!" || $op eq "not" || $op eq "++" || $op eq "--") { return 1; }
+        return 0;
+    }
+    return Perla::CodeGen::Predicate::expr_is_int($node);
 }
 
 func gen_block_stmts(scalar $cg, scalar $node) void {
@@ -13335,7 +13430,7 @@ func _gen_binop(scalar $cg, scalar $node) void {
         } else {
             $uv_ovf = "({ uint64_t __um; (__opl >= 0 && __opr >= 0 && !__builtin_mul_overflow((uint64_t)__opl, (uint64_t)__opr, &__um)) ? strada_new_uint(__um) : strada_new_num((double)__opl * (double)__opr); })";
         }
-        if (Perla::CodeGen::Predicate::expr_is_int($node->{"left"}) == 1 && Perla::CodeGen::Predicate::expr_is_int($node->{"right"}) == 1) {
+        if (_node_is_int($cg, $node->{"left"}) == 1 && _node_is_int($cg, $node->{"right"}) == 1) {
             # Int-typed operands: still need overflow check (perl auto-
             # promotes to float/UV on overflow). `12345678901 * 9876543210`
             # fits in int64 individually but the product overflows.

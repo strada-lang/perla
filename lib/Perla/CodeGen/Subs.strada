@@ -31,6 +31,7 @@ extern func Perla::CodeGen::ind(scalar $cg) void;
 extern func Perla::CodeGen::gen_expr(scalar $cg, scalar $node) void;
 extern func Perla::CodeGen::gen_stmt(scalar $cg, scalar $node) void;
 extern func Perla::CodeGen::gen_block_stmts(scalar $cg, scalar $node) void;
+extern func Perla::CodeGen::_compute_int_vars(scalar $cg, scalar $stmts) void;
 extern func Perla::CodeGen::gen_expr_safe(scalar $cg, scalar $node) void;
 extern func Perla::CodeGen::gen_if_capture_return(scalar $cg, scalar $node, str $ret_var) void;
 extern func Perla::CodeGen::c_var(str $name) str;
@@ -789,6 +790,8 @@ func gen_sub_def(scalar $cg, scalar $node) void {
         # implicit return.
         if (defined($node->{"body"})) {
             my scalar $stmts = $node->{"body"}->{"stmts"};
+            # int type-inference (M1): compute int-eligible locals for this sub.
+            Perla::CodeGen::_compute_int_vars($cg, $stmts);
             if (defined($stmts) && scalar(@{$stmts}) > $bind_skip) {
                 my int $last_s = scalar(@{$stmts}) - 1;
                 my int $si = $bind_skip;  # skip the param-extraction statement(s)

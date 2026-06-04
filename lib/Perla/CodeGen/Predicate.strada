@@ -288,8 +288,9 @@ func scalar_int_unsafe(scalar $node, str $varname) int {
         if (pred_subtree_names_scalar($node, $varname) == 1) { return 1; }
         return 0;
     }
-    # re-declaration (shadowing)
-    if ($t == Perla::AST::N_MY() && _my_decl_names($node, $varname) == 1) { return 1; }
+    # (Shadowing — a second `my $x` for the same name — is handled by the
+    # caller via declaration-count, NOT here: this walk also visits the var's
+    # OWN declaration, so flagging N_MY here would bail on every candidate.)
     # assignment
     if ($t == Perla::AST::N_ASSIGN()) {
         my scalar $tgt = $node->{"target"};
