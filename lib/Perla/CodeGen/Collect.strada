@@ -1028,6 +1028,33 @@ func rewrite_var_refs(scalar $node, scalar $renames) void {
         && defined($effective_renames->{$node->{"var"}->{"value"}})) {
         $node->{"var"}->{"value"} = $effective_renames->{$node->{"var"}->{"value"}};
     }
+    # `for my $x (LIST) { BODY }` declares a FRESH loop var scoped to BODY.
+    # If $x's name is currently being renamed (an outer same-name `my $x` in
+    # this block was renamed to x__blkN), the BODY's references resolve to the
+    # FRESH loop var, NOT the outer — so rename the BODY with $x removed from
+    # the set, while the LIST (evaluated in the outer scope) keeps the full
+    # renames. Without this, `{ my $x=99; for my $x (10,2.5){ $x*2 } }` read
+    # the outer 99 (gave 198,198 instead of 20,5). The loop-var token itself
+    # stays unrenamed (it's the fresh declaration → its own C var v_x).
+    if ($t == Perla::AST::N_FOREACH()
+        && defined($node->{"my"}) && $node->{"my"} == 1
+        && defined($node->{"var"}) && ref($node->{"var"}) eq "HASH"
+        && defined($node->{"var"}->{"value"})
+        && defined($effective_renames->{$node->{"var"}->{"value"}})) {
+        my str $__felv = "" . $node->{"var"}->{"value"};
+        if (defined($node->{"list"})) { rewrite_var_refs($node->{"list"}, $effective_renames); }
+        my scalar $__fe_body_renames = {};
+        my array @__ferk = keys($effective_renames);
+        my int $__ferki = 0;
+        while ($__ferki < scalar(@__ferk)) {
+            if ($__ferk[$__ferki] ne $__felv) {
+                $__fe_body_renames->{$__ferk[$__ferki]} = $effective_renames->{$__ferk[$__ferki]};
+            }
+            $__ferki = $__ferki + 1;
+        }
+        if (defined($node->{"body"})) { rewrite_var_refs($node->{"body"}, $__fe_body_renames); }
+        return;  # handled list + body explicitly; skip the generic walk
+    }
     # N_ARRAY_SLICE: `array` field is a NAME STRING (not an AST node) for
     # the sigil form `@arr[1,2]`. Rename it directly here so the slice
     # reads the renamed C var. The deref form `@$ref[...]` has `array`

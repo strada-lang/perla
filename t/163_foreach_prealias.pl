@@ -39,4 +39,19 @@ use Test::More;
 our $fs; for $fs (3, 4) {}  # just exercise; value semantics covered above
 ok(1, 'file-scope for $x compiles/runs');
 
+# `for my $x` declares a FRESH loop var; it must shadow an outer same-named
+# `my $x` in the BODY but the LIST is still evaluated in the outer scope.
+{
+    my $x = 99; my @r;
+    for my $x (10, 2.5) { push @r, $x * 2; }
+    is("@r", "20 5", 'for my $x body uses fresh loop var, not outer');
+    is($x, 99, 'outer $x unchanged after for my $x');
+}
+{
+    my $x = 3; my @r;
+    for my $x ($x, $x + 10) { push @r, $x; }   # list sees outer $x=3
+    is("@r", "3 13", 'for my $x list is evaluated in outer scope');
+    is($x, 3, 'outer $x still 3 after the loop');
+}
+
 done_testing;
