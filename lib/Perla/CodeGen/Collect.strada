@@ -631,17 +631,35 @@ func collect_our_vars_from_stmts(scalar $cg, scalar $stmts) void {
                     }
                 }
             }
+            # Record every `my $X / @X / %X` name file-wide so strict 'vars'
+            # inside a nested sub/block still recognises a lexical declared in
+            # an enclosing scope (Perl's compile-time visibility — e.g. a nested
+            # named sub referencing the outer sub's `my @reserved_columns`, the
+            # "Variable will not stay shared" idiom). Lenient by design: perla
+            # runs code already strict-clean in real Perl, so a file-wide set
+            # suppresses false positives without missing much.
+            if ($s->{"type"} == Perla::AST::N_MY()) {
+                if (!defined($cg->{"all_my_lexicals"})) { $cg->{"all_my_lexicals"} = {}; }
+                if (defined($s->{"var"}) && defined($s->{"var"}->{"value"})) {
+                    $cg->{"all_my_lexicals"}->{"" . $s->{"var"}->{"value"}} = 1;
+                }
+                if (defined($s->{"vars"})) {
+                    my int $myi = 0;
+                    while ($myi < scalar(@{$s->{"vars"}})) {
+                        if (defined($s->{"vars"}->[$myi]) && defined($s->{"vars"}->[$myi]->{"value"})) {
+                            $cg->{"all_my_lexicals"}->{"" . $s->{"vars"}->[$myi]->{"value"}} = 1;
+                        }
+                        $myi = $myi + 1;
+                    }
+                }
+            }
             # Recurse into blocks
             if ($s->{"type"} == Perla::AST::N_BLOCK() && defined($s->{"stmts"})) {
                 collect_our_vars_from_stmts($cg, $s->{"stmts"});
             }
-            # Recurse into BEGIN/END bodies — `use vars`/`our` are commonly
-            # BEGIN-wrapped by the parser (file-init hoist), so their decls
-            # would otherwise be missed by this top-level walk.
-            if (($s->{"type"} == Perla::AST::N_BEGIN() || $s->{"type"} == Perla::AST::N_END())
-                && defined($s->{"body"}) && defined($s->{"body"}->{"stmts"})) {
-                collect_our_vars_from_stmts($cg, $s->{"body"}->{"stmts"});
-            }
+            # (BEGIN/END bodies are walked by the N_BEGIN/N_END/N_EVAL_BLOCK
+            # recursion further down — `use vars`/`our` are commonly
+            # BEGIN-wrapped, and their decls are picked up there.)
             # Recurse into sub bodies — `our $x = N` inside a sub
             # declares a package var visible to the rest of the file.
             # Without this, perla's strict check fired on subsequent

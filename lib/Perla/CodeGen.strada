@@ -2346,6 +2346,15 @@ func _strict_check_var(scalar $cg, str $sigil, str $name, int $line) void {
     if (defined($cg->{"our_vars"}) && defined($cg->{"our_vars"}->{$__sc_cname})) {
         return;
     }
+    # File-wide `my` lexical: declared via `my` in SOME scope of this file
+    # (collected into all_my_lexicals). perla's per-sub declared_vars is reset
+    # entering each sub, so a nested sub / sort / map / grep block referencing
+    # an enclosing-scope lexical would otherwise false-positive. Real Perl makes
+    # enclosing lexicals visible at compile time, so treat any file-declared
+    # `my` name as in scope.
+    if (defined($cg->{"all_my_lexicals"}) && defined($cg->{"all_my_lexicals"}->{$name})) {
+        return;
+    }
     # `local $x = expr;` auto-declares the package var in real Perl, but
     # only under strict if it was already declared. We don't track that
     # specifically — defer to file/our scope.
@@ -3938,6 +3947,14 @@ func gen_stmt(scalar $cg, scalar $node) void {
                 $cg->{"use_integer"} = $__psnap->{"use_integer"};
                 $cg->{"use_utf8"} = $__psnap->{"use_utf8"};
             }
+            return;
+        }
+        # `use vars qw(...)` is a compile-time pragma — its only effect is
+        # registering the package-var names (done in Collect → our_vars).
+        # It must NOT emit a runtime perla_require_module, which would
+        # load/compile the real vars.pm at run time and hang init (Carp.pm's
+        # `use vars` blocked the warnings-runtime path on a cold cache).
+        if (defined($mod) && $mod eq "vars") {
             return;
         }
         # Register the package as "imported" so perla_code_get_walking
