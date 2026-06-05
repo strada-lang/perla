@@ -1,0 +1,2205 @@
+# Perla::CodeGen::Operator - Binary/unary operator code generation.
+#
+# Extracted from CodeGen.strada. Owns _gen_binop (all of Perl's binary
+# operators: arithmetic, string, comparison, logical, bitwise, range, etc.)
+# and _gen_unop (unary !, -, ~, \, defined, etc.).
+#
+# Calls back into the main Perla::CodeGen via body-less `extern func` decls
+# (can't `use` it: cycle). Uses sibling Perla::CodeGen::Assign for the
+# hash compound-assign helpers it shares.
+
+use Perla::AST;
+use Perla::Lexer;
+use Perla::Parser;
+use Perla::CodeGen::Escape;
+use Perla::CodeGen::Eval;
+use Perla::CodeGen::Interp;
+use Perla::CodeGen::Predicate;
+use Perla::CodeGen::Subst;
+use Perla::CodeGen::Assign;
+
+package Perla::CodeGen::Operator;
+
+# Forward decls for Perla::CodeGen helpers we call inline.
+extern func Perla::CodeGen::_emit_our_sync(scalar $cg, scalar $node) void;
+extern func Perla::CodeGen::_emit_pkg_scalar_inc_postfix(scalar $cg, scalar $node, str $sign) void;
+extern func Perla::CodeGen::_emit_pkg_scalar_inc_prefix(scalar $cg, scalar $node, str $sign) void;
+extern func Perla::CodeGen::_gen_expr_scalar(scalar $cg, scalar $node) void;
+extern func Perla::CodeGen::_is_our_unqual_scalar(scalar $cg, scalar $node) int;
+extern func Perla::CodeGen::_is_pkg_qualified_scalar(scalar $node) int;
+extern func Perla::CodeGen::_node_is_int(scalar $cg, scalar $node) int;
+extern func Perla::CodeGen::_split_pkg_qual_name(scalar $node) array;
+extern func Perla::CodeGen::c_var(str $name) str;
+extern func Perla::CodeGen::emit(scalar $cg, str $s) void;
+extern func Perla::CodeGen::expr_is_borrowed(scalar $node) int;
+extern func Perla::CodeGen::gen_expr(scalar $cg, scalar $node) void;
+extern func Perla::CodeGen::gen_stmt(scalar $cg, scalar $node) void;
+extern func Perla::CodeGen::has_perl_var(str $s) int;
+
+# --- Binary operations ---
+func _gen_binop(scalar $cg, scalar $node) void {
+    my str $op = $node->{"op"};
+
+    # `use bigint` — route integer arithmetic and numeric comparisons through
+    # the arbitrary-precision runtime. The int64 fast path inside
+    # perla_bigint_binop keeps small values as tagged ints (so loop counters /
+    # indices stay cheap); only results exceeding int64 carry as decimal-string
+    # bignums. Division/modulo are not yet arbitrary-precision (fall through).
+    if (defined($cg->{"use_bigint"}) && $cg->{"use_bigint"} == 1
+        && ($op eq "+" || $op eq "-" || $op eq "*" || $op eq "**"
+            || $op eq "/" || $op eq "%"
+            || $op eq "<=>" || $op eq "==" || $op eq "!="
+            || $op eq "<" || $op eq ">" || $op eq "<=" || $op eq ">=")) {
+        my int $bi_l = Perla::CodeGen::expr_is_borrowed($node->{"left"});
+        my int $bi_r = Perla::CodeGen::expr_is_borrowed($node->{"right"});
+        Perla::CodeGen::emit($cg, "({ StradaValue *__bil = ");
+        Perla::CodeGen::_gen_expr_scalar($cg, $node->{"left"});
+        Perla::CodeGen::emit($cg, "; StradaValue *__bir = ");
+        Perla::CodeGen::_gen_expr_scalar($cg, $node->{"right"});
+        Perla::CodeGen::emit($cg, "; StradaValue *__bires = perla_bigint_binop(\"" . $op . "\", __bil, __bir); ");
+        if ($bi_l == 0) { Perla::CodeGen::emit($cg, "if (__bil) strada_decref(__bil); "); }
+        if ($bi_r == 0) { Perla::CodeGen::emit($cg, "if (__bir) strada_decref(__bir); "); }
+        Perla::CodeGen::emit($cg, "__bires; })");
+        return;
+    }
+
+    # Smartmatch — dispatch to runtime helper. Handles the common cases
+    # (scalar in array, scalar in hash, undef test, code ref, regex,
+    # fallback eq); see runtime/perla_stash.c perla_smartmatch.
+    #
+    # Force list context around the RHS so `@a` / `%h` evaluate to the
+    # underlying container, not the scalar-context count/key-count —
+    # perla_smartmatch dispatches on the rhs->type tag and a scalar
+    # count would never match the ARRAY / HASH branches.
+    if ($op eq "~~") {
+        my int $sm_l_borrowed = Perla::CodeGen::expr_is_borrowed($node->{"left"});
+        my int $sm_r_borrowed = Perla::CodeGen::expr_is_borrowed($node->{"right"});
+        Perla::CodeGen::emit($cg, "({ StradaValue *__sml = ");
+        Perla::CodeGen::_gen_expr_scalar($cg, $node->{"left"});
+        Perla::CodeGen::emit($cg, "; int __sm_sav_wl = __perla_want_list; __perla_want_list = 1; ");
+        Perla::CodeGen::emit($cg, "StradaValue *__smr = ");
+        Perla::CodeGen::gen_expr($cg, $node->{"right"});
+        Perla::CodeGen::emit($cg, "; __perla_want_list = __sm_sav_wl; ");
+        Perla::CodeGen::emit($cg, "StradaValue *__smres = perla_smartmatch(__sml, __smr); ");
+        if ($sm_l_borrowed == 0) { Perla::CodeGen::emit($cg, "if (__sml) strada_decref(__sml); "); }
+        if ($sm_r_borrowed == 0) { Perla::CodeGen::emit($cg, "if (__smr) strada_decref(__smr); "); }
+        Perla::CodeGen::emit($cg, "__smres; })");
+        return;
+    }
+
+    # String concat
+    if ($op eq ".") {
+        # Flatten concat chains: a . b . c → sequential concats with cleanup
+        # Collect all parts of the chain
+        my scalar $parts = [];
+        my scalar $cur = $node;
+        while (defined($cur) && $cur->{"type"} == Perla::AST::N_BINOP() && $cur->{"op"} eq ".") {
+            unshift(@{$parts}, $cur->{"right"});
+            $cur = $cur->{"left"};
+        }
+        unshift(@{$parts}, $cur);  # leftmost part
+
+        # Perl's `.` is a scalar operator: both operands must evaluate
+        # in scalar context regardless of the surrounding expression's
+        # context. Without forcing want_list=0 around the operand
+        # codegen, calls like `caller` and array-returning sigils
+        # inherit the outer (list) context and return arrays — the
+        # subsequent strada_concat_sv then coerces the array to its
+        # length-count, e.g. `caller . '::'` evaluates as `6 . '::'`
+        # giving "6::" instead of "Pkg::". Surfaced via YAML::Mo's
+        # `my($P,%e,%o) = caller.'::';` in `use YAML::Mo` which left
+        # the importer's @ISA empty and `has` accessor not installed.
+        Perla::CodeGen::emit($cg, "({ int __cc_sav_wl = __perla_want_list; __perla_want_list = 0; StradaValue *__cc_rv = ");
+
+        if (scalar(@{$parts}) <= 2) {
+            # Simple 2-part concat — no chain cleanup needed
+            my scalar $left = $parts->[0];
+            my int $left_type = $left->{"type"};
+            # Don't use the cstr_sv fast path if:
+            # - the interp string contains a `$N` capture var
+            #   (`"$1" . "x"` needs perla_capture_var substitution, but
+            #   the fast path emits the literal `$1` bytes)
+            # - RHS is an array or hash var (strada_concat_cstr_sv
+            #   doesn't have STRADA_ARRAY/HASH branches; it would emit
+            #   empty for `"" . @a`. strada_concat_sv handles both.)
+            my int $right_type = $parts->[1]->{"type"};
+            my int $rhs_is_container = ($right_type == Perla::AST::N_ARRAY_VAR()
+                                       || $right_type == Perla::AST::N_HASH_VAR()
+                                       || $right_type == Perla::AST::N_DEREF_ARRAY()
+                                       || $right_type == Perla::AST::N_DEREF_HASH());
+            if ($rhs_is_container == 0 && defined($left) && ($left_type == Perla::AST::N_STR_LIT() || ($left_type == Perla::AST::N_INTERP_STR() && Perla::CodeGen::has_perl_var($left->{"value"}) == 0 && Perla::CodeGen::Interp::has_dollar_digit($left->{"value"}) == 0 && index($left->{"value"}, "\\") < 0))) {
+                my str $lit = Perla::CodeGen::Escape::escape_c_str($left->{"value"});
+                Perla::CodeGen::emit($cg, "strada_concat_cstr_sv(\"" . $lit . "\", sizeof(\"" . $lit . "\") - 1, ");
+                Perla::CodeGen::gen_expr($cg, $parts->[1]);
+                Perla::CodeGen::emit($cg, ")");
+            } else {
+                # `.` overload dispatch: if either operand is a blessed
+                # ref with `use overload '.'`, that wins over default
+                # string concat. Without this, `$obj . "x"` stringified
+                # $obj (via '""' overload or default) and concatenated
+                # instead of calling the user's '.' sub.
+                Perla::CodeGen::emit($cg, "({ StradaValue *__dcl = ");
+                Perla::CodeGen::gen_expr($cg, $left);
+                Perla::CodeGen::emit($cg, "; StradaValue *__dcr = ");
+                Perla::CodeGen::gen_expr($cg, $parts->[1]);
+                Perla::CodeGen::emit($cg, "; StradaValue *__dcov = NULL; ");
+                Perla::CodeGen::emit($cg, "if ((__dcl && !STRADA_IS_TAGGED_INT(__dcl) && __dcl->type == STRADA_REF) || ");
+                Perla::CodeGen::emit($cg, "    (__dcr && !STRADA_IS_TAGGED_INT(__dcr) && __dcr->type == STRADA_REF)) { ");
+                Perla::CodeGen::emit($cg, "  __dcov = perla_overload_binary(__dcl, __dcr, \".\"); } ");
+                Perla::CodeGen::emit($cg, "__dcov ? __dcov : strada_concat_sv(__dcl, __dcr); })");
+            }
+        } else {
+            # Chain of 3+ parts — emit sequential concats with intermediate cleanup
+            Perla::CodeGen::emit($cg, "({ StradaValue *__cc = ");
+            # First pair
+            my scalar $p0 = $parts->[0];
+            my int $p0_type = $p0->{"type"};
+            # Emit first pair — capture RHS if it's a temp.
+            # The decref MUST be conditional on RHS actually being a temp; if
+            # parts[1] is a borrowed scalar var (SCALAR_VAR / ARRAY_VAR), an
+            # unconditional `strada_decref(__cc_r)` will drop the variable's
+            # storage. Visible site: `"prefix: " . "$cr" . " suffix"` where
+            # `$cr` is a coderef from `Pkg->can(...)` — after the warn the
+            # var was emptied so the subsequent `$cr->()` call did nothing.
+            # Use the same r_is_temp predicate the loop below uses, but
+            # ALSO recognize that a single-variable INTERP_STR (e.g. `"$cr"`)
+            # routes through `_gen_interp_c_str`'s scalar(@parts)==1 path
+            # which emits the variable directly — that result is borrowed,
+            # not a temp.
+            my scalar $p1 = $parts->[1];
+            my int $p1_type = $p1->{"type"};
+            my int $p1_is_single_var_interp = 0;
+            if ($p1_type == Perla::AST::N_INTERP_STR() && Perla::CodeGen::Predicate::is_single_var_interp($p1->{"value"}) == 1) {
+                $p1_is_single_var_interp = 1;
+            }
+            my int $p1_is_temp = ($p1_type == Perla::AST::N_STR_LIT() || $p1_type == Perla::AST::N_INT_LIT() ||
+                ($p1_type == Perla::AST::N_INTERP_STR() && $p1_is_single_var_interp == 0) || $p1_type == Perla::AST::N_BINOP() ||
+                $p1_type == Perla::AST::N_HASH_ELEM() || $p1_type == Perla::AST::N_ARROW_HASH() ||
+                $p1_type == Perla::AST::N_CALL());
+            Perla::CodeGen::emit($cg, "({ StradaValue *__cc_r = ");
+            Perla::CodeGen::gen_expr($cg, $parts->[1]);
+            Perla::CodeGen::emit($cg, "; StradaValue *__cc_tmp = ");
+            # Same guard as the 2-part path: cstr_sv fast path doesn't
+            # handle array/hash RHS, fall back to general concat_sv.
+            my int $p1_is_container = ($p1_type == Perla::AST::N_ARRAY_VAR()
+                                      || $p1_type == Perla::AST::N_HASH_VAR()
+                                      || $p1_type == Perla::AST::N_DEREF_ARRAY()
+                                      || $p1_type == Perla::AST::N_DEREF_HASH());
+            if ($p1_is_container == 0 && defined($p0) && ($p0_type == Perla::AST::N_STR_LIT() || ($p0_type == Perla::AST::N_INTERP_STR() && Perla::CodeGen::has_perl_var($p0->{"value"}) == 0 && Perla::CodeGen::Interp::has_dollar_digit($p0->{"value"}) == 0 && index($p0->{"value"}, "\\") < 0))) {
+                my str $lit = Perla::CodeGen::Escape::escape_c_str($p0->{"value"});
+                Perla::CodeGen::emit($cg, "strada_concat_cstr_sv(\"" . $lit . "\", sizeof(\"" . $lit . "\") - 1, __cc_r)");
+            } else {
+                Perla::CodeGen::emit($cg, "strada_concat_sv(");
+                Perla::CodeGen::gen_expr($cg, $p0);
+                Perla::CodeGen::emit($cg, ", __cc_r)");
+            }
+            if ($p1_is_temp == 1) {
+                Perla::CodeGen::emit($cg, "; strada_decref(__cc_r); __cc_tmp; })");
+            } else {
+                Perla::CodeGen::emit($cg, "; __cc_tmp; })");
+            }
+            Perla::CodeGen::emit($cg, "; ");
+            # Remaining parts: chain concat with cleanup of old AND RHS
+            Perla::CodeGen::emit($cg, "StradaValue *__cc_old; ");
+            my int $ci = 2;
+            while ($ci < scalar(@{$parts})) {
+                my scalar $rpart = $parts->[$ci];
+                my int $r_type = $rpart->{"type"};
+                # Only decref right operand if it's a temporary (newly created value).
+                # Single-var INTERP_STR (e.g. `"$x"`) emits the variable directly
+                # and is borrowed — see _is_single_var_interp.
+                my int $r_is_single_var_interp = 0;
+                if ($r_type == Perla::AST::N_INTERP_STR() && Perla::CodeGen::Predicate::is_single_var_interp($rpart->{"value"}) == 1) {
+                    $r_is_single_var_interp = 1;
+                }
+                my int $r_is_temp = ($r_type == Perla::AST::N_STR_LIT() || $r_type == Perla::AST::N_INT_LIT() ||
+                    ($r_type == Perla::AST::N_INTERP_STR() && $r_is_single_var_interp == 0) || $r_type == Perla::AST::N_BINOP() ||
+                    $r_type == Perla::AST::N_HASH_ELEM() || $r_type == Perla::AST::N_ARROW_HASH() ||
+                    $r_type == Perla::AST::N_CALL());
+                Perla::CodeGen::emit($cg, "__cc_old = __cc; ");
+                if ($r_is_temp == 1) {
+                    Perla::CodeGen::emit($cg, "{ StradaValue *__cc_r2 = ");
+                    Perla::CodeGen::gen_expr($cg, $rpart);
+                    Perla::CodeGen::emit($cg, "; __cc = strada_concat_sv(__cc, __cc_r2); strada_decref(__cc_r2); } ");
+                } else {
+                    Perla::CodeGen::emit($cg, "__cc = strada_concat_sv(__cc, ");
+                    Perla::CodeGen::gen_expr($cg, $rpart);
+                    Perla::CodeGen::emit($cg, "); ");
+                }
+                Perla::CodeGen::emit($cg, "strada_decref(__cc_old); ");
+                $ci++;
+            }
+            Perla::CodeGen::emit($cg, "__cc; })");
+        }
+        Perla::CodeGen::emit($cg, "; __perla_want_list = __cc_sav_wl; __cc_rv; })");
+        return;
+    }
+
+    # Numeric ops — use _gen_expr_scalar for @array → count in numeric context
+    if ($op eq "+" || $op eq "-" || $op eq "*") {
+        # __builtin name for overflow check
+        my str $op_builtin = "add";
+        if ($op eq "-") { $op_builtin = "sub"; }
+        elsif ($op eq "*") { $op_builtin = "mul"; }
+        # On a TRUE int64 overflow, perl promotes to a UV (not NV) when the
+        # mathematical result is a non-negative integer <= UINT64_MAX —
+        # `9223372036854775807 + 9223372036854775807` is 18446744073709551614,
+        # a UV, not 1.84e19. Two's-complement add/sub already give the exact
+        # low-64 bits, which equal the true value when it fits [0,UV_MAX];
+        # mul needs a uint64 overflow re-check. Otherwise fall back to NV.
+        my str $uv_ovf;
+        if ($op eq "+") {
+            $uv_ovf = "(__opl >= 0 && __opr >= 0) ? strada_new_uint((uint64_t)__opl + (uint64_t)__opr) : strada_new_num((double)__opl + (double)__opr)";
+        } elsif ($op eq "-") {
+            $uv_ovf = "(__opl >= 0 && __opr < 0) ? strada_new_uint((uint64_t)__opl - (uint64_t)__opr) : strada_new_num((double)__opl - (double)__opr)";
+        } else {
+            $uv_ovf = "({ uint64_t __um; (__opl >= 0 && __opr >= 0 && !__builtin_mul_overflow((uint64_t)__opl, (uint64_t)__opr, &__um)) ? strada_new_uint(__um) : strada_new_num((double)__opl * (double)__opr); })";
+        }
+        if (Perla::CodeGen::_node_is_int($cg, $node->{"left"}) == 1 && Perla::CodeGen::_node_is_int($cg, $node->{"right"}) == 1) {
+            # Int-typed operands: still need overflow check (perl auto-
+            # promotes to float/UV on overflow). `12345678901 * 9876543210`
+            # fits in int64 individually but the product overflows.
+            # A result that overflows the tagged range but NOT int64 is an
+            # exact heap int (strada_new_int), not a lossy double.
+            # Capture the operand SVs so owned heap-int operands are
+            # released. Tagged ints are immortal (decref is a no-op), but an
+            # integer literal beyond 2^62 (e.g. INT64_MAX) is a HEAP int —
+            # `strada_to_int(<gen_expr>)` directly would leak it. The result
+            # is always independent (tagged / fresh uint / num / new_int), so
+            # decref'ing the operands afterward is safe.
+            Perla::CodeGen::emit($cg, "({ StradaValue *__iol = ");
+            Perla::CodeGen::_gen_expr_scalar($cg, $node->{"left"});
+            Perla::CodeGen::emit($cg, "; StradaValue *__ior = ");
+            Perla::CodeGen::_gen_expr_scalar($cg, $node->{"right"});
+            Perla::CodeGen::emit($cg, "; int64_t __opl = strada_to_int(__iol); int64_t __opr = strada_to_int(__ior); ");
+            Perla::CodeGen::emit($cg, "int64_t __opres; int __ovf = __builtin_" . $op_builtin . "_overflow(__opl, __opr, &__opres); ");
+            Perla::CodeGen::emit($cg, "StradaValue *__ires = __ovf ? (" . $uv_ovf . ") ");
+            Perla::CodeGen::emit($cg, " : ((__opres > STRADA_TAGGED_INT_MAX || __opres < STRADA_TAGGED_INT_MIN) ? strada_new_int(__opres) : STRADA_MAKE_TAGGED_INT(__opres)); ");
+            if (Perla::CodeGen::expr_is_borrowed($node->{"left"}) == 0) {
+                Perla::CodeGen::emit($cg, "if (__iol) strada_decref(__iol); ");
+            }
+            if (Perla::CodeGen::expr_is_borrowed($node->{"right"}) == 0) {
+                Perla::CodeGen::emit($cg, "if (__ior) strada_decref(__ior); ");
+            }
+            Perla::CodeGen::emit($cg, "__ires; })");
+        } else {
+            # Runtime check: if either operand is a blessed ref with an
+            # overload registered for this op, dispatch through
+            # `perla_overload_binary`. Otherwise fall through to
+            # tagged-int / numeric arithmetic. Without this,
+            # `$v1 + $v2` on blessed Vec objects added their addresses
+            # as numbers instead of running the user's `use overload '+'`.
+            my int $al_borrowed = Perla::CodeGen::expr_is_borrowed($node->{"left"});
+            my int $ar_borrowed = Perla::CodeGen::expr_is_borrowed($node->{"right"});
+            Perla::CodeGen::emit($cg, "({ StradaValue *__al = ");
+            Perla::CodeGen::_gen_expr_scalar($cg, $node->{"left"});
+            Perla::CodeGen::emit($cg, "; StradaValue *__ar = ");
+            Perla::CodeGen::_gen_expr_scalar($cg, $node->{"right"});
+            Perla::CodeGen::emit($cg, "; StradaValue *__abr = NULL; StradaValue *__ares; ");
+            # FAST PATH: two tagged integers — the overwhelmingly common case
+            # (loop counters, indices, fib-style int arithmetic). Skips the
+            # REF/overload check and the two non-inlined strada_sv_is_uint
+            # calls, and reads operands via the STRADA_TAGGED_INT_VAL shift
+            # instead of strada_to_int. Identical overflow/range/tag semantics
+            # to the general signed-int branch below; tagged ints are immortal
+            # so no operand decref is needed. (fib35: most of the 0.45s vs a
+            # 0.04s hand-written tagged-int floor was this per-op overhead.)
+            Perla::CodeGen::emit($cg, "if (STRADA_IS_TAGGED_INT(__al) && STRADA_IS_TAGGED_INT(__ar)) { ");
+            Perla::CodeGen::emit($cg, "  int64_t __opl = STRADA_TAGGED_INT_VAL(__al); int64_t __opr = STRADA_TAGGED_INT_VAL(__ar); int64_t __opres; ");
+            Perla::CodeGen::emit($cg, "  __ares = __builtin_" . $op_builtin . "_overflow(__opl, __opr, &__opres) ? (" . $uv_ovf . ") ");
+            Perla::CodeGen::emit($cg, "          : ((__opres > STRADA_TAGGED_INT_MAX || __opres < STRADA_TAGGED_INT_MIN) ? strada_new_int(__opres) : STRADA_MAKE_TAGGED_INT(__opres)); ");
+            Perla::CodeGen::emit($cg, "} else { ");
+            Perla::CodeGen::emit($cg, "if (((__al && !STRADA_IS_TAGGED_INT(__al) && __al->type == STRADA_REF) || ");
+            Perla::CodeGen::emit($cg, "     (__ar && !STRADA_IS_TAGGED_INT(__ar) && __ar->type == STRADA_REF))) { ");
+            Perla::CodeGen::emit($cg, "  __abr = perla_overload_binary(__al, __ar, \"" . $op . "\"); } ");
+            # Tagged-int fast-path with overflow detection. Perl auto-
+            # promotes to float when integer arithmetic overflows; perla
+            # used to silently wrap. __builtin_*_overflow returns true
+            # on overflow without UB; on overflow OR out-of-tagged-int-
+            # range, promote to a float via strada_new_num.
+            Perla::CodeGen::emit($cg, "if (__abr) { __ares = __abr; } ");
+            # UV-aware path FIRST: when either operand is an unsigned-64 (UV)
+            # heap int, do the arithmetic in uint64 so `$uv - 1`, `~0 - 5`,
+            # `$near_uvmax + n` stay exact unsigned integers instead of
+            # numifying to a lossy double. Overflow past UINT64_MAX falls
+            # back to NV (matching Perl). strada_new_uint demotes results
+            # <= INT64_MAX back to a plain int. Checked before the signed
+            # integer branch so a UV operand isn't read as a signed bit
+            # pattern.
+            Perla::CodeGen::emit($cg, "else if (strada_sv_is_uint(__al) || strada_sv_is_uint(__ar)) { ");
+            Perla::CodeGen::emit($cg, "  uint64_t __ua = strada_to_uint64(__al); uint64_t __ub = strada_to_uint64(__ar); uint64_t __ur; ");
+            Perla::CodeGen::emit($cg, "  __ares = __builtin_" . $op_builtin . "_overflow(__ua, __ub, &__ur) ");
+            Perla::CodeGen::emit($cg, "          ? strada_new_num((double)__ua " . $op . " (double)__ub) ");
+            Perla::CodeGen::emit($cg, "          : strada_new_uint(__ur); ");
+            # Both operands integer-valued (tagged OR signed heap int64).
+            # Read via strada_to_int (handles both). True int64 overflow
+            # promotes to UV when the result is non-negative & fits uint64;
+            # a result out of tagged range but within int64 is an exact heap
+            # int. Covers `$a + $b` where both hold INT64_MAX-range values.
+            Perla::CodeGen::emit($cg, "} else if ((STRADA_IS_TAGGED_INT(__al) || (__al && !STRADA_IS_TAGGED_INT(__al) && __al->type == STRADA_INT)) && (STRADA_IS_TAGGED_INT(__ar) || (__ar && !STRADA_IS_TAGGED_INT(__ar) && __ar->type == STRADA_INT))) { ");
+            Perla::CodeGen::emit($cg, "  int64_t __opl = strada_to_int(__al); int64_t __opr = strada_to_int(__ar); int64_t __opres; ");
+            Perla::CodeGen::emit($cg, "  int __ovf = __builtin_" . $op_builtin . "_overflow(__opl, __opr, &__opres); ");
+            Perla::CodeGen::emit($cg, "  __ares = __ovf ? (" . $uv_ovf . ") ");
+            Perla::CodeGen::emit($cg, "          : ((__opres > STRADA_TAGGED_INT_MAX || __opres < STRADA_TAGGED_INT_MIN) ? strada_new_int(__opres) : STRADA_MAKE_TAGGED_INT(__opres)); ");
+            # `use warnings` numeric-category emission: warn when a
+            # non-numeric string operand is converted to number here.
+            # Mirrors perl's "Argument %s isn't numeric in addition (+)"
+            # (and the matching subtraction/multiplication variants).
+            # The two perla_warn_non_numeric calls go inside the same
+            # else branch as the strada_to_num conversion, so the
+            # check only fires on the non-tagged-int path that actually
+            # runs the numeric coercion.
+            my str $__warn_op_long = "addition (+)";
+            if ($op eq "-") { $__warn_op_long = "subtraction (-)"; }
+            elsif ($op eq "*") { $__warn_op_long = "multiplication (*)"; }
+            my int $__warn_line = 0;
+            if (defined($node->{"line"})) { $__warn_line = $node->{"line"} + 0; }
+            # Fall back to operand's line — BINOP nodes don't always
+            # carry their own line attribute; the leftmost operand's
+            # line is close enough for the warning location.
+            if ($__warn_line == 0 && defined($node->{"left"})
+                && defined($node->{"left"}->{"line"})) {
+                $__warn_line = $node->{"left"}->{"line"} + 0;
+            }
+            if ($__warn_line == 0 && defined($node->{"right"})
+                && defined($node->{"right"}->{"line"})) {
+                $__warn_line = $node->{"right"}->{"line"} + 0;
+            }
+            my str $__warn_file = "" . $cg->{"filename"};
+            if (length($__warn_file) == 0) { $__warn_file = "-"; }
+            my str $__warn_file_esc = Perla::CodeGen::Escape::escape_c_str($__warn_file);
+            Perla::CodeGen::emit($cg, "} else { ");
+            Perla::CodeGen::emit($cg, "  perla_warn_non_numeric(__al, \"" . $__warn_op_long . "\", \"" . $__warn_file_esc . "\", " . $__warn_line . "); ");
+            Perla::CodeGen::emit($cg, "  perla_warn_non_numeric(__ar, \"" . $__warn_op_long . "\", \"" . $__warn_file_esc . "\", " . $__warn_line . "); ");
+            Perla::CodeGen::emit($cg, "  __ares = strada_new_num(strada_to_num(__al) " . $op . " strada_to_num(__ar)); } ");
+            # Decref owned operands. Without this, `$i * 1.5` leaks the
+            # fresh-allocated 1.5 num each iter.
+            if ($al_borrowed == 0) {
+                Perla::CodeGen::emit($cg, "if (__al) strada_decref(__al); ");
+            }
+            if ($ar_borrowed == 0) {
+                Perla::CodeGen::emit($cg, "if (__ar) strada_decref(__ar); ");
+            }
+            Perla::CodeGen::emit($cg, "} ");  # close the `else` of the tagged-int fast path
+            Perla::CodeGen::emit($cg, "__ares; })");
+        }
+        return;
+    }
+    if ($op eq "/") {
+        my int $use_int = 0;
+        if (defined($cg->{"use_integer"}) && $cg->{"use_integer"} == 1) { $use_int = 1; }
+        # Runtime overload dispatch for blessed refs with `/` overloaded;
+        # falls back to native int- or float-division otherwise.
+        my int $dl_borrowed = Perla::CodeGen::expr_is_borrowed($node->{"left"});
+        my int $dr_borrowed = Perla::CodeGen::expr_is_borrowed($node->{"right"});
+        Perla::CodeGen::emit($cg, "({ StradaValue *__dlv = ");
+        Perla::CodeGen::_gen_expr_scalar($cg, $node->{"left"});
+        Perla::CodeGen::emit($cg, "; StradaValue *__drv = ");
+        Perla::CodeGen::_gen_expr_scalar($cg, $node->{"right"});
+        Perla::CodeGen::emit($cg, "; StradaValue *__dbr = NULL; ");
+        Perla::CodeGen::emit($cg, "if (((__dlv && !STRADA_IS_TAGGED_INT(__dlv) && __dlv->type == STRADA_REF) || ");
+        Perla::CodeGen::emit($cg, "     (__drv && !STRADA_IS_TAGGED_INT(__drv) && __drv->type == STRADA_REF))) { ");
+        Perla::CodeGen::emit($cg, "  __dbr = perla_overload_binary(__dlv, __drv, \"/\"); } ");
+        Perla::CodeGen::emit($cg, "StradaValue *__dres; if (__dbr) { __dres = __dbr; } else { ");
+        if ($use_int == 1) {
+            # `use integer` — truncating integer division.
+            Perla::CodeGen::emit($cg, "  int64_t __dl = strada_to_int(__dlv); int64_t __dr = strada_to_int(__drv); ");
+            Perla::CodeGen::emit($cg, "  if (__dr == 0) strada_die(\"%s\", \"Illegal division by zero\"); ");
+            Perla::CodeGen::emit($cg, "  __dres = STRADA_MAKE_TAGGED_INT(__dr == 0 ? 0 : __dl / __dr); ");
+        } else {
+            Perla::CodeGen::emit($cg, "  double __dl = strada_to_num(__dlv); double __dr = strada_to_num(__drv); ");
+            Perla::CodeGen::emit($cg, "  if (__dr == 0.0) strada_die(\"%s\", \"Illegal division by zero\"); ");
+            Perla::CodeGen::emit($cg, "  __dres = strada_new_num(__dr == 0.0 ? 0.0 : __dl / __dr); ");
+        }
+        Perla::CodeGen::emit($cg, "} ");
+        if ($dl_borrowed == 0) {
+            Perla::CodeGen::emit($cg, "if (__dlv) strada_decref(__dlv); ");
+        }
+        if ($dr_borrowed == 0) {
+            Perla::CodeGen::emit($cg, "if (__drv) strada_decref(__drv); ");
+        }
+        Perla::CodeGen::emit($cg, "__dres; })");
+        return;
+    }
+    # Modulo — Perl's `%` follows the sign of the right operand
+    # (mathematical modulo), unlike C's `%` which follows the sign of
+    # the left operand. Compute `a - b * floor(a/b)` to match Perl.
+    if ($op eq "%") {
+        # Runtime overload dispatch for blessed refs with `%` overloaded;
+        # otherwise integer modulo with Perl-style sign rules. Use a
+        # result var so the statement-expression yields a value
+        # (an if-else statement doesn't).
+        Perla::CodeGen::emit($cg, "({ StradaValue *__mlv = ");
+        Perla::CodeGen::_gen_expr_scalar($cg, $node->{"left"});
+        Perla::CodeGen::emit($cg, "; StradaValue *__mrv = ");
+        Perla::CodeGen::_gen_expr_scalar($cg, $node->{"right"});
+        Perla::CodeGen::emit($cg, "; StradaValue *__mbr = NULL; ");
+        Perla::CodeGen::emit($cg, "if (((__mlv && !STRADA_IS_TAGGED_INT(__mlv) && __mlv->type == STRADA_REF) || ");
+        Perla::CodeGen::emit($cg, "     (__mrv && !STRADA_IS_TAGGED_INT(__mrv) && __mrv->type == STRADA_REF))) { ");
+        Perla::CodeGen::emit($cg, "  __mbr = perla_overload_binary(__mlv, __mrv, \"%\"); } ");
+        Perla::CodeGen::emit($cg, "StradaValue *__mres; ");
+        Perla::CodeGen::emit($cg, "if (__mbr) { __mres = __mbr; } ");
+        # UV-aware modulo: a UV operand must use UNSIGNED modulo, else its
+        # bit pattern is read as a negative signed value
+        # (`18446744073709551615 % 10` gave 9 instead of 5).
+        Perla::CodeGen::emit($cg, "else if (strada_sv_is_uint(__mlv) || strada_sv_is_uint(__mrv)) { ");
+        Perla::CodeGen::emit($cg, "  uint64_t __mul = strada_to_uint64(__mlv); uint64_t __mur = strada_to_uint64(__mrv); ");
+        Perla::CodeGen::emit($cg, "  if (__mur == 0) strada_die(\"%s\", \"Illegal modulus zero\"); ");
+        Perla::CodeGen::emit($cg, "  __mres = strada_new_uint(__mul % __mur); } ");
+        Perla::CodeGen::emit($cg, "else { ");
+        Perla::CodeGen::emit($cg, "  int64_t __ml = strada_to_int(__mlv); int64_t __mr = strada_to_int(__mrv); ");
+        Perla::CodeGen::emit($cg, "  if (__mr == 0) strada_die(\"%s\", \"Illegal modulus zero\"); ");
+        Perla::CodeGen::emit($cg, "  int64_t __mm = (__mr == 0) ? 0 : (__ml % __mr); ");
+        Perla::CodeGen::emit($cg, "  if (__mm != 0 && ((__mm < 0) != (__mr < 0))) __mm += __mr; ");
+        Perla::CodeGen::emit($cg, "  __mres = STRADA_MAKE_TAGGED_INT(__mm); } ");
+        # Release owned operand temps (e.g. UV literals / arithmetic
+        # results, which are heap-allocated). Tagged ints are immortal so
+        # the old code never leaked, but a heap UV operand did. __mres is
+        # always an independent value (overload result / fresh uint / tagged
+        # int), so decref'ing the operands here is safe.
+        if (Perla::CodeGen::expr_is_borrowed($node->{"left"}) == 0) {
+            Perla::CodeGen::emit($cg, "if (__mlv) strada_decref(__mlv); ");
+        }
+        if (Perla::CodeGen::expr_is_borrowed($node->{"right"}) == 0) {
+            Perla::CodeGen::emit($cg, "if (__mrv) strada_decref(__mrv); ");
+        }
+        Perla::CodeGen::emit($cg, "__mres; })");
+        return;
+    }
+
+    # Bitwise operators (& | ^ << >>). All also dispatch the matching
+    # `use overload` slot on blessed refs, with native integer ops as
+    # the fallback.
+    if ($op eq "&" || $op eq "|" || $op eq "^" || $op eq "<<" || $op eq ">>") {
+        # Perl's >> and << operate on UVs (unsigned), so `-256 >> 2`
+        # yields a large positive number, not -64. Cast both operands
+        # to uint64_t for shifts to match Perl's default behavior (no
+        # `use integer` pragma support — but signed shift on negatives
+        # is implementation-defined anyway). For shifts whose result
+        # exceeds the tagged-int range (2^62-1), allocate a heap int —
+        # `-1 >> 1` = 0x7FFFFFFFFFFFFFFF in u64 and the tag shift would
+        # overflow to -1 if we stuffed it into a tagged int.
+        if ($op eq "<<" || $op eq ">>") {
+            Perla::CodeGen::emit($cg, "({ StradaValue *__shl = ");
+            Perla::CodeGen::gen_expr($cg, $node->{"left"});
+            Perla::CodeGen::emit($cg, "; StradaValue *__shr = ");
+            Perla::CodeGen::gen_expr($cg, $node->{"right"});
+            Perla::CodeGen::emit($cg, "; StradaValue *__shbr = NULL; ");
+            Perla::CodeGen::emit($cg, "if (((__shl && !STRADA_IS_TAGGED_INT(__shl) && __shl->type == STRADA_REF) || ");
+            Perla::CodeGen::emit($cg, "     (__shr && !STRADA_IS_TAGGED_INT(__shr) && __shr->type == STRADA_REF))) { ");
+            Perla::CodeGen::emit($cg, "  __shbr = perla_overload_binary(__shl, __shr, \"" . $op . "\"); } ");
+            Perla::CodeGen::emit($cg, "__shbr ? __shbr : ({ uint64_t __sh = (uint64_t)strada_to_int(__shl) " . $op . " (uint64_t)strada_to_int(__shr); ");
+            Perla::CodeGen::emit($cg, "(__sh > (uint64_t)STRADA_TAGGED_INT_MAX) ? strada_new_int((int64_t)__sh) : STRADA_MAKE_TAGGED_INT((int64_t)__sh); }); })");
+            return;
+        }
+        Perla::CodeGen::emit($cg, "({ StradaValue *__bwl = ");
+        Perla::CodeGen::gen_expr($cg, $node->{"left"});
+        Perla::CodeGen::emit($cg, "; StradaValue *__bwr = ");
+        Perla::CodeGen::gen_expr($cg, $node->{"right"});
+        Perla::CodeGen::emit($cg, "; StradaValue *__bwbr = NULL; ");
+        Perla::CodeGen::emit($cg, "if (((__bwl && !STRADA_IS_TAGGED_INT(__bwl) && __bwl->type == STRADA_REF) || ");
+        Perla::CodeGen::emit($cg, "     (__bwr && !STRADA_IS_TAGGED_INT(__bwr) && __bwr->type == STRADA_REF))) { ");
+        Perla::CodeGen::emit($cg, "  __bwbr = perla_overload_binary(__bwl, __bwr, \"" . $op . "\"); } ");
+        # When both operands are STRADA_STR, Perl does byte-wise. Without
+        # this branch, `"abc" | "ABC"` became `strada_to_int("abc") | ...`
+        # which is 0|0 = 0.
+        my str $strfn = "";
+        if ($op eq "|") { $strfn = "perla_str_or"; }
+        elsif ($op eq "&") { $strfn = "perla_str_and"; }
+        elsif ($op eq "^") { $strfn = "perla_str_xor"; }
+        if (length($strfn) > 0) {
+            Perla::CodeGen::emit($cg, "if (!__bwbr && __bwl && !STRADA_IS_TAGGED_INT(__bwl) && __bwl->type == STRADA_STR && ");
+            Perla::CodeGen::emit($cg, "    __bwr && !STRADA_IS_TAGGED_INT(__bwr) && __bwr->type == STRADA_STR) { ");
+            Perla::CodeGen::emit($cg, "  __bwbr = " . $strfn . "(__bwl, __bwr); } ");
+        }
+        Perla::CodeGen::emit($cg, "__bwbr ? __bwbr : STRADA_MAKE_TAGGED_INT(strada_to_int(__bwl) " . $op . " strada_to_int(__bwr)); })");
+        return;
+    }
+
+    # Exponentiation — runtime overload dispatch when either operand
+    # is a blessed ref with `**` overloaded; otherwise pow().
+    if ($op eq "**") {
+        Perla::CodeGen::emit($cg, "({ StradaValue *__pl = ");
+        Perla::CodeGen::_gen_expr_scalar($cg, $node->{"left"});
+        Perla::CodeGen::emit($cg, "; StradaValue *__pr = ");
+        Perla::CodeGen::_gen_expr_scalar($cg, $node->{"right"});
+        Perla::CodeGen::emit($cg, "; StradaValue *__pbr = NULL; ");
+        Perla::CodeGen::emit($cg, "if (((__pl && !STRADA_IS_TAGGED_INT(__pl) && __pl->type == STRADA_REF) || ");
+        Perla::CodeGen::emit($cg, "     (__pr && !STRADA_IS_TAGGED_INT(__pr) && __pr->type == STRADA_REF))) { ");
+        Perla::CodeGen::emit($cg, "  __pbr = perla_overload_binary(__pl, __pr, \"**\"); } ");
+        Perla::CodeGen::emit($cg, "__pbr ? __pbr : strada_new_num(pow(strada_to_num(__pl), strada_to_num(__pr))); })");
+        return;
+    }
+
+    # Numeric comparisons
+    if ($op eq "==" || $op eq "!=" || $op eq "<" || $op eq ">" || $op eq "<=" || $op eq ">=") {
+        # Perl: comparison ops yield "1" (true) or "" (defined empty,
+        # false). Was returning tagged 0/1, so `print "'\$x'"` for a
+        # false comparison emitted "'0'" instead of "''". The empty
+        # vs "0" distinction matters for string-equality tests like
+        # `if (\$result eq "")`.
+        if (Perla::CodeGen::Predicate::expr_is_int($node->{"left"}) == 1 && Perla::CodeGen::Predicate::expr_is_int($node->{"right"}) == 1) {
+            Perla::CodeGen::emit($cg, "((strada_to_int(");
+            Perla::CodeGen::_gen_expr_scalar($cg, $node->{"left"});
+            Perla::CodeGen::emit($cg, ") " . $op . " strada_to_int(");
+            Perla::CodeGen::_gen_expr_scalar($cg, $node->{"right"});
+            Perla::CodeGen::emit($cg, ")) ? STRADA_MAKE_TAGGED_INT(1) : strada_new_str(\"\"))");
+        } else {
+            # Overload dispatch: when either operand is a blessed ref
+            # with the matching comparison overload registered, call it.
+            # Without this, `$n1 == $n2` on Num objects compared the
+            # ref addresses (always unequal) instead of running the
+            # user's `use overload '==' => …`.
+            my int $cl_borrowed = Perla::CodeGen::expr_is_borrowed($node->{"left"});
+            my int $cr_borrowed = Perla::CodeGen::expr_is_borrowed($node->{"right"});
+            Perla::CodeGen::emit($cg, "({ StradaValue *__cl = ");
+            Perla::CodeGen::_gen_expr_scalar($cg, $node->{"left"});
+            Perla::CodeGen::emit($cg, "; StradaValue *__cr = ");
+            Perla::CodeGen::_gen_expr_scalar($cg, $node->{"right"});
+            Perla::CodeGen::emit($cg, "; StradaValue *__cbr = NULL; ");
+            Perla::CodeGen::emit($cg, "if (((__cl && !STRADA_IS_TAGGED_INT(__cl) && __cl->type == STRADA_REF) || ");
+            Perla::CodeGen::emit($cg, "     (__cr && !STRADA_IS_TAGGED_INT(__cr) && __cr->type == STRADA_REF))) { ");
+            Perla::CodeGen::emit($cg, "  __cbr = perla_overload_binary(__cl, __cr, \"" . $op . "\"); } ");
+            Perla::CodeGen::emit($cg, "StradaValue *__cres = __cbr ? (strada_to_bool(__cbr) ? STRADA_MAKE_TAGGED_INT(1) : strada_new_str(\"\")) : ");
+            Perla::CodeGen::emit($cg, "((strada_to_num(__cl) " . $op . " strada_to_num(__cr)) ? STRADA_MAKE_TAGGED_INT(1) : strada_new_str(\"\")); ");
+            # Decref owned operand temps so `$i == -1` doesn't leak the
+            # fresh strada_new_num(-1) once per call.
+            if ($cl_borrowed == 0) {
+                Perla::CodeGen::emit($cg, "if (__cl) strada_decref(__cl); ");
+            }
+            if ($cr_borrowed == 0) {
+                Perla::CodeGen::emit($cg, "if (__cr) strada_decref(__cr); ");
+            }
+            Perla::CodeGen::emit($cg, "__cres; })");
+        }
+        return;
+    }
+
+    # Spaceship
+    if ($op eq "<=>") {
+        Perla::CodeGen::emit($cg, "({ StradaValue *__sl = ");
+        Perla::CodeGen::gen_expr($cg, $node->{"left"});
+        Perla::CodeGen::emit($cg, "; StradaValue *__sr = ");
+        Perla::CodeGen::gen_expr($cg, $node->{"right"});
+        Perla::CodeGen::emit($cg, "; StradaValue *__sbr = NULL; ");
+        Perla::CodeGen::emit($cg, "if (((__sl && !STRADA_IS_TAGGED_INT(__sl) && __sl->type == STRADA_REF) || ");
+        Perla::CodeGen::emit($cg, "     (__sr && !STRADA_IS_TAGGED_INT(__sr) && __sr->type == STRADA_REF))) { ");
+        Perla::CodeGen::emit($cg, "  __sbr = perla_overload_binary(__sl, __sr, \"<=>\"); } ");
+        Perla::CodeGen::emit($cg, "__sbr ? __sbr : ({ double __l = strada_to_num(__sl); double __r = strada_to_num(__sr); ");
+        Perla::CodeGen::emit($cg, "STRADA_MAKE_TAGGED_INT(__l < __r ? -1 : __l > __r ? 1 : 0); }); })");
+        return;
+    }
+
+    # String spaceship (cmp)
+    if ($op eq "cmp") {
+        Perla::CodeGen::emit($cg, "({ char *__l = strada_to_str(");
+        Perla::CodeGen::gen_expr($cg, $node->{"left"});
+        Perla::CodeGen::emit($cg, "); char *__r = strada_to_str(");
+        Perla::CodeGen::gen_expr($cg, $node->{"right"});
+        Perla::CodeGen::emit($cg, "); int __cmp = strcmp(__l, __r); StradaValue *__res = STRADA_MAKE_TAGGED_INT(__cmp < 0 ? -1 : __cmp > 0 ? 1 : 0); free(__l); free(__r); __res; })");
+        return;
+    }
+
+    # String comparisons (general expression form).
+    if ($op eq "eq" || $op eq "ne" || $op eq "lt" || $op eq "gt" || $op eq "le" || $op eq "ge") {
+        # Perl-bool result: "1" for true, "" for false.
+        # Scalar context for operands — see the if-cond fast path above
+        # for why (reverse $s in eq operand must reverse the string).
+        # Overload dispatch for blessed refs: `use overload 'eq' => sub
+        # {...}` should fire before the default strcmp. Without this,
+        # strada_to_str on the blessed ref returned a generic "P=HASH(...)"
+        # stringification and the user's 'eq' override never ran. Falls
+        # back to 'cmp' (and ultimately strcmp) when 'eq' isn't defined.
+        Perla::CodeGen::emit($cg, "({ int __sav_wl_seq = __perla_want_list; __perla_want_list = 0; ");
+        Perla::CodeGen::emit($cg, "StradaValue *__sl = ");
+        Perla::CodeGen::gen_expr($cg, $node->{"left"});
+        Perla::CodeGen::emit($cg, "; StradaValue *__sr = ");
+        Perla::CodeGen::gen_expr($cg, $node->{"right"});
+        Perla::CodeGen::emit($cg, "; __perla_want_list = __sav_wl_seq; ");
+        Perla::CodeGen::emit($cg, "StradaValue *__sovr = NULL; ");
+        Perla::CodeGen::emit($cg, "if ((__sl && !STRADA_IS_TAGGED_INT(__sl) && __sl->type == STRADA_REF) || ");
+        Perla::CodeGen::emit($cg, "    (__sr && !STRADA_IS_TAGGED_INT(__sr) && __sr->type == STRADA_REF)) { ");
+        Perla::CodeGen::emit($cg, "  __sovr = perla_overload_binary(__sl, __sr, \"" . $op . "\"); } ");
+        Perla::CodeGen::emit($cg, "StradaValue *__res; ");
+        Perla::CodeGen::emit($cg, "if (__sovr) { __res = perla_to_bool(__sovr) ? STRADA_MAKE_TAGGED_INT(1) : strada_new_str(\"\"); strada_decref(__sovr); } ");
+        Perla::CodeGen::emit($cg, "else { char *__l = strada_to_str(__sl); char *__r = strada_to_str(__sr); int __cmp = strcmp(__l, __r); ");
+        if ($op eq "eq") { Perla::CodeGen::emit($cg, "__res = (__cmp == 0) ? STRADA_MAKE_TAGGED_INT(1) : strada_new_str(\"\");"); }
+        elsif ($op eq "ne") { Perla::CodeGen::emit($cg, "__res = (__cmp != 0) ? STRADA_MAKE_TAGGED_INT(1) : strada_new_str(\"\");"); }
+        elsif ($op eq "lt") { Perla::CodeGen::emit($cg, "__res = (__cmp < 0) ? STRADA_MAKE_TAGGED_INT(1) : strada_new_str(\"\");"); }
+        elsif ($op eq "gt") { Perla::CodeGen::emit($cg, "__res = (__cmp > 0) ? STRADA_MAKE_TAGGED_INT(1) : strada_new_str(\"\");"); }
+        elsif ($op eq "le") { Perla::CodeGen::emit($cg, "__res = (__cmp <= 0) ? STRADA_MAKE_TAGGED_INT(1) : strada_new_str(\"\");"); }
+        elsif ($op eq "ge") { Perla::CodeGen::emit($cg, "__res = (__cmp >= 0) ? STRADA_MAKE_TAGGED_INT(1) : strada_new_str(\"\");"); }
+        Perla::CodeGen::emit($cg, " free(__l); free(__r); } __res; })");
+        return;
+    }
+
+    # Logical
+    if ($op eq "&&" || $op eq "and") {
+        # Symmetric to the `or next`/`or last` handling below: when the
+        # RHS is a control-flow statement, _gen_expr emits nothing and
+        # the short-circuit becomes a no-op. `EXPR and last;` is the
+        # typical "break on success" idiom.
+        my scalar $rhs_a = $node->{"right"};
+        # `EXPR && return VAL` is Perl's positive short-circuit return —
+        # mirrors the `||`/`return` branch below. Class::C3::Componentised's
+        # `eval {...} && return 1` got compiled as a ternary that produced
+        # 1 but never actually returned, so load_optional_class fell through
+        # to throw_exception even when the eval succeeded. Symptom: every
+        # successful DBIC driver-class load still threw an empty exception.
+        if (defined($rhs_a) && $rhs_a->{"type"} == Perla::AST::N_RETURN()) {
+            Perla::CodeGen::emit($cg, "({ StradaValue *__l = ");
+            Perla::CodeGen::gen_expr($cg, $node->{"left"});
+            Perla::CodeGen::emit($cg, "; if (perla_to_bool(__l)) { if (__perla_local_chain != __perla_local_chain_mark) { perla_local_chain_restore_to(__perla_local_chain, __perla_local_chain_mark); __perla_local_chain = __perla_local_chain_mark; } perla_call_pop(); return ");
+            if (defined($rhs_a->{"value"})) {
+                Perla::CodeGen::gen_expr($cg, $rhs_a->{"value"});
+            } else {
+                Perla::CodeGen::emit($cg, "strada_new_undef()");
+            }
+            Perla::CodeGen::emit($cg, "; } __l; })");
+            return;
+        }
+        if (defined($rhs_a) && ($rhs_a->{"type"} == Perla::AST::N_NEXT() ||
+                                $rhs_a->{"type"} == Perla::AST::N_LAST() ||
+                                $rhs_a->{"type"} == Perla::AST::N_REDO())) {
+            my int $rt_a = $rhs_a->{"type"};
+            my str $cf_a = "continue";
+            if ($rt_a == Perla::AST::N_LAST()) { $cf_a = "break"; }
+            my str $label_a = "" . $rhs_a->{"label"};
+            if (length($label_a) > 0) {
+                my str $ul_a = $cg->{"label_map"}->{$label_a};
+                if (length($ul_a) > 0) {
+                    if ($rt_a == Perla::AST::N_NEXT()) { $cf_a = "goto __perla_next_" . $ul_a; }
+                    elsif ($rt_a == Perla::AST::N_LAST()) { $cf_a = "goto __perla_last_" . $ul_a; }
+                    elsif ($rt_a == Perla::AST::N_REDO()) { $cf_a = "goto __perla_redo_" . $ul_a; }
+                }
+            }
+            Perla::CodeGen::emit($cg, "({ StradaValue *__l = ");
+            Perla::CodeGen::gen_expr($cg, $node->{"left"});
+            Perla::CodeGen::emit($cg, "; if (perla_to_bool(__l)) { " . $cf_a . "; } __l; })");
+            return;
+        }
+        # Incref __l when returning the LHS so consumers that decref the
+        # result don't free a borrowed variable.
+        Perla::CodeGen::emit($cg, "({ StradaValue *__l = ");
+        Perla::CodeGen::gen_expr($cg, $node->{"left"});
+        Perla::CodeGen::emit($cg, "; perla_to_bool(__l) ? (");
+        Perla::CodeGen::gen_expr($cg, $node->{"right"});
+        Perla::CodeGen::emit($cg, ") : (strada_incref(__l), __l); })");
+        return;
+    }
+    if ($op eq "||" || $op eq "or") {
+        # Check if RHS is a return statement — generate actual C return
+        my scalar $rhs = $node->{"right"};
+        if (defined($rhs) && $rhs->{"type"} == Perla::AST::N_RETURN()) {
+            Perla::CodeGen::emit($cg, "({ StradaValue *__l = ");
+            Perla::CodeGen::gen_expr($cg, $node->{"left"});
+            Perla::CodeGen::emit($cg, "; if (!perla_to_bool(__l)) { if (__perla_local_chain != __perla_local_chain_mark) { perla_local_chain_restore_to(__perla_local_chain, __perla_local_chain_mark); __perla_local_chain = __perla_local_chain_mark; } perla_call_pop(); return ");
+            if (defined($rhs->{"value"})) {
+                Perla::CodeGen::gen_expr($cg, $rhs->{"value"});
+            } else {
+                Perla::CodeGen::emit($cg, "strada_new_undef()");
+            }
+            Perla::CodeGen::emit($cg, "; } __l; })");
+            return;
+        }
+        # `EXPR or next/last/redo` — RHS is a control-flow statement, not
+        # an expression. Without this branch, _gen_expr on N_NEXT emits
+        # nothing useful inside the ternary, so the "or next" silently
+        # becomes "or 0" and the loop body keeps executing past the
+        # short-circuit. Idiomatic Perl uses this constantly:
+        #   eval { ... } or next;        # Clone::Choose backend loop
+        #   $fn or next;                  # skip-on-empty
+        if (defined($rhs) && ($rhs->{"type"} == Perla::AST::N_NEXT() ||
+                              $rhs->{"type"} == Perla::AST::N_LAST() ||
+                              $rhs->{"type"} == Perla::AST::N_REDO())) {
+            my int $rt = $rhs->{"type"};
+            my str $cf = "continue";
+            if ($rt == Perla::AST::N_LAST()) { $cf = "break"; }
+            # REDO has no direct C equivalent and labelled forms need a
+            # goto; for a plain unlabelled `redo` we approximate with
+            # `continue` (skip rest of body) — close enough that the
+            # control flow doesn't run past the short-circuit. A proper
+            # redo would need a goto into the top of the loop body.
+            my str $label = "" . $rhs->{"label"};
+            if (length($label) > 0) {
+                my str $ul = $cg->{"label_map"}->{$label};
+                if (length($ul) > 0) {
+                    if ($rt == Perla::AST::N_NEXT()) { $cf = "goto __perla_next_" . $ul; }
+                    elsif ($rt == Perla::AST::N_LAST()) { $cf = "goto __perla_last_" . $ul; }
+                    elsif ($rt == Perla::AST::N_REDO()) { $cf = "goto __perla_redo_" . $ul; }
+                }
+            }
+            Perla::CodeGen::emit($cg, "({ StradaValue *__l = ");
+            Perla::CodeGen::gen_expr($cg, $node->{"left"});
+            Perla::CodeGen::emit($cg, "; if (!perla_to_bool(__l)) { " . $cf . "; } __l; })");
+            return;
+        }
+        # Incref __l when returning the LHS so consumers that decref the
+        # result don't free a borrowed variable.
+        Perla::CodeGen::emit($cg, "({ StradaValue *__l = ");
+        Perla::CodeGen::gen_expr($cg, $node->{"left"});
+        Perla::CodeGen::emit($cg, "; perla_to_bool(__l) ? (strada_incref(__l), __l) : (");
+        Perla::CodeGen::gen_expr($cg, $node->{"right"});
+        Perla::CodeGen::emit($cg, "); })");
+        return;
+    }
+    if ($op eq "xor") {
+        # Perl's `xor` is a low-precedence logical xor: boolean-of-left !=
+        # boolean-of-right. Result is 1 or empty-string (not the operand
+        # values, unlike || / &&). Both sides are always evaluated.
+        Perla::CodeGen::emit($cg, "({ int __lx = perla_to_bool(");
+        Perla::CodeGen::gen_expr($cg, $node->{"left"});
+        Perla::CodeGen::emit($cg, "); int __rx = perla_to_bool(");
+        Perla::CodeGen::gen_expr($cg, $node->{"right"});
+        Perla::CodeGen::emit($cg, "); (__lx != __rx) ? STRADA_MAKE_TAGGED_INT(1) : strada_new_str(\"\"); })");
+        return;
+    }
+    if ($op eq "//") {
+        # `//` (defined-or) is a binary scalar op. Evaluate LHS in
+        # scalar context — otherwise `eval { die } // "default"` in
+        # list context returns an empty array from eval, which
+        # `strada_defined_bool` says IS defined, and the fallback
+        # is never reached. Save/restore __perla_want_list around LHS.
+        my scalar $rhs = $node->{"right"};
+        if (defined($rhs) && $rhs->{"type"} == Perla::AST::N_RETURN()) {
+            Perla::CodeGen::emit($cg, "({ int __sav_wl_dor = __perla_want_list; __perla_want_list = 0; StradaValue *__l = ");
+            Perla::CodeGen::gen_expr($cg, $node->{"left"});
+            Perla::CodeGen::emit($cg, "; __perla_want_list = __sav_wl_dor; if (!strada_defined_bool(__l)) { if (__perla_local_chain != __perla_local_chain_mark) { perla_local_chain_restore_to(__perla_local_chain, __perla_local_chain_mark); __perla_local_chain = __perla_local_chain_mark; } perla_call_pop(); return ");
+            if (defined($rhs->{"value"})) {
+                Perla::CodeGen::gen_expr($cg, $rhs->{"value"});
+            } else {
+                Perla::CodeGen::emit($cg, "strada_new_undef()");
+            }
+            Perla::CodeGen::emit($cg, "; } __l; })");
+            return;
+        }
+        # Incref __l when returning the LHS so consumers (e.g. concat)
+        # that decref the result don't free a borrowed variable.
+        Perla::CodeGen::emit($cg, "({ int __sav_wl_dor = __perla_want_list; __perla_want_list = 0; StradaValue *__l = ");
+        Perla::CodeGen::gen_expr($cg, $node->{"left"});
+        Perla::CodeGen::emit($cg, "; __perla_want_list = __sav_wl_dor; strada_defined_bool(__l) ? (strada_incref(__l), __l) : (");
+        Perla::CodeGen::gen_expr($cg, $node->{"right"});
+        Perla::CodeGen::emit($cg, "); })");
+        return;
+    }
+
+    # String repeat
+    if ($op eq "x") {
+        # `(LIST) x N` in list context returns the flat list repeated N
+        # times. In scalar context, returns the string-concatenation
+        # repeated. perla's parser produces N_ANON_ARRAY for `(...)` —
+        # in list context with such an LHS, emit list-repeat semantics.
+        # Otherwise fall back to string-repeat.
+        my int $lhs_is_anon = 0;
+        if (defined($node->{"left"}) && $node->{"left"}->{"type"} == Perla::AST::N_ANON_ARRAY()) {
+            my int $is_ref = 0;
+            if (defined($node->{"left"}->{"is_ref"})) { $is_ref = $node->{"left"}->{"is_ref"}; }
+            # `[...] x N` (ref form) is a ref, not a list — string-repeat
+            # the stringified ref. Only `(...)` (non-ref) should list-repeat.
+            if ($is_ref == 0) { $lhs_is_anon = 1; }
+        }
+        if ($lhs_is_anon == 1) {
+            # Evaluate the LHS with the SURROUNDING want_list context.
+            # In list context, `(LIST) x N` is the flat list repeated;
+            # in scalar context, `(SCALAR) x N` is string repetition of
+            # the scalar's stringification. Previously this path forced
+            # want_list=1 on the LHS — that meant in scalar context the
+            # ANON_ARRAY came back as a STRADA_ARRAY and then got
+            # stringified as "ARRAY(0x..)" rather than the scalar value
+            # inside. `(1 ? "a" : "b") x 3` produced
+            # "ARRAY(0x..)ARRAY(0x..)ARRAY(0x..)" instead of "aaa".
+            Perla::CodeGen::emit($cg, "({ StradaValue *__lhs = ");
+            Perla::CodeGen::gen_expr($cg, $node->{"left"});
+            Perla::CodeGen::emit($cg, "; int __n = (int)strada_to_num(");
+            Perla::CodeGen::gen_expr($cg, $node->{"right"});
+            Perla::CodeGen::emit($cg, "); StradaValue *__xr; ");
+            Perla::CodeGen::emit($cg, "if (__perla_want_list && __lhs && !STRADA_IS_TAGGED_INT(__lhs) && __lhs->type == STRADA_ARRAY) { ");
+            Perla::CodeGen::emit($cg, "  __xr = strada_new_array(); StradaArray *__xdst = strada_deref_array(__xr); ");
+            Perla::CodeGen::emit($cg, "  StradaArray *__xsrc = strada_deref_array(__lhs); ");
+            Perla::CodeGen::emit($cg, "  if (__xsrc) for (int __xi = 0; __xi < __n; __xi++) { ");
+            Perla::CodeGen::emit($cg, "    for (int __xj = 0; __xj < (int)strada_array_length(__xsrc); __xj++) { ");
+            Perla::CodeGen::emit($cg, "      StradaValue *__xe = strada_array_get(__xsrc, __xj); if (__xe) strada_incref(__xe); strada_array_push(__xdst, __xe); } } ");
+            Perla::CodeGen::emit($cg, "  strada_decref(__lhs); ");
+            Perla::CodeGen::emit($cg, "} else { ");
+            Perla::CodeGen::emit($cg, "  char *__s = strada_to_str(__lhs); int __sl = (int)strlen(__s); ");
+            Perla::CodeGen::emit($cg, "  if (__n < 0) __n = 0; ");
+            Perla::CodeGen::emit($cg, "  char *__buf = malloc((size_t)__sl * (size_t)__n + 1); __buf[0] = 0; ");
+            Perla::CodeGen::emit($cg, "  for(int __i=0; __i<__n; __i++) memcpy(__buf + __i*__sl, __s, __sl); __buf[__sl*__n]=0; ");
+            Perla::CodeGen::emit($cg, "  __xr = strada_new_str(__buf); free(__buf); free(__s); strada_decref(__lhs); ");
+            Perla::CodeGen::emit($cg, "} __xr; })");
+            return;
+        }
+        # Negative or zero repeat count is a no-op (empty string). Without
+        # the clamp, `malloc(__sl * __n + 1)` with __n=-3 produced a huge
+        # size_t (negative→wrap) and `__buf[0] = 0` segfaulted.
+        # Overload dispatch first: `$obj x N` with `use overload "x"`
+        # gets the user sub. Without this, the LHS stringified to its
+        # default form and got repeated as a string instead of the
+        # user's overload behavior.
+        my int $__xl_borrowed = Perla::CodeGen::expr_is_borrowed($node->{"left"});
+        my int $__xr_borrowed = Perla::CodeGen::expr_is_borrowed($node->{"right"});
+        Perla::CodeGen::emit($cg, "({ StradaValue *__xl = ");
+        Perla::CodeGen::gen_expr($cg, $node->{"left"});
+        Perla::CodeGen::emit($cg, "; StradaValue *__xr_rhs = ");
+        Perla::CodeGen::gen_expr($cg, $node->{"right"});
+        Perla::CodeGen::emit($cg, "; StradaValue *__xrov = NULL; ");
+        Perla::CodeGen::emit($cg, "if (__xl && !STRADA_IS_TAGGED_INT(__xl) && __xl->type == STRADA_REF) { ");
+        Perla::CodeGen::emit($cg, "  __xrov = perla_overload_binary(__xl, __xr_rhs, \"x\"); } ");
+        Perla::CodeGen::emit($cg, "StradaValue *__xrf; ");
+        Perla::CodeGen::emit($cg, "if (__xrov) { __xrf = __xrov; } ");
+        Perla::CodeGen::emit($cg, "else { ");
+        # Route through strada_string_repeat which preserves embedded NULs
+        # (binary payloads). The previous inline path used strlen() and
+        # silently produced "" for strings containing \x00.
+        Perla::CodeGen::emit($cg, "  __xrf = strada_string_repeat(__xl, (int64_t)strada_to_num(__xr_rhs)); ");
+        Perla::CodeGen::emit($cg, "} ");
+        # Drop the LHS / RHS temps if they were owned (literals, refs,
+        # calls, etc.). Borrowed forms (variables) keep their backing
+        # alive through their owning slot, so we must not decref.
+        # Without this, every `"ab" x N` leaked the "ab" literal once
+        # per iter — visible in t/leaks/string_x_repeat.pl.
+        if ($__xl_borrowed == 0) {
+            Perla::CodeGen::emit($cg, "if (__xl) strada_decref(__xl); ");
+        }
+        if ($__xr_borrowed == 0) {
+            Perla::CodeGen::emit($cg, "if (__xr_rhs) strada_decref(__xr_rhs); ");
+        }
+        Perla::CodeGen::emit($cg, "__xrf; })");
+        return;
+    }
+
+    # Regex match or substitution: $str =~ /pattern/ or $str =~ s/pat/repl/
+    if ($op eq "=~") {
+        my scalar $right = $node->{"right"};
+        # For mutating RHS (s///, tr///), the codegen evaluates `left` multiple
+        # times — once to read the current value, once to decref, once to
+        # assign. When `left` is itself a side-effecting construct like
+        # `(my $x = $src)` (N_MY) or `($x = $src)` (N_ASSIGN), re-evaluating
+        # it would re-declare or re-assign on every call and produce non-lvalue
+        # C like `(v_x = v_src) = __nv`. Hoist such side-effecting LHS forms
+        # to a prelude statement and rewrite `left` to the plain scalar-var
+        # node for downstream use.
+        my int $_mutating_rhs = 0;
+        if (defined($right) && ($right->{"type"} == Perla::AST::N_SUBST() || $right->{"type"} == Perla::AST::N_TR())) {
+            $_mutating_rhs = 1;
+        }
+        if ($_mutating_rhs == 1 && defined($node->{"left"})) {
+            my int $lt = $node->{"left"}->{"type"};
+            my str $hoist_vname = "";
+            if ($lt == Perla::AST::N_MY()) {
+                my scalar $mn = $node->{"left"};
+                my scalar $mv = $mn->{"var"};
+                if (!defined($mv) && defined($mn->{"vars"}) && scalar(@{$mn->{"vars"}}) > 0) {
+                    my scalar $mv0 = $mn->{"vars"}->[0];
+                    if (defined($mv0->{"var"})) { $mv = $mv0->{"var"}; }
+                }
+                if (defined($mv) && length("" . $mv->{"value"}) > 0) { $hoist_vname = $mv->{"value"}; }
+            } elsif ($lt == Perla::AST::N_ASSIGN() && defined($node->{"left"}->{"op"}) && $node->{"left"}->{"op"} eq "=") {
+                my scalar $at = $node->{"left"}->{"target"};
+                if (defined($at) && $at->{"type"} == Perla::AST::N_SCALAR_VAR()) {
+                    $hoist_vname = "" . $at->{"name"};
+                }
+            }
+            if (length($hoist_vname) > 0) {
+                my str $hcvar = Perla::CodeGen::c_var($hoist_vname);
+                if (!defined($cg->{"declared_vars"})) { $cg->{"declared_vars"} = {}; }
+                $cg->{"declared_vars"}->{$hcvar} = 1;
+                # Inline the hoist as a leading comma-expression so the
+                # binop yields ONE expression value (the s/// result).
+                # Without the leading `(` + trailing `)` wrap, the hoist
+                # emitted standalone statements that ran BEFORE the s/// —
+                # and in a map body capture context, `__mr = body` then
+                # took the hoist's value (the my-init assignment) instead
+                # of the s/// substitution result.
+                Perla::CodeGen::emit($cg, "(");
+                Perla::CodeGen::gen_expr($cg, $node->{"left"});
+                Perla::CodeGen::emit($cg, ", (" . $hcvar . " ? (strada_incref(" . $hcvar . "), 0) : 0), ");
+                my scalar $sv_node = Perla::AST::node(Perla::AST::N_SCALAR_VAR());
+                $sv_node->{"name"} = $hoist_vname;
+                $node->{"left"} = $sv_node;
+                $cg->{"_subst_hoist_wrap"} = 1;
+            } else {
+                $cg->{"_subst_hoist_wrap"} = 0;
+            }
+        } else {
+            $cg->{"_subst_hoist_wrap"} = 0;
+        }
+        if (defined($right) && $right->{"type"} == Perla::AST::N_REGEX()) {
+            my str $raw_pat = $right->{"pattern"};
+            # Embedded code blocks `(?{ CODE })` — perl runs CODE during
+            # matching (with $1.. set). PCRE2 has no equivalent, so we
+            # strip the blocks from the pattern and run their code AFTER
+            # a successful match, with the captures in place. This is
+            # exact for the overwhelmingly common single-shot use
+            # (`/(\d+)(?{ $n = $1 })/`); it diverges only for patterns
+            # that fire the block multiple times via backtracking, which
+            # is rare. The strip+post-run is fully contained here and
+            # only activates when `(?{` is present, so normal regexes
+            # are untouched. Multiple blocks run in order, joined by `;`.
+            my str $emb_code = "";
+            if (index($raw_pat, "(?{") >= 0) {
+                my str $emb_stripped = "";
+                my int $epi = 0;
+                my int $eplen = length($raw_pat);
+                while ($epi < $eplen) {
+                    if ($epi + 2 < $eplen && substr($raw_pat, $epi, 3) eq "(?{") {
+                        # Balance-match braces from just after `(?{`.
+                        my int $edepth = 1;
+                        my int $ej = $epi + 3;
+                        my int $ecode_start = $ej;
+                        while ($ej < $eplen && $edepth > 0) {
+                            my str $ec = substr($raw_pat, $ej, 1);
+                            if ($ec eq "{") { $edepth = $edepth + 1; }
+                            elsif ($ec eq "}") { $edepth = $edepth - 1; }
+                            if ($edepth == 0) { last; }
+                            $ej = $ej + 1;
+                        }
+                        my str $ecode = substr($raw_pat, $ecode_start, $ej - $ecode_start);
+                        if (length($emb_code) > 0) { $emb_code = $emb_code . "; "; }
+                        $emb_code = $emb_code . $ecode;
+                        # Skip the closing `}` and an optional `)`.
+                        my int $eafter = $ej + 1;
+                        if ($eafter < $eplen && substr($raw_pat, $eafter, 1) eq ")") {
+                            $eafter = $eafter + 1;
+                        }
+                        $epi = $eafter;
+                    } else {
+                        $emb_stripped = $emb_stripped . substr($raw_pat, $epi, 1);
+                        $epi = $epi + 1;
+                    }
+                }
+                $raw_pat = $emb_stripped;
+            }
+            my str $pat = Perla::CodeGen::Escape::escape_c_str($raw_pat);
+            my str $flags = "";
+            if (defined($right->{"flags"})) { $flags = $right->{"flags"}; }
+            my int $is_global = 0;
+            if (index($flags, "g") >= 0) { $is_global = 1; }
+            # Open the embedded-code wrapper: capture the match result so
+            # we can run the stripped (?{ }) code on success.
+            if (length($emb_code) > 0) {
+                Perla::CodeGen::emit($cg, "({ StradaValue *__emb_mr = (");
+            }
+            # Detect `$var` interpolation in the pattern (including inside
+            # `[...]` character classes) and build the runtime pattern
+            # via _gen_interp_c_str. Without this, URI's
+            # `s*([^$uric\#])*...*ego` had `[^$uric]` emitted literally
+            # as `[^$uric\#]` — matched every char except `$`/`u`/`r`/...,
+            # and URI->new escaped every char of every URL.
+            my int $pat_has_var = Perla::CodeGen::has_perl_var($raw_pat);
+            # The subject __rsv is gen_expr'd as an owned temp when the left
+            # operand is not a borrowed lvalue (e.g. an interpolated string or
+            # a call result). It is freed at the very end of each branch —
+            # after any /g meta (pos) store, which reads __rsv. Borrowed
+            # subjects (a bare variable) must NOT be decref'd.
+            my str $rsv_free = (Perla::CodeGen::expr_is_borrowed($node->{"left"}) == 0) ? "strada_decref(__rsv); " : "";
+            if ($is_global == 1 && defined($cg->{"regex_g_pos_var"}) && length($cg->{"regex_g_pos_var"}) > 0) {
+                # /g with position tracking (inside while loop)
+                # Capture SV first so subject_len override sees binary-safe length.
+                # The left operand of =~ is always scalar context — even
+                # when the surrounding statement is list context. Force
+                # __perla_want_list = 0 around the gen_expr so calls
+                # like `unpack(...) =~ /pat/g` evaluate unpack in scalar
+                # context (returning a single string) instead of getting
+                # the array form whose stringification is "ARRAY(0x...)".
+                Perla::CodeGen::emit($cg, "({ int __sav_wl_rxl = __perla_want_list; __perla_want_list = 0; StradaValue *__rsv = ");
+                Perla::CodeGen::gen_expr($cg, $node->{"left"});
+                Perla::CodeGen::emit($cg, "; __perla_want_list = __sav_wl_rxl; strada_regex_set_subject_for_sv(__rsv); char *__rs = strada_to_str(__rsv); ");
+                # /gc preserves pos on loop exit (for tokenizer patterns
+                # that probe with \G then back-track). Mirror the local
+                # pos var into the SV's meta on each successful match so
+                # the final pos is visible after the loop via pos().
+                my int $loop_has_c = 0;
+                if (index($flags, "c") >= 0) { $loop_has_c = 1; }
+                if ($pat_has_var == 1) {
+                    Perla::CodeGen::emit($cg, "char *__pat = strada_to_str(");
+                    Perla::CodeGen::Interp::gen_interp_c_str($cg, $raw_pat);
+                    Perla::CodeGen::emit($cg, "); int __rm = strada_regex_match_global(__rs, __pat, \"" . $flags . "\", &" . $cg->{"regex_g_pos_var"} . "); free(__pat); ");
+                } else {
+                    Perla::CodeGen::emit($cg, "int __rm = strada_regex_match_global(__rs, \"" . $pat . "\", \"" . $flags . "\", &" . $cg->{"regex_g_pos_var"} . "); ");
+                }
+                if ($loop_has_c == 1) {
+                    Perla::CodeGen::emit($cg, "if (__rm && __rsv && !STRADA_IS_TAGGED_INT(__rsv)) { StradaMetadata *__rwm = strada_ensure_meta(__rsv); if (__rwm) __rwm->regex_pos = (int32_t)" . $cg->{"regex_g_pos_var"} . "; } ");
+                }
+                Perla::CodeGen::emit($cg, "free(__rs); strada_regex_clear_subject_len(); " . $rsv_free . "STRADA_MAKE_TAGGED_INT(__rm); })");
+            } elsif ($is_global == 1) {
+                # /g outside a while loop. Two contexts to handle:
+                #   - Scalar: track pos on the SV's meta so pos($var) and
+                #     subsequent /g iterations resume from the right
+                #     offset (matches perl). Pos stored in
+                #     meta->regex_pos with -1 = unset / failed-match-reset.
+                #   - List: return all matches' captures concatenated
+                #     via strada_regex_match_list. (List-context /g
+                #     consumes all matches at once; per-SV pos isn't
+                #     meaningful since the iteration is done in one
+                #     call.)
+                # The left operand of =~ is always scalar context — even
+                # when the surrounding statement is list context. Force
+                # __perla_want_list = 0 around the gen_expr so calls
+                # like `unpack(...) =~ /pat/g` evaluate unpack in scalar
+                # context (returning a single string) instead of getting
+                # the array form whose stringification is "ARRAY(0x...)".
+                Perla::CodeGen::emit($cg, "({ int __sav_wl_rxl = __perla_want_list; __perla_want_list = 0; StradaValue *__rsv = ");
+                Perla::CodeGen::gen_expr($cg, $node->{"left"});
+                Perla::CodeGen::emit($cg, "; __perla_want_list = __sav_wl_rxl; strada_regex_set_subject_for_sv(__rsv); char *__rs = strada_to_str(__rsv); ");
+                Perla::CodeGen::emit($cg, "StradaValue *__rmv; ");
+                Perla::CodeGen::emit($cg, "if (__perla_want_list) { ");
+                if ($pat_has_var == 1) {
+                    Perla::CodeGen::emit($cg, "char *__pat = strada_to_str(");
+                    Perla::CodeGen::Interp::gen_interp_c_str($cg, $raw_pat);
+                    Perla::CodeGen::emit($cg, "); __rmv = strada_regex_match_list(__rs, __pat, \"" . $flags . "\"); free(__pat); ");
+                } else {
+                    Perla::CodeGen::emit($cg, "__rmv = strada_regex_match_list(__rs, \"" . $pat . "\", \"" . $flags . "\"); ");
+                }
+                Perla::CodeGen::emit($cg, "} else { ");
+                Perla::CodeGen::emit($cg, "StradaMetadata *__rmeta = strada_ensure_meta(__rsv); ");
+                # strada_regex_match_global takes size_t* — declare as size_t to
+                # avoid 32/64-bit truncation that loses the pos on platforms
+                # where int is 32-bit and size_t is 64-bit.
+                Perla::CodeGen::emit($cg, "size_t __rpos = (__rmeta && __rmeta->regex_pos >= 0) ? (size_t)__rmeta->regex_pos : 0; ");
+                if ($pat_has_var == 1) {
+                    Perla::CodeGen::emit($cg, "char *__pat = strada_to_str(");
+                    Perla::CodeGen::Interp::gen_interp_c_str($cg, $raw_pat);
+                    Perla::CodeGen::emit($cg, "); int __rm = strada_regex_match_global(__rs, __pat, \"" . $flags . "\", &__rpos); free(__pat); ");
+                } else {
+                    Perla::CodeGen::emit($cg, "int __rm = strada_regex_match_global(__rs, \"" . $pat . "\", \"" . $flags . "\", &__rpos); ");
+                }
+                # On match, store new pos. On no-match: /c preserves pos
+                # (perl semantics — used for tokenizers that backtrack via
+                # \G); plain /g resets to -1.
+                my int $has_c_flag = 0;
+                if (index($flags, "c") >= 0) { $has_c_flag = 1; }
+                if ($has_c_flag == 1) {
+                    Perla::CodeGen::emit($cg, "if (__rmeta && __rm) __rmeta->regex_pos = (int32_t)__rpos; ");
+                } else {
+                    Perla::CodeGen::emit($cg, "if (__rmeta) __rmeta->regex_pos = __rm ? (int32_t)__rpos : -1; ");
+                }
+                Perla::CodeGen::emit($cg, "__rmv = STRADA_MAKE_TAGGED_INT(__rm); ");
+                Perla::CodeGen::emit($cg, "} ");
+                Perla::CodeGen::emit($cg, "free(__rs); strada_regex_clear_subject_len(); " . $rsv_free . "__rmv; })");
+            } else {
+                # In list context, return the capture groups (excluding $0).
+                # `($x =~ /\.(.+)/) => $hash{$x}` inside map needs this — otherwise
+                # the match collapses to (1) and the hash key becomes the literal '1'.
+                # Specifically: DBIx::Class::ResultSource::_resolve_condition strips
+                # the table-alias prefix via `map { ($_=~/\.(.+)/) => $r->{$_} } keys %$r`
+                # — without list-context captures, every key collapses to '1' and
+                # subsequent `_qualify_cond_columns` produces `WHERE me.1 = ?`.
+                # Capture the left-hand StradaValue so we can arm the
+                # regex subject-length override before strada_to_str —
+                # otherwise embedded NUL bytes truncate the subject.
+                # The left operand of =~ is always scalar context — even
+                # when the surrounding statement is list context. Force
+                # __perla_want_list = 0 around the gen_expr so calls
+                # like `unpack(...) =~ /pat/g` evaluate unpack in scalar
+                # context (returning a single string) instead of getting
+                # the array form whose stringification is "ARRAY(0x...)".
+                Perla::CodeGen::emit($cg, "({ int __sav_wl_rxl = __perla_want_list; __perla_want_list = 0; StradaValue *__rsv = ");
+                Perla::CodeGen::gen_expr($cg, $node->{"left"});
+                Perla::CodeGen::emit($cg, "; __perla_want_list = __sav_wl_rxl; strada_regex_set_subject_for_sv(__rsv); char *__rs = strada_to_str(__rsv); ");
+                if ($pat_has_var == 1) {
+                    Perla::CodeGen::emit($cg, "char *__pat = strada_to_str(");
+                    Perla::CodeGen::Interp::gen_interp_c_str($cg, $raw_pat);
+                    Perla::CodeGen::emit($cg, "); StradaValue *__rmv; if (__perla_want_list) { __rmv = strada_regex_match_list(__rs, __pat, \"" . $flags . "\"); } else { int __rmi = strada_regex_match_with_capture(__rs, __pat, \"" . $flags . "\"); __rmv = __rmi ? STRADA_MAKE_TAGGED_INT(1) : strada_new_str(\"\"); } free(__pat); free(__rs); strada_regex_clear_subject_len(); " . $rsv_free . "__rmv; })");
+                } else {
+                    Perla::CodeGen::emit($cg, "StradaValue *__rmv; if (__perla_want_list) { __rmv = strada_regex_match_list(__rs, \"" . $pat . "\", \"" . $flags . "\"); } else { int __rmi = strada_regex_match_with_capture(__rs, \"" . $pat . "\", \"" . $flags . "\"); __rmv = __rmi ? STRADA_MAKE_TAGGED_INT(1) : strada_new_str(\"\"); } free(__rs); strada_regex_clear_subject_len(); " . $rsv_free . "__rmv; })");
+                }
+            }
+            # Close the embedded-code wrapper: on a truthy match result,
+            # run the stripped (?{ }) code with captures ($1..) in place.
+            if (length($emb_code) > 0) {
+                Perla::CodeGen::emit($cg, "); if (perla_to_bool(__emb_mr)) { ");
+                my array @__emb_toks = Perla::Lexer::lex($emb_code . ";");
+                my scalar $__emb_ast = Perla::Parser::parse(@__emb_toks);
+                if (defined($__emb_ast) && defined($__emb_ast->{"stmts"})) {
+                    my scalar $__emb_stmts = $__emb_ast->{"stmts"};
+                    my int $__embi = 0;
+                    while ($__embi < scalar(@{$__emb_stmts})) {
+                        Perla::CodeGen::gen_stmt($cg, $__emb_stmts->[$__embi]);
+                        $__embi = $__embi + 1;
+                    }
+                }
+                Perla::CodeGen::emit($cg, " } __emb_mr; })");
+            }
+        } elsif (defined($right) && $right->{"type"} == Perla::AST::N_SUBST()) {
+            # `substr(STR, OFF, LEN) =~ s///` — substr-lvalue + regex
+            # substitution. perl modifies STR in place through the lvalue
+            # alias; perla's gen_expr on N_CALL("substr") returns a
+            # rvalue copy. Rewrite to:
+            #   ({ my $t = substr(STR, OFF, LEN);
+            #      $t =~ s///;
+            #      substr(STR, OFF, LEN) = $t; })
+            # using a synthetic scalar var, then re-dispatch. Needed by
+            # File::Temp::_replace_XX which uses this idiom to do the
+            # XXXX-substitution.
+            my scalar $sslv_left = $node->{"left"};
+            if (defined($sslv_left)
+                && $sslv_left->{"type"} == Perla::AST::N_CALL()
+                && defined($sslv_left->{"name"}) && $sslv_left->{"name"} eq "substr"
+                && defined($sslv_left->{"args"}) && scalar(@{$sslv_left->{"args"}}) >= 2) {
+                # Build a synthetic scalar var name.
+                if (!defined($cg->{"sslv_count"})) { $cg->{"sslv_count"} = 0; }
+                $cg->{"sslv_count"} = $cg->{"sslv_count"} + 1;
+                my str $sslv_tname = "__sslv_" . $cg->{"sslv_count"};
+                my str $sslv_cvar = Perla::CodeGen::c_var($sslv_tname);
+                if (!defined($cg->{"declared_vars"})) { $cg->{"declared_vars"} = {}; }
+                $cg->{"declared_vars"}->{$sslv_cvar} = 1;
+                Perla::CodeGen::emit($cg, "({ ");
+                # Step 1: capture substr result into the synth var.
+                Perla::CodeGen::emit($cg, "StradaValue *" . $sslv_cvar . " = ");
+                Perla::CodeGen::gen_expr($cg, $sslv_left);
+                Perla::CodeGen::emit($cg, "; ");
+                # Step 2: apply s/// to it. Recurse via gen_expr on a
+                # synthesised binop with left = N_SCALAR_VAR(synth).
+                my scalar $sslv_tvar = Perla::AST::node(Perla::AST::N_SCALAR_VAR());
+                $sslv_tvar->{"name"} = $sslv_tname;
+                my scalar $sslv_subst = Perla::AST::node(Perla::AST::N_BINOP());
+                $sslv_subst->{"op"} = "=~";
+                $sslv_subst->{"left"} = $sslv_tvar;
+                $sslv_subst->{"right"} = $right;
+                Perla::CodeGen::emit($cg, "StradaValue *__sslv_r = ");
+                Perla::CodeGen::gen_expr($cg, $sslv_subst);
+                Perla::CodeGen::emit($cg, "; ");
+                # Step 3: write back via strada_substr_assign on the
+                # original target SV (must be an N_SCALAR_VAR lvalue).
+                my scalar $sslv_args = $sslv_left->{"args"};
+                my int $sslv_str_t = $sslv_args->[0]->{"type"};
+                if ($sslv_str_t == Perla::AST::N_SCALAR_VAR()) {
+                    Perla::CodeGen::emit($cg, "{ char *__sslv_s = strada_to_str(" . $sslv_cvar . "); ");
+                    Perla::CodeGen::emit($cg, "strada_substr_assign(&");
+                    Perla::CodeGen::gen_expr($cg, $sslv_args->[0]);
+                    Perla::CodeGen::emit($cg, ", (int64_t)strada_to_int(");
+                    Perla::CodeGen::gen_expr($cg, $sslv_args->[1]);
+                    Perla::CodeGen::emit($cg, "), ");
+                    if (scalar(@{$sslv_args}) >= 3) {
+                        Perla::CodeGen::emit($cg, "(int64_t)strada_to_int(");
+                        Perla::CodeGen::gen_expr($cg, $sslv_args->[2]);
+                        Perla::CodeGen::emit($cg, ")");
+                    } else {
+                        Perla::CodeGen::emit($cg, "(int64_t)999999");
+                    }
+                    Perla::CodeGen::emit($cg, ", __sslv_s); free(__sslv_s); } ");
+                }
+                Perla::CodeGen::emit($cg, "if (" . $sslv_cvar . ") strada_decref(" . $sslv_cvar . "); ");
+                Perla::CodeGen::emit($cg, "__sslv_r; })");
+                return;
+            }
+            # s/pattern/replacement/flags — modifies the variable in place
+            my str $pat = Perla::CodeGen::Escape::escape_c_str($right->{"pattern"});
+            my str $repl = Perla::CodeGen::Escape::escape_perl_dq_for_c($right->{"replacement"});
+            my str $flags = $right->{"flags"};
+            my int $global = 0;
+            my int $has_eval = 0;
+            my int $has_double_eval = 0;
+            my int $has_r = 0;
+            if (defined($flags) && index($flags, "g") >= 0) { $global = 1; }
+            if (defined($flags) && index($flags, "e") >= 0) { $has_eval = 1; }
+            # /ee — eval the replacement expression's RESULT as another
+            # Perl expression. Common in templating: `$tag =~ s/\[(.+)\]/$1/ee`
+            # first evals $1 to get the captured string ("2+3"), then evals
+            # that string as Perl source ("2+3" → 5).
+            if (defined($flags)) {
+                my int $e_count = 0;
+                my int $__ef_i = 0;
+                while ($__ef_i < length($flags)) {
+                    if (substr($flags, $__ef_i, 1) eq "e") { $e_count = $e_count + 1; }
+                    $__ef_i = $__ef_i + 1;
+                }
+                if ($e_count >= 2) { $has_double_eval = 1; }
+            }
+            # Replacements like `$h{$1}` / `$a[$1]` / `$r->{$1}` need
+            # per-match evaluation (the capture-driven subscript can't
+            # be baked into a static replacement string). Force the /e
+            # codegen path even when the user didn't write the flag.
+            if ($has_eval == 0 && Perla::CodeGen::Interp::repl_needs_eval($right->{"replacement"}) == 1) {
+                $has_eval = 1;
+            }
+            # `/r` returns the modified string and leaves the LHS untouched
+            # — `my $new = $old =~ s/x/y/r` keeps $old as-is. Without this
+            # the codegen wrote back and returned the substitution count.
+            if (defined($flags) && index($flags, "r") >= 0) { $has_r = 1; }
+
+
+            if ($has_eval == 1) {
+                my str $raw_repl = $right->{"replacement"};
+                # Simpler /e approach: use a replacement callback via an anon function
+                # Generate an anon function for the replacement expression
+                $cg->{"tmp_count"} = $cg->{"tmp_count"} + 1;
+                my str $eval_func = "__perla_eval_repl_" . $cg->{"tmp_count"};
+                # Parse the replacement as a Perl expression
+                # For now, compile common patterns inline
+                Perla::CodeGen::emit($cg, "({ char *__es = strada_to_str(");
+                Perla::CodeGen::gen_expr($cg, $node->{"left"});
+                Perla::CodeGen::emit($cg, "); ");
+                Perla::CodeGen::emit($cg, "size_t __epos = 0; size_t __eslen = strlen(__es); ");
+                Perla::CodeGen::emit($cg, "StradaValue *__esb = strada_new_str(\"\"); ");
+                Perla::CodeGen::emit($cg, "size_t __last = 0; int __ec = 0; ");
+                # Pass through user flags so /x (whitespace-ignore), /i (case-insensitive),
+                # /s (single-line), and /m (multi-line) all reach pcre2_compile. Force
+                # 'g' to be set so the loop iterates correctly (pcre2_match doesn't need
+                # /g but the caller treats `g` as a hint to keep advancing pos).
+                my str $rgx_flags_e = "g";
+                my int $rgx_fi_e = 0;
+                while ($rgx_fi_e < length($flags)) {
+                    my str $rgx_fc_e = substr($flags, $rgx_fi_e, 1);
+                    if ($rgx_fc_e ne "g" && $rgx_fc_e ne "e") {
+                        $rgx_flags_e = $rgx_flags_e . $rgx_fc_e;
+                    }
+                    $rgx_fi_e = $rgx_fi_e + 1;
+                }
+                # Interpolate $vars in the pattern. URI::Escape's
+                # `$text =~ s/($re)/$escapes{$1} || _fail_hi($1)/ge` uses
+                # `$re` (a qr// object) as the pattern source — without
+                # this, perla matched literal "($re)" and URL-encoded
+                # nothing, leaving `https://...` unmodified.
+                my int $pate_has_var = Perla::CodeGen::has_perl_var($pat);
+                if ($pate_has_var == 1) {
+                    Perla::CodeGen::emit($cg, "char *__pat_e = strada_to_str(");
+                    Perla::CodeGen::Interp::gen_interp_c_str($cg, $right->{"pattern"});
+                    Perla::CodeGen::emit($cg, "); ");
+                    Perla::CodeGen::emit($cg, "while (strada_regex_match_global(__es, __pat_e, \"" . $rgx_flags_e . "\", &__epos)) { ");
+                } else {
+                    Perla::CodeGen::emit($cg, "while (strada_regex_match_global(__es, \"" . $pat . "\", \"" . $rgx_flags_e . "\", &__epos)) { ");
+                }
+                # Append text before match
+                Perla::CodeGen::emit($cg, "StradaValue *__c0 = strada_capture_var(0); char *__c0s = strada_to_str(__c0); ");
+                Perla::CodeGen::emit($cg, "char *__mpos = strstr(__es + __last, __c0s); ");
+                Perla::CodeGen::emit($cg, "if (__mpos) { size_t __plen = __mpos - (__es + __last); ");
+                Perla::CodeGen::emit($cg, "if (__plen > 0) { char *__pre = malloc(__plen+1); memcpy(__pre, __es+__last, __plen); __pre[__plen]=0; ");
+                Perla::CodeGen::emit($cg, "StradaValue *__old_esb = __esb; __esb = strada_concat_sv(__esb, strada_new_str(__pre)); strada_decref(__old_esb); free(__pre); } ");
+                # Evaluate replacement expression
+                Perla::CodeGen::emit($cg, "StradaValue *__eval_r = ");
+                Perla::CodeGen::Eval::gen_eval_replacement($cg, $raw_repl);
+                Perla::CodeGen::emit($cg, "; ");
+                # /ee — feed the first eval's stringified result through
+                # perla_eval_string for a second pass. Required for the
+                # `\${expr}` indirection idiom; without it /ee only ran
+                # once and left the captured Perl source un-evaluated.
+                if ($has_double_eval == 1) {
+                    Perla::CodeGen::emit($cg, "{ StradaValue *__ee_src = __eval_r; StradaValue *__ee_r = perla_eval_string(__ee_src, \"" . $cg->{"pkg"} . "\"); strada_decref(__ee_src); __eval_r = __ee_r ? __ee_r : strada_new_undef(); } ");
+                }
+                Perla::CodeGen::emit($cg, "StradaValue *__old_esb2 = __esb; __esb = strada_concat_sv(__esb, __eval_r); strada_decref(__old_esb2); ");
+                Perla::CodeGen::emit($cg, "__last = __mpos - __es + strlen(__c0s); __ec++; } ");
+                Perla::CodeGen::emit($cg, "free(__c0s); ");
+                if ($global == 0) { Perla::CodeGen::emit($cg, "break; "); }
+                Perla::CodeGen::emit($cg, "} ");
+                # Append remainder
+                Perla::CodeGen::emit($cg, "if (__last < __eslen) { StradaValue *__old_esb3 = __esb; __esb = strada_concat_sv(__esb, strada_new_str(__es + __last)); strada_decref(__old_esb3); } ");
+                Perla::CodeGen::emit($cg, "free(__es); ");
+                if ($pate_has_var == 1) { Perla::CodeGen::emit($cg, "free(__pat_e); "); }
+                if ($has_r == 1) {
+                    Perla::CodeGen::emit($cg, "__esb; })");
+                } else {
+                    Perla::CodeGen::Subst::emit_subst_writeback($cg, $node->{"left"}, "__esb");
+                    # Perl: s/// returns the substitution count when > 0,
+                    # but "" (empty string) when 0 — so `if ($s =~ s///)`
+                    # works as a "did anything match" test.
+                    Perla::CodeGen::emit($cg, "(__ec > 0 ? STRADA_MAKE_TAGGED_INT(__ec) : strada_new_str(\"\")); })");
+                }
+                if (defined($cg->{"_subst_hoist_wrap"}) && $cg->{"_subst_hoist_wrap"} == 1) { Perla::CodeGen::emit($cg, ")"); $cg->{"_subst_hoist_wrap"} = 0; }
+                return;
+            }
+
+            # Check if pattern/replacement contain variable interpolation ($var).
+            # For the replacement, exclude \`\$+{name}\` named-capture
+            # backrefs — they look like \`\$+\` (a Perl special) but in
+            # s/// context they're PCRE2 substitute references and must be
+            # passed straight through. _has_perl_var would otherwise route
+            # the replacement through eager interp where the named-capture
+            # hash is empty at codegen time.
+            my int $pat_has_var = Perla::CodeGen::has_perl_var($pat);
+            my int $repl_has_var = Perla::CodeGen::Interp::has_perl_var_repl($repl);
+            # Optimization: use plain string replacement for simple literal
+            # patterns — but only when no regex-sensitive flag is set. \`/i\`
+            # (case-insensitive) and \`/x\` (extended) and \`/m\`/\`/s\`
+            # change matching, so they must go through PCRE.
+            my int $is_literal_pat = 1;
+            if ($pat_has_var == 1) { $is_literal_pat = 0; }
+            if ($is_literal_pat == 1) { $is_literal_pat = Perla::CodeGen::Predicate::is_regex_literal($pat); }
+            if ($is_literal_pat == 1 && defined($flags)) {
+                if (index($flags, "i") >= 0 || index($flags, "x") >= 0
+                    || index($flags, "m") >= 0 || index($flags, "s") >= 0) {
+                    $is_literal_pat = 0;
+                }
+            }
+            if ($is_literal_pat == 1 && $repl_has_var == 0) {
+                # Plain string replacement: count occurrences (for the
+                # Perl `s///g` return value), then substitute. Earlier
+                # code returned constant 1 so `my $n = ($s =~ s/x/y/g)`
+                # always saw "1 substitution" no matter the actual count.
+                Perla::CodeGen::emit($cg, "({ ");
+                Perla::CodeGen::emit($cg, "char *__cs = strada_to_str(");
+                Perla::CodeGen::gen_expr($cg, $node->{"left"});
+                Perla::CodeGen::emit($cg, "); int __nsub = 0; ");
+                Perla::CodeGen::emit($cg, "{ const char *__pp = __cs; const char *__nd = \"" . $pat . "\"; size_t __ndl = strlen(__nd); ");
+                if ($global == 1) {
+                    Perla::CodeGen::emit($cg, "  if (__ndl > 0) { while ((__pp = strstr(__pp, __nd))) { __nsub++; __pp += __ndl; } } ");
+                } else {
+                    Perla::CodeGen::emit($cg, "  if (__ndl > 0 && strstr(__pp, __nd)) __nsub = 1; ");
+                }
+                Perla::CodeGen::emit($cg, "} free(__cs); ");
+                if ($global == 1) {
+                    Perla::CodeGen::emit($cg, "StradaValue *__nv = strada_sv_replace_all(");
+                } else {
+                    Perla::CodeGen::emit($cg, "StradaValue *__nv = strada_sv_replace_first(");
+                }
+                Perla::CodeGen::gen_expr($cg, $node->{"left"});
+                Perla::CodeGen::emit($cg, ", \"" . $pat . "\", \"" . $repl . "\"); ");
+                if ($has_r == 1) {
+                    Perla::CodeGen::emit($cg, "__nv; })");
+                } else {
+                    Perla::CodeGen::Subst::emit_subst_writeback($cg, $node->{"left"}, "__nv");
+                    # Perl: 0-count s/// returns "" (empty), not 0.
+                    Perla::CodeGen::emit($cg, "(__nsub > 0 ? STRADA_MAKE_TAGGED_INT(__nsub) : strada_new_str(\"\")); })");
+                }
+                if (defined($cg->{"_subst_hoist_wrap"}) && $cg->{"_subst_hoist_wrap"} == 1) { Perla::CodeGen::emit($cg, ")"); $cg->{"_subst_hoist_wrap"} = 0; }
+                return;
+            }
+            # Regex path: use strada_regex_replace_capture for proper return value + $1/$2 captures
+            # Capture left SV so we can mirror its SVf_UTF8 flag onto
+            # the substituted result (otherwise length() on the post-
+            # substitution string returns byte count instead of chars).
+            Perla::CodeGen::emit($cg, "({ StradaValue *__sub_left = ");
+            Perla::CodeGen::gen_expr($cg, $node->{"left"});
+            Perla::CodeGen::emit($cg, "; char *__s = strada_to_str(__sub_left); ");
+            # Build pattern
+            if ($pat_has_var == 1) {
+                Perla::CodeGen::emit($cg, "char *__pat = strada_to_str(");
+                Perla::CodeGen::Interp::gen_interp_c_str($cg, $right->{"pattern"});
+                Perla::CodeGen::emit($cg, "); ");
+            }
+            # Build replacement
+            if ($repl_has_var == 1) {
+                Perla::CodeGen::emit($cg, "char *__repl = strada_to_str(");
+                Perla::CodeGen::Interp::gen_interp_c_str($cg, $right->{"replacement"});
+                Perla::CodeGen::emit($cg, "); ");
+            }
+            # For the replacement, double-backslash the captured string so
+            # PCRE2 (in EXTENDED mode) sees the same number of backslashes
+            # Perl would. Without this, `s/x/\\n/g` ended up as runtime `\n`
+            # which PCRE2 rewrites to newline; Perl emits a literal `\n`.
+            # Pattern is left as-is so existing escape semantics (\n, \d,
+            # ...) keep working — its quirks with literal `\\` are tracked
+            # separately.
+            my str $pat_arg = "\"" . $pat . "\"";
+            if ($pat_has_var == 1) { $pat_arg = "__pat"; }
+            my str $repl_arg = "\"" . Perla::CodeGen::Escape::escape_c_str($repl) . "\"";
+            if ($repl_has_var == 1) { $repl_arg = "__repl"; }
+            my str $global_arg = "0";
+            if ($global == 1) { $global_arg = "1"; }
+            Perla::CodeGen::emit($cg, "char *__r = NULL; int __matched = strada_regex_replace_capture(__s, " . $pat_arg . ", " . $repl_arg . ", \"" . $flags . "\", " . $global_arg . ", &__r); ");
+            if ($pat_has_var == 1) { Perla::CodeGen::emit($cg, "free(__pat); "); }
+            if ($repl_has_var == 1) { Perla::CodeGen::emit($cg, "free(__repl); "); }
+            Perla::CodeGen::emit($cg, "StradaValue *__nv = strada_new_str_like(__r, __sub_left); free(__r); free(__s); ");
+            if ($has_r == 1) {
+                # /r — always return __nv, even on no-match (returns
+                # a copy of the original).
+                Perla::CodeGen::emit($cg, "__nv; })");
+            } else {
+                Perla::CodeGen::emit($cg, "if (__matched) { ");
+                Perla::CodeGen::Subst::emit_subst_writeback($cg, $node->{"left"}, "__nv");
+                Perla::CodeGen::emit($cg, "} else { strada_decref(__nv); } ");
+                # Perl: 0-count s/// returns "" (empty), not 0.
+                Perla::CodeGen::emit($cg, "(__matched > 0 ? STRADA_MAKE_TAGGED_INT(__matched) : strada_new_str(\"\")); })");
+            }
+        } elsif (defined($right) && $right->{"type"} == Perla::AST::N_TR()) {
+            # `substr(STR, OFF, LEN) =~ tr///` — same lvalue rewrite as
+            # for s///. Without this, tr operates on a temp copy and
+            # STR stays unchanged. Code that uppercases a slice via
+            # `substr($s, 0, 3) =~ tr/a-z/A-Z/` no-op'd.
+            my scalar $sstr_left = $node->{"left"};
+            if (defined($sstr_left)
+                && $sstr_left->{"type"} == Perla::AST::N_CALL()
+                && defined($sstr_left->{"name"}) && $sstr_left->{"name"} eq "substr"
+                && defined($sstr_left->{"args"}) && scalar(@{$sstr_left->{"args"}}) >= 2) {
+                if (!defined($cg->{"sslv_count"})) { $cg->{"sslv_count"} = 0; }
+                $cg->{"sslv_count"} = $cg->{"sslv_count"} + 1;
+                my str $sstr_tname = "__sslv_" . $cg->{"sslv_count"};
+                my str $sstr_cvar = Perla::CodeGen::c_var($sstr_tname);
+                if (!defined($cg->{"declared_vars"})) { $cg->{"declared_vars"} = {}; }
+                $cg->{"declared_vars"}->{$sstr_cvar} = 1;
+                Perla::CodeGen::emit($cg, "({ StradaValue *" . $sstr_cvar . " = ");
+                Perla::CodeGen::gen_expr($cg, $sstr_left);
+                Perla::CodeGen::emit($cg, "; ");
+                my scalar $sstr_tvar = Perla::AST::node(Perla::AST::N_SCALAR_VAR());
+                $sstr_tvar->{"name"} = $sstr_tname;
+                my scalar $sstr_binop = Perla::AST::node(Perla::AST::N_BINOP());
+                $sstr_binop->{"op"} = "=~";
+                $sstr_binop->{"left"} = $sstr_tvar;
+                $sstr_binop->{"right"} = $right;
+                Perla::CodeGen::emit($cg, "StradaValue *__sstr_r = ");
+                Perla::CodeGen::gen_expr($cg, $sstr_binop);
+                Perla::CodeGen::emit($cg, "; ");
+                my scalar $sstr_args = $sstr_left->{"args"};
+                my int $sstr_str_t = $sstr_args->[0]->{"type"};
+                if ($sstr_str_t == Perla::AST::N_SCALAR_VAR()) {
+                    Perla::CodeGen::emit($cg, "{ char *__sstr_s = strada_to_str(" . $sstr_cvar . "); ");
+                    Perla::CodeGen::emit($cg, "strada_substr_assign(&");
+                    Perla::CodeGen::gen_expr($cg, $sstr_args->[0]);
+                    Perla::CodeGen::emit($cg, ", (int64_t)strada_to_int(");
+                    Perla::CodeGen::gen_expr($cg, $sstr_args->[1]);
+                    Perla::CodeGen::emit($cg, "), ");
+                    if (scalar(@{$sstr_args}) >= 3) {
+                        Perla::CodeGen::emit($cg, "(int64_t)strada_to_int(");
+                        Perla::CodeGen::gen_expr($cg, $sstr_args->[2]);
+                        Perla::CodeGen::emit($cg, ")");
+                    } else {
+                        Perla::CodeGen::emit($cg, "(int64_t)999999");
+                    }
+                    Perla::CodeGen::emit($cg, ", __sstr_s); free(__sstr_s); } ");
+                }
+                Perla::CodeGen::emit($cg, "if (" . $sstr_cvar . ") strada_decref(" . $sstr_cvar . "); ");
+                Perla::CodeGen::emit($cg, "__sstr_r; })");
+                return;
+            }
+            # tr/from/to/flags — transliteration. Perl semantics:
+            #   tr/abc/xyz/  : a→x, b→y, c→z. Counts replacements.
+            #   tr/abc//     : count matches; do NOT replace (still counts).
+            #   tr/abc//d    : delete matched chars from result.
+            #   tr/abc/xy/   : a→x, b→y, c→y (last char of `to` repeated).
+            #   tr/abc/xy/d  : a→x, b→y, c→DELETED.
+            # Previous codegen ignored /d and didn't count when `to` was empty.
+            my str $from = Perla::CodeGen::Escape::escape_c_str(Perla::CodeGen::Escape::expand_tr_charset($right->{"from"}));
+            my str $to = Perla::CodeGen::Escape::escape_c_str(Perla::CodeGen::Escape::expand_tr_charset($right->{"to"}));
+            my str $tr_flags = "";
+            if (defined($right->{"flags"})) { $tr_flags = "" . $right->{"flags"}; }
+            my int $tr_del = 0;
+            my int $tr_c = 0;
+            my int $tr_s = 0;
+            my int $tr_r = 0;
+            if (index($tr_flags, "d") >= 0) { $tr_del = 1; }
+            if (index($tr_flags, "c") >= 0) { $tr_c = 1; }
+            if (index($tr_flags, "s") >= 0) { $tr_s = 1; }
+            if (index($tr_flags, "r") >= 0) { $tr_r = 1; }
+            # Capture LHS SV so we can branch on SVf_UTF8 — char-oriented
+            # tr/// needs to decode codepoints, not bytes (otherwise
+            # tr/é/X/ replaces both bytes of é with X, doubling the
+            # count and corrupting the result). Use a ternary stmt-expr
+            # for the branch so the outer expression yields a value
+            # whichever path runs.
+            Perla::CodeGen::emit($cg, "({ StradaValue *__tr_lhs = ");
+            Perla::CodeGen::gen_expr($cg, $node->{"left"});
+            Perla::CodeGen::emit($cg, "; int __tr_is_utf8 = (__tr_lhs && !STRADA_IS_TAGGED_INT(__tr_lhs) && __tr_lhs->type == STRADA_STR && STRADA_STR_IS_UTF8(__tr_lhs)); ");
+            Perla::CodeGen::emit($cg, "const char *__from = \"" . $from . "\"; const char *__to = \"" . $to . "\"; size_t __fl_ = strlen(__from); size_t __tl_ = strlen(__to); (void)__fl_; (void)__tl_; ");
+            Perla::CodeGen::emit($cg, "__tr_is_utf8 ? ({ ");
+            Perla::CodeGen::emit($cg, "char *__s_u = strada_to_str(__tr_lhs); size_t __sl_u = strlen(__s_u); int __cnt_u = 0; ");
+            Perla::CodeGen::emit($cg, "char *__r_u = strada_tr_utf8(__s_u, __sl_u, __from, __to, " . $tr_del . ", " . $tr_c . ", " . $tr_s . ", &__cnt_u); ");
+            if ($tr_r == 1) {
+                Perla::CodeGen::emit($cg, "StradaValue *__nv_u = strada_new_str_like(__r_u, __tr_lhs); free(__r_u); free(__s_u); __nv_u; }) : ({ ");
+            } else {
+                Perla::CodeGen::emit($cg, "StradaValue *__nv_u = strada_new_str_like(__r_u, __tr_lhs); ");
+                Perla::CodeGen::Subst::emit_subst_writeback($cg, $node->{"left"}, "__nv_u");
+                Perla::CodeGen::emit($cg, " free(__r_u); free(__s_u); STRADA_MAKE_TAGGED_INT(__cnt_u); }) : ({ ");
+            }
+            # Fallthrough byte-oriented path (original).
+            Perla::CodeGen::emit($cg, "char *__s = strada_to_str(__tr_lhs); ");
+            Perla::CodeGen::emit($cg, "size_t __sl = strlen(__s); char *__r = malloc(__sl + 1); size_t __ri = 0; int __cnt = 0; ");
+            Perla::CodeGen::emit($cg, "size_t __fl = __fl_; size_t __tl = __tl_; ");
+            Perla::CodeGen::emit($cg, "int __last_was_xlated = 0; (void)__last_was_xlated; char __last_xlated = 0; (void)__last_xlated; ");
+            Perla::CodeGen::emit($cg, "for (size_t __ti = 0; __ti < __sl; __ti++) { char *__fp = memchr(__from, __s[__ti], __fl); ");
+            # /c flips the matched-vs-unmatched logic. Build:
+            #   bool matched = /c ? (__fp == NULL) : (__fp != NULL)
+            if ($tr_c == 1) {
+                Perla::CodeGen::emit($cg, "if (!__fp) { __cnt++; ");
+            } else {
+                Perla::CodeGen::emit($cg, "if (__fp) { __cnt++; ");
+            }
+            Perla::CodeGen::emit($cg, "  char __xl;  int __is_xl = 1; ");
+            if ($tr_c == 1) {
+                # complement: matched chars are not in `from`. Map to LAST char
+                # of `to` (or delete with /d).
+                if ($tr_del == 1) {
+                    Perla::CodeGen::emit($cg, "  __is_xl = 0; ");
+                } else {
+                    Perla::CodeGen::emit($cg, "  __xl = __tl > 0 ? __to[__tl - 1] : __s[__ti]; ");
+                }
+            } else {
+                Perla::CodeGen::emit($cg, "  ptrdiff_t __idx = __fp - __from; ");
+                Perla::CodeGen::emit($cg, "  if (__tl == 0) { ");
+                if ($tr_del == 1) {
+                    Perla::CodeGen::emit($cg, "    __is_xl = 0; ");
+                } else {
+                    Perla::CodeGen::emit($cg, "    __xl = __s[__ti]; ");
+                }
+                Perla::CodeGen::emit($cg, "  } else if ((size_t)__idx < __tl) { __xl = __to[__idx]; ");
+                Perla::CodeGen::emit($cg, "  } else { ");
+                if ($tr_del == 1) {
+                    Perla::CodeGen::emit($cg, "    __is_xl = 0; ");
+                } else {
+                    Perla::CodeGen::emit($cg, "    __xl = __to[__tl - 1]; ");
+                }
+                Perla::CodeGen::emit($cg, "  } ");
+            }
+            if ($tr_s == 1) {
+                # squeeze: skip consecutive identical translated chars
+                Perla::CodeGen::emit($cg, "  if (__is_xl) { if (!(__last_was_xlated && __last_xlated == __xl)) { __r[__ri++] = __xl; __last_xlated = __xl; } __last_was_xlated = 1; } else { __last_was_xlated = 0; } ");
+            } else {
+                Perla::CodeGen::emit($cg, "  if (__is_xl) __r[__ri++] = __xl; ");
+                Perla::CodeGen::emit($cg, "  __last_was_xlated = 0; ");
+            }
+            Perla::CodeGen::emit($cg, "} else { __r[__ri++] = __s[__ti]; __last_was_xlated = 0; } } __r[__ri] = 0; ");
+            if ($tr_r == 1) {
+                # /r — return the modified string, leave source untouched.
+                Perla::CodeGen::emit($cg, "StradaValue *__nv = strada_new_str(__r); free(__r); free(__s); __nv; }); })");
+            } else {
+                Perla::CodeGen::emit($cg, "{ StradaValue *__nv = strada_new_str(__r); ");
+                Perla::CodeGen::Subst::emit_subst_writeback($cg, $node->{"left"}, "__nv");
+                Perla::CodeGen::emit($cg, "} free(__r); free(__s); STRADA_MAKE_TAGGED_INT(__cnt); }); })");
+            }
+        } else {
+            # `$str =~ $pat_or_qr` — RHS is a variable or expression
+            # holding either a plain string pattern or a qr// stringified
+            # as `(?FLAGS:PATTERN)`. PCRE accepts the embedded-flag form
+            # natively, so passing the whole string as pattern works.
+            Perla::CodeGen::emit($cg, "({ char *__rs = strada_to_str(");
+            Perla::CodeGen::gen_expr($cg, $node->{"left"});
+            Perla::CodeGen::emit($cg, "); char *__rp = strada_to_str(");
+            Perla::CodeGen::gen_expr($cg, $right);
+            Perla::CodeGen::emit($cg, "); int __rm = strada_regex_match_with_capture(__rs, __rp, \"\"); free(__rs); free(__rp); STRADA_MAKE_TAGGED_INT(__rm); })");
+        }
+        if (defined($cg->{"_subst_hoist_wrap"}) && $cg->{"_subst_hoist_wrap"} == 1) { Perla::CodeGen::emit($cg, ")"); $cg->{"_subst_hoist_wrap"} = 0; }
+        return;
+    }
+    if ($op eq "!~") {
+        my scalar $right = $node->{"right"};
+        if (defined($right) && $right->{"type"} == Perla::AST::N_REGEX()) {
+            my str $pat = Perla::CodeGen::Escape::escape_c_str($right->{"pattern"});
+            my str $flags = "";
+            if (defined($right->{"flags"})) { $flags = $right->{"flags"}; }
+            # Interpolate $var in pattern. URI::implementor's
+            # `$scheme !~ /\A$scheme_re\z/o` was emitting the literal
+            # "\A$scheme_re\z" as pattern — so EVERY scheme failed the
+            # match and URI->new returned URI::_generic instead of
+            # URI::https.
+            my int $not_pat_has_var = Perla::CodeGen::has_perl_var($pat);
+            Perla::CodeGen::emit($cg, "({ char *__rs = strada_to_str(");
+            Perla::CodeGen::gen_expr($cg, $node->{"left"});
+            if ($not_pat_has_var == 1) {
+                Perla::CodeGen::emit($cg, "); char *__pat = strada_to_str(");
+                Perla::CodeGen::Interp::gen_interp_c_str($cg, $right->{"pattern"});
+                Perla::CodeGen::emit($cg, "); int __rm = !strada_regex_match_with_capture(__rs, __pat, \"" . $flags . "\"); free(__pat); free(__rs); STRADA_MAKE_TAGGED_INT(__rm); })");
+            } else {
+                Perla::CodeGen::emit($cg, "); int __rm = !strada_regex_match_with_capture(__rs, \"" . $pat . "\", \"" . $flags . "\"); free(__rs); STRADA_MAKE_TAGGED_INT(__rm); })");
+            }
+        } else {
+            Perla::CodeGen::emit($cg, "({ char *__rs = strada_to_str(");
+            Perla::CodeGen::gen_expr($cg, $node->{"left"});
+            Perla::CodeGen::emit($cg, "); char *__rp = strada_to_str(");
+            Perla::CodeGen::gen_expr($cg, $right);
+            Perla::CodeGen::emit($cg, "); int __rm = !strada_regex_match_with_capture(__rs, __rp, \"\"); free(__rs); free(__rp); STRADA_MAKE_TAGGED_INT(__rm); })");
+        }
+        return;
+    }
+
+    # Fallback
+    Perla::CodeGen::emit($cg, "strada_new_undef() /* TODO: binop " . $op . " */");
+}
+
+# --- Unary operations ---
+func _gen_unop(scalar $cg, scalar $node) void {
+    my str $op = $node->{"op"};
+
+    # File test operators
+    if ($op eq "-e" || $op eq "-f" || $op eq "-d" || $op eq "-r" || $op eq "-w" || $op eq "-x" || $op eq "-s" || $op eq "-z" || $op eq "-l" || $op eq "-T" || $op eq "-B" || $op eq "-t" || $op eq "-p" || $op eq "-S" || $op eq "-b" || $op eq "-c" || $op eq "-u" || $op eq "-g" || $op eq "-k" || $op eq "-o" || $op eq "-O" || $op eq "-R" || $op eq "-W" || $op eq "-X" || $op eq "-M" || $op eq "-A" || $op eq "-C") {
+        # `-X _` reuses the previous stat. Detect bareword `_` operand
+        # (parsed as N_CALL with name="_" and no args) and route through a
+        # cached path. YAML::Tiny's `-e $f; -f _; -r _` idiom needs this:
+        # without it, `-f _` checked a literal file named "_" which doesn't
+        # exist, and YAML::Tiny falsely reported any real file as a directory.
+        my int $is_stat_cache = 0;
+        my scalar $op_arg = $node->{"operand"};
+        if (defined($op_arg) && $op_arg->{"type"} == Perla::AST::N_CALL()
+            && defined($op_arg->{"name"}) && $op_arg->{"name"} eq "_") {
+            $is_stat_cache = 1;
+        }
+        if ($op eq "-e") {
+            if ($is_stat_cache == 1) {
+                Perla::CodeGen::emit($cg, "STRADA_MAKE_TAGGED_INT(perla_last_stat_path[0] ? strada_file_exists(perla_last_stat_path) : 0)");
+            } else {
+                Perla::CodeGen::emit($cg, "({ char *__fp = strada_to_str(");
+                Perla::CodeGen::gen_expr($cg, $node->{"operand"});
+                Perla::CodeGen::emit($cg, "); perla_remember_stat_path(__fp); StradaValue *__fr = STRADA_MAKE_TAGGED_INT(strada_file_exists(__fp)); free(__fp); __fr; })");
+            }
+        } elsif ($op eq "-f") {
+            if ($is_stat_cache == 1) {
+                Perla::CodeGen::emit($cg, "({ StradaValue *__fp = strada_new_str(perla_last_stat_path); StradaValue *__fr = strada_is_file(__fp); strada_decref(__fp); __fr; })");
+            } else {
+                Perla::CodeGen::emit($cg, "strada_is_file(");
+                Perla::CodeGen::gen_expr($cg, $node->{"operand"});
+                Perla::CodeGen::emit($cg, ")");
+            }
+        } elsif ($op eq "-d") {
+            if ($is_stat_cache == 1) {
+                Perla::CodeGen::emit($cg, "({ StradaValue *__fp = strada_new_str(perla_last_stat_path); StradaValue *__fr = strada_is_dir(__fp); strada_decref(__fp); __fr; })");
+            } else {
+                Perla::CodeGen::emit($cg, "strada_is_dir(");
+                Perla::CodeGen::gen_expr($cg, $node->{"operand"});
+                Perla::CodeGen::emit($cg, ")");
+            }
+        } elsif ($op eq "-s") {
+            # Return size in bytes (or undef if file doesn't exist). The
+            # `-e` fallthrough below made `-s $f` return 1/0, which broke
+            # the common `read($fh, $buf, -s $f)` idiom for slurping a
+            # file by its size — read(…, …, 1) returned one byte.
+            if ($is_stat_cache == 1) {
+                Perla::CodeGen::emit($cg, "({ struct stat __fs; StradaValue *__fr; if (perla_last_stat_path[0] && stat(perla_last_stat_path, &__fs) == 0) __fr = STRADA_MAKE_TAGGED_INT((int64_t)__fs.st_size); else __fr = strada_new_undef(); __fr; })");
+            } else {
+                Perla::CodeGen::emit($cg, "({ char *__fp = strada_to_str(");
+                Perla::CodeGen::gen_expr($cg, $node->{"operand"});
+                Perla::CodeGen::emit($cg, "); perla_remember_stat_path(__fp); struct stat __fs; StradaValue *__fr; if (stat(__fp, &__fs) == 0) __fr = STRADA_MAKE_TAGGED_INT((int64_t)__fs.st_size); else __fr = strada_new_undef(); free(__fp); __fr; })");
+            }
+        } elsif ($op eq "-z") {
+            if ($is_stat_cache == 1) {
+                Perla::CodeGen::emit($cg, "({ struct stat __fs; StradaValue *__fr; if (perla_last_stat_path[0] && stat(perla_last_stat_path, &__fs) == 0) __fr = STRADA_MAKE_TAGGED_INT(__fs.st_size == 0 ? 1 : 0); else __fr = strada_new_undef(); __fr; })");
+            } else {
+                Perla::CodeGen::emit($cg, "({ char *__fp = strada_to_str(");
+                Perla::CodeGen::gen_expr($cg, $node->{"operand"});
+                Perla::CodeGen::emit($cg, "); perla_remember_stat_path(__fp); struct stat __fs; StradaValue *__fr; if (stat(__fp, &__fs) == 0) __fr = STRADA_MAKE_TAGGED_INT(__fs.st_size == 0 ? 1 : 0); else __fr = strada_new_undef(); free(__fp); __fr; })");
+            }
+        } elsif ($op eq "-T" || $op eq "-B") {
+            my str $fn = $op eq "-T" ? "strada_file_is_text" : "strada_file_is_binary";
+            if ($is_stat_cache == 1) {
+                Perla::CodeGen::emit($cg, "({ StradaValue *__fp = strada_new_str(perla_last_stat_path); perla_remember_stat_path(perla_last_stat_path); StradaValue *__fr = " . $fn . "(__fp); strada_decref(__fp); __fr; })");
+            } else {
+                Perla::CodeGen::emit($cg, $fn . "(");
+                Perla::CodeGen::gen_expr($cg, $node->{"operand"});
+                Perla::CodeGen::emit($cg, ")");
+            }
+        } elsif ($op eq "-l") {
+            # Symlink test — uses lstat to avoid following.
+            if ($is_stat_cache == 1) {
+                Perla::CodeGen::emit($cg, "({ struct stat __fs; StradaValue *__fr; if (perla_last_stat_path[0] && lstat(perla_last_stat_path, &__fs) == 0 && S_ISLNK(__fs.st_mode)) __fr = STRADA_MAKE_TAGGED_INT(1); else __fr = STRADA_MAKE_TAGGED_INT(0); __fr; })");
+            } else {
+                Perla::CodeGen::emit($cg, "({ char *__fp = strada_to_str(");
+                Perla::CodeGen::gen_expr($cg, $node->{"operand"});
+                Perla::CodeGen::emit($cg, "); perla_remember_stat_path(__fp); struct stat __fs; StradaValue *__fr; if (lstat(__fp, &__fs) == 0 && S_ISLNK(__fs.st_mode)) __fr = STRADA_MAKE_TAGGED_INT(1); else __fr = STRADA_MAKE_TAGGED_INT(0); free(__fp); __fr; })");
+            }
+        } elsif ($op eq "-r" || $op eq "-w" || $op eq "-x") {
+            # Use access(2) with appropriate mode flag.
+            my str $mode = "R_OK";
+            if ($op eq "-w") { $mode = "W_OK"; }
+            elsif ($op eq "-x") { $mode = "X_OK"; }
+            if ($is_stat_cache == 1) {
+                Perla::CodeGen::emit($cg, "STRADA_MAKE_TAGGED_INT(perla_last_stat_path[0] ? (access(perla_last_stat_path, " . $mode . ") == 0 ? 1 : 0) : 0)");
+            } else {
+                Perla::CodeGen::emit($cg, "({ char *__fp = strada_to_str(");
+                Perla::CodeGen::gen_expr($cg, $node->{"operand"});
+                Perla::CodeGen::emit($cg, "); perla_remember_stat_path(__fp); StradaValue *__fr = STRADA_MAKE_TAGGED_INT(access(__fp, " . $mode . ") == 0 ? 1 : 0); free(__fp); __fr; })");
+            }
+        } elsif ($op eq "-t") {
+            # -t FH: is filehandle a tty? Test fileno via isatty(3).
+            Perla::CodeGen::emit($cg, "({ StradaValue *__tv = ");
+            Perla::CodeGen::gen_expr($cg, $node->{"operand"});
+            Perla::CodeGen::emit($cg, "; int __tfd = -1; ");
+            Perla::CodeGen::emit($cg, "if (__tv && !STRADA_IS_TAGGED_INT(__tv) && __tv->type == STRADA_FILEHANDLE && __tv->value.fh) { __tfd = fileno(__tv->value.fh); } else if (__tv) { __tfd = (int)strada_to_int(__tv); } ");
+            # Perl returns empty string for false (not 0), so use STR not int
+            Perla::CodeGen::emit($cg, "StradaValue *__tr = (__tfd >= 0 && isatty(__tfd)) ? STRADA_MAKE_TAGGED_INT(1) : strada_new_str(\"\"); __tr; })");
+        } elsif ($op eq "-p" || $op eq "-S" || $op eq "-b" || $op eq "-c") {
+            # -p (FIFO), -S (socket), -b (block dev), -c (char dev)
+            my str $macro = "S_ISFIFO";
+            if    ($op eq "-S") { $macro = "S_ISSOCK"; }
+            elsif ($op eq "-b") { $macro = "S_ISBLK"; }
+            elsif ($op eq "-c") { $macro = "S_ISCHR"; }
+            Perla::CodeGen::emit($cg, "({ char *__fp = strada_to_str(");
+            Perla::CodeGen::gen_expr($cg, $node->{"operand"});
+            Perla::CodeGen::emit($cg, "); perla_remember_stat_path(__fp); struct stat __fs; ");
+            Perla::CodeGen::emit($cg, "StradaValue *__fr = (stat(__fp, &__fs) == 0 && " . $macro . "(__fs.st_mode)) ? STRADA_MAKE_TAGGED_INT(1) : strada_new_str(\"\"); free(__fp); __fr; })");
+        } elsif ($op eq "-u" || $op eq "-g" || $op eq "-k") {
+            # -u (setuid), -g (setgid), -k (sticky)
+            my str $bit = "S_ISUID";
+            if    ($op eq "-g") { $bit = "S_ISGID"; }
+            elsif ($op eq "-k") { $bit = "S_ISVTX"; }
+            Perla::CodeGen::emit($cg, "({ char *__fp = strada_to_str(");
+            Perla::CodeGen::gen_expr($cg, $node->{"operand"});
+            Perla::CodeGen::emit($cg, "); perla_remember_stat_path(__fp); struct stat __fs; ");
+            Perla::CodeGen::emit($cg, "StradaValue *__fr = (stat(__fp, &__fs) == 0 && (__fs.st_mode & " . $bit . ")) ? STRADA_MAKE_TAGGED_INT(1) : strada_new_str(\"\"); free(__fp); __fr; })");
+        } elsif ($op eq "-o" || $op eq "-O") {
+            # -o (owned by effective uid), -O (owned by real uid)
+            my str $uidfn = $op eq "-O" ? "getuid()" : "geteuid()";
+            Perla::CodeGen::emit($cg, "({ char *__fp = strada_to_str(");
+            Perla::CodeGen::gen_expr($cg, $node->{"operand"});
+            Perla::CodeGen::emit($cg, "); perla_remember_stat_path(__fp); struct stat __fs; ");
+            Perla::CodeGen::emit($cg, "StradaValue *__fr = (stat(__fp, &__fs) == 0 && __fs.st_uid == " . $uidfn . ") ? STRADA_MAKE_TAGGED_INT(1) : strada_new_str(\"\"); free(__fp); __fr; })");
+        } elsif ($op eq "-R" || $op eq "-W" || $op eq "-X") {
+            # Real-uid versions of -r/-w/-x. Use access(2) with AT_EACCESS
+            # turned off — i.e. access() (not faccessat with effective).
+            my str $accmode = "R_OK";
+            if    ($op eq "-W") { $accmode = "W_OK"; }
+            elsif ($op eq "-X") { $accmode = "X_OK"; }
+            Perla::CodeGen::emit($cg, "({ char *__fp = strada_to_str(");
+            Perla::CodeGen::gen_expr($cg, $node->{"operand"});
+            Perla::CodeGen::emit($cg, "); StradaValue *__fr = (access(__fp, " . $accmode . ") == 0) ? STRADA_MAKE_TAGGED_INT(1) : strada_new_str(\"\"); free(__fp); __fr; })");
+        } elsif ($op eq "-M" || $op eq "-A" || $op eq "-C") {
+            # File age in days from script start time. -M = mtime,
+            # -A = atime, -C = ctime. Returns (now - file_time) / 86400.0
+            # in days as a num. Returns undef if stat fails.
+            my str $field = "st_mtime";
+            if    ($op eq "-A") { $field = "st_atime"; }
+            elsif ($op eq "-C") { $field = "st_ctime"; }
+            Perla::CodeGen::emit($cg, "({ char *__fp = strada_to_str(");
+            Perla::CodeGen::gen_expr($cg, $node->{"operand"});
+            Perla::CodeGen::emit($cg, "); perla_remember_stat_path(__fp); struct stat __fs; ");
+            Perla::CodeGen::emit($cg, "StradaValue *__fr; if (stat(__fp, &__fs) == 0) { double __age = (double)(time(NULL) - __fs." . $field . ") / 86400.0; __fr = strada_new_num(__age); } else { __fr = strada_new_undef(); } free(__fp); __fr; })");
+        } else {
+            # Fallthrough: existence
+            if ($is_stat_cache == 1) {
+                Perla::CodeGen::emit($cg, "STRADA_MAKE_TAGGED_INT(perla_last_stat_path[0] ? strada_file_exists(perla_last_stat_path) : 0)");
+            } else {
+                Perla::CodeGen::emit($cg, "({ char *__fp = strada_to_str(");
+                Perla::CodeGen::gen_expr($cg, $node->{"operand"});
+                Perla::CodeGen::emit($cg, "); StradaValue *__fr = STRADA_MAKE_TAGGED_INT(strada_file_exists(__fp)); free(__fp); __fr; })");
+            }
+        }
+        return;
+    }
+
+    if ($op eq "-") {
+        # `-9223372036854775808` (i64 min) — the positive literal is
+        # exactly INT64_MAX+1, which overflows i64 and the codegen
+        # promotes it to NUM. Unary-minus-of-NUM then loses
+        # integer precision (stringifies as -9.22e+18). Detect the
+        # specific case and emit strada_new_int(INT64_MIN) directly.
+        my scalar $umop = $node->{"operand"};
+        if (defined($umop) && $umop->{"type"} == Perla::AST::N_INT_LIT()
+            && defined($umop->{"value"}) && $umop->{"value"} eq "9223372036854775808") {
+            Perla::CodeGen::emit($cg, "strada_new_int((int64_t)(-9223372036854775807LL - 1))");
+            return;
+        }
+        # Unary minus on a blessed ref with `neg` overloaded dispatches
+        # through the overload sub (perla_overload_binary with right=undef
+        # is the same calling convention CPAN overload uses for unary).
+        # When `neg` isn't defined, Perl falls back to `0 - $obj` which
+        # fires the `-` overload with swap=1. Without that fallback,
+        # classes that only define '-' (not 'neg') got the default
+        # pointer-as-int garbage when negated.
+        #
+        # For integer operands (tagged ints or heap INT), negate as
+        # integer so the result keeps integer precision and
+        # stringification. Without this, `-9223372036854775807` was
+        # converted to double via strada_to_num and stringified as
+        # \`-9.22e+18\` instead of the exact int. Special-case
+        # INT64_MIN (where -val overflows i64): promote to NUM as
+        # the only safe representation.
+        Perla::CodeGen::emit($cg, "({ StradaValue *__nv = ");
+        Perla::CodeGen::gen_expr($cg, $node->{"operand"});
+        Perla::CodeGen::emit($cg, "; StradaValue *__nr = NULL; ");
+        Perla::CodeGen::emit($cg, "if (__nv && !STRADA_IS_TAGGED_INT(__nv) && __nv->type == STRADA_REF) { ");
+        Perla::CodeGen::emit($cg, "  __nr = perla_overload_binary(__nv, strada_new_undef(), \"neg\"); ");
+        Perla::CodeGen::emit($cg, "  if (!__nr) __nr = perla_overload_binary(STRADA_MAKE_TAGGED_INT(0), __nv, \"-\"); } ");
+        Perla::CodeGen::emit($cg, "if (!__nr) { ");
+        Perla::CodeGen::emit($cg, "  if (STRADA_IS_TAGGED_INT(__nv)) { ");
+        Perla::CodeGen::emit($cg, "    int64_t __ni = STRADA_TAGGED_INT_VAL(__nv); ");
+        Perla::CodeGen::emit($cg, "    if (__ni == INT64_MIN) { __nr = strada_new_num(-(double)__ni); } ");
+        Perla::CodeGen::emit($cg, "    else { __nr = STRADA_MAKE_TAGGED_INT(-__ni); } ");
+        Perla::CodeGen::emit($cg, "  } else if (__nv && __nv->type == STRADA_INT) { ");
+        Perla::CodeGen::emit($cg, "    int64_t __ni = __nv->value.iv; ");
+        Perla::CodeGen::emit($cg, "    if (__ni == INT64_MIN) { __nr = strada_new_num(-(double)__ni); } ");
+        Perla::CodeGen::emit($cg, "    else { __nr = strada_new_int(-__ni); } ");
+        Perla::CodeGen::emit($cg, "  } ");
+        Perla::CodeGen::emit($cg, "} ");
+        # Perl's \"string negation\": if the operand is a string that
+        # doesn't look numeric, `-\"foo\"` returns `\"-foo\"` (prepend
+        # a `-`). If it already starts with `-`, strip the `-`. If it
+        # starts with `+`, replace with `-`. Numeric-looking strings
+        # fall through to the numeric path below. Only kicks in when
+        # __nv is a string AND strada_to_num returns 0 AND the string
+        # isn't a numeric \"0\"/\"0.0\"/etc. — i.e. genuinely alpha.
+        Perla::CodeGen::emit($cg, "if (!__nr && __nv && !STRADA_IS_TAGGED_INT(__nv) && __nv->type == STRADA_STR && __nv->value.pv) { ");
+        Perla::CodeGen::emit($cg, "  const char *__nvs = __nv->value.pv; size_t __nvslen = strlen(__nvs); ");
+        Perla::CodeGen::emit($cg, "  /* Skip leading whitespace for the numeric-ish check. */ ");
+        Perla::CodeGen::emit($cg, "  const char *__nvscan = __nvs; while (*__nvscan == ' ' || *__nvscan == '\\t') __nvscan++; ");
+        Perla::CodeGen::emit($cg, "  int __nvc = (unsigned char)*__nvscan; ");
+        Perla::CodeGen::emit($cg, "  int __nvc_is_digit_like = (__nvc >= '0' && __nvc <= '9') || __nvc == '.' || __nvc == 'e' || __nvc == 'E'; ");
+        Perla::CodeGen::emit($cg, "  if (!__nvc_is_digit_like) { ");
+        /* Per perlop on unary minus: leading `-` becomes `+`, leading
+         * `+` becomes `-`, otherwise the result is `-` prepended to
+         * the identifier-like string. -\"foo\" = \"-foo\", -\"-foo\" =
+         * \"+foo\", -\"+foo\" = \"-foo\". */
+        Perla::CodeGen::emit($cg, "    if (__nvc == '-') { char *__buf = malloc(__nvslen + 1); if (__buf) { memcpy(__buf, __nvs, __nvslen + 1); __buf[0] = '+'; __nr = strada_new_str(__buf); free(__buf); } } ");
+        Perla::CodeGen::emit($cg, "    else if (__nvc == '+') { char *__buf = malloc(__nvslen + 1); if (__buf) { memcpy(__buf, __nvs, __nvslen + 1); __buf[0] = '-'; __nr = strada_new_str(__buf); free(__buf); } } ");
+        Perla::CodeGen::emit($cg, "    else if (__nvc != 0) { char *__buf = malloc(__nvslen + 2); if (__buf) { __buf[0] = '-'; memcpy(__buf + 1, __nvs, __nvslen + 1); __nr = strada_new_str(__buf); free(__buf); } } ");
+        Perla::CodeGen::emit($cg, "  } ");
+        Perla::CodeGen::emit($cg, "} ");
+        Perla::CodeGen::emit($cg, "__nr ? __nr : strada_new_num(-strada_to_num(__nv)); })");
+        return;
+    }
+    if ($op eq "!" || $op eq "not") {
+        # Perl: !TRUTHY returns "" (defined empty), !FALSY returns "1".
+        # Was emitting STRADA_MAKE_TAGGED_INT(0/1), so `print !"foo"`
+        # showed "0" instead of "".
+        #
+        # Overload: blessed refs with `'!'` overload bypass the
+        # default truthiness — the user sub gets called. Falls through
+        # to the default boolean for non-refs (and refs without an
+        # explicit `'!'` overload). Use a statement-expression so the
+        # overload short-circuit path can early-return its value.
+        Perla::CodeGen::emit($cg, "({ StradaValue *__nlv = ");
+        Perla::CodeGen::gen_expr($cg, $node->{"operand"});
+        Perla::CodeGen::emit($cg, "; StradaValue *__nlr = NULL; ");
+        Perla::CodeGen::emit($cg, "if (__nlv && !STRADA_IS_TAGGED_INT(__nlv) && __nlv->type == STRADA_REF) { ");
+        Perla::CodeGen::emit($cg, "  __nlr = perla_overload_binary(__nlv, strada_new_undef(), \"!\"); } ");
+        Perla::CodeGen::emit($cg, "__nlr ? __nlr : (perla_to_bool(__nlv) ? strada_new_str(\"\") : STRADA_MAKE_TAGGED_INT(1)); })");
+        return;
+    }
+    if ($op eq "~") {
+        # Overload dispatch: `use overload '~' => sub {...}` on a blessed
+        # ref fires before the default bitwise-not. Without this, `~$obj`
+        # collapsed to `~strada_to_int(ref)` = `~0` = -1.
+        #
+        # Perl's bitwise-not on a non-negative integer uses UNSIGNED
+        # 64-bit semantics: `~5` is `0xFFFFFFFFFFFFFFFA` = 18446744073709551610.
+        # i.e. all-bits-flipped of the u64 value, not the signed
+        # -val-1. Wrap the value as NUM since u64 max doesn't fit
+        # i64; a tagged-int couldn't represent it. Negative i64 input
+        # falls through to the signed path (perl's behavior is
+        # symmetric there: ~(-1) = 0, ~INT_MIN = INT_MAX).
+        Perla::CodeGen::emit($cg, "({ StradaValue *__nv = ");
+        Perla::CodeGen::gen_expr($cg, $node->{"operand"});
+        Perla::CodeGen::emit($cg, "; StradaValue *__ovr = NULL; ");
+        Perla::CodeGen::emit($cg, "if (__nv && !STRADA_IS_TAGGED_INT(__nv) && __nv->type == STRADA_REF) { ");
+        Perla::CodeGen::emit($cg, "  __ovr = perla_overload_binary(__nv, strada_undef_static(), \"~\"); } ");
+        Perla::CodeGen::emit($cg, "StradaValue *__nrr = __ovr; ");
+        Perla::CodeGen::emit($cg, "if (!__nrr) { int64_t __nvi = strada_to_int(__nv); ");
+        Perla::CodeGen::emit($cg, "  if (__nvi >= 0) { uint64_t __nvu = ~(uint64_t)__nvi; ");
+        Perla::CodeGen::emit($cg, "    if (__nvu <= (uint64_t)INT64_MAX) __nrr = STRADA_MAKE_TAGGED_INT((int64_t)__nvu); ");
+        # Above INT64_MAX, the all-bits-flipped value is a true unsigned
+        # 64-bit integer — store it as a UV (strada_new_uint) so it prints
+        # the exact decimal AND behaves as an integer in arithmetic. (It
+        # used to be stored as a decimal string to dodge the missing UV
+        # type; that round-tripped through perl's string-numeric coercion
+        # but lost integer typing.)
+        Perla::CodeGen::emit($cg, "    else { __nrr = strada_new_uint(__nvu); } } ");
+        Perla::CodeGen::emit($cg, "  else __nrr = STRADA_MAKE_TAGGED_INT(~__nvi); } __nrr; })");
+        return;
+    }
+    # Postfix ++
+    if ($op eq "++" && defined($node->{"postfix"}) && $node->{"postfix"} == 1) {
+        my int $op_type = $node->{"operand"}->{"type"};
+        if ($op_type == Perla::AST::N_ARROW_HASH() || $op_type == Perla::AST::N_HASH_ELEM()) {
+            Perla::CodeGen::Assign::_gen_hash_postfix_inc_dec($cg, $node->{"operand"}, "+");
+        } elsif ($op_type == Perla::AST::N_ARRAY_ELEM() || $op_type == Perla::AST::N_ARROW_ARRAY()) {
+            Perla::CodeGen::emit($cg, "({ StradaArray *__pi_av = strada_deref_array(");
+            my scalar $pi_an = ($op_type == Perla::AST::N_ARRAY_ELEM()) ? $node->{"operand"}->{"array"} : $node->{"operand"}->{"object"};
+            my int $pi_is_arrow = 0;
+            if (defined($node->{"operand"}->{"is_explicit_arrow"}) && $node->{"operand"}->{"is_explicit_arrow"} == 1) { $pi_is_arrow = 1; }
+            if ($pi_is_arrow == 0
+                && defined($pi_an) && $pi_an->{"type"} == Perla::AST::N_SCALAR_VAR()
+                && defined($pi_an->{"name"}) && $pi_an->{"name"} eq "_") {
+                Perla::CodeGen::emit($cg, "perla_at_");
+            } elsif ($pi_is_arrow == 0
+                && defined($pi_an) && $pi_an->{"type"} == Perla::AST::N_SCALAR_VAR()
+                && defined($pi_an->{"name"}) && index($pi_an->{"name"}, "::") > 0) {
+                my array @pipn = Perla::CodeGen::_split_pkg_qual_name($pi_an);
+                Perla::CodeGen::emit($cg, "perla_array_get(\"" . $pipn[0] . "\", \"" . $pipn[1] . "\")");
+            } else {
+                Perla::CodeGen::gen_expr($cg, $pi_an);
+            }
+            Perla::CodeGen::emit($cg, "); int __pi_idx = (int)strada_to_int(");
+            Perla::CodeGen::gen_expr($cg, $node->{"operand"}->{"index"});
+            Perla::CodeGen::emit($cg, "); if (__pi_idx < 0 && __pi_av) __pi_idx += strada_array_length(__pi_av); ");
+            Perla::CodeGen::emit($cg, "StradaValue *__pi_old = strada_array_get(__pi_av, __pi_idx); strada_incref(__pi_old); ");
+            Perla::CodeGen::emit($cg, "StradaValue *__pi_new = STRADA_MAKE_TAGGED_INT(strada_to_int(__pi_old) + 1); ");
+            Perla::CodeGen::emit($cg, "strada_array_set(__pi_av, __pi_idx, __pi_new); __pi_old; })");
+        } elsif ($op_type == Perla::AST::N_DEREF_SCALAR()) {
+            # ${EXPR}++ — eval EXPR to a scalar ref, read/write via the
+            # ref's target. Two cases:
+            #  - slot ref (`\$var`): write directly through the slot.
+            #  - value ref: snapshot OLD value first (do not alias __tgt),
+            #    then overwrite the target in place.
+            # The alias bug (`__old = __tgt; ... overwrite_in_place(__tgt)`)
+            # made `${$r}++` return the NEW value instead of the OLD.
+            Perla::CodeGen::emit($cg, "({ StradaValue *__dref = ");
+            Perla::CodeGen::gen_expr($cg, $node->{"operand"}->{"ref"});
+            Perla::CodeGen::emit($cg, "; StradaValue *__old = NULL; ");
+            Perla::CodeGen::emit($cg, "if (__dref && !STRADA_IS_TAGGED_INT(__dref) && __dref->type == STRADA_REF) { ");
+            Perla::CodeGen::emit($cg, "  if (strada_is_slot_ref(__dref)) { ");
+            Perla::CodeGen::emit($cg, "    StradaValue **__slot = (StradaValue**)__dref->value.ptr; ");
+            Perla::CodeGen::emit($cg, "    __old = *__slot; if (__old) strada_incref(__old); ");
+            Perla::CodeGen::emit($cg, "    StradaValue *__nv = perla_increment(__old); ");
+            Perla::CodeGen::emit($cg, "    if (*__slot) strada_decref(*__slot); *__slot = __nv; ");
+            Perla::CodeGen::emit($cg, "  } else if (__dref->value.rv) { ");
+            Perla::CodeGen::emit($cg, "    StradaValue *__tgt = __dref->value.rv; ");
+            Perla::CodeGen::emit($cg, "    __old = strada_new_undef(); strada_overwrite_in_place(__old, __tgt); ");
+            Perla::CodeGen::emit($cg, "    StradaValue *__nv = perla_increment(__tgt); ");
+            Perla::CodeGen::emit($cg, "    strada_overwrite_in_place(__tgt, __nv); strada_decref(__nv); ");
+            Perla::CodeGen::emit($cg, "  } ");
+            Perla::CodeGen::emit($cg, "} ");
+            Perla::CodeGen::emit($cg, "if (!__old) __old = strada_new_undef(); __old; })");
+        } else {
+            if (Perla::CodeGen::_is_pkg_qualified_scalar($node->{"operand"}) == 1) {
+                Perla::CodeGen::_emit_pkg_scalar_inc_postfix($cg, $node->{"operand"}, "+");
+            } else {
+                # Use perla_increment (magic string-or-number inc) to
+                # match Perl's `$s = "a"; $s++` → "b" semantics. Old
+                # codegen always truncated to int (so "a"++ → 1).
+                # Tied-scalar dispatch: when $x is a tied SV, $x++ should
+                # FETCH the pre-inc value (returned), increment it, and
+                # STORE the new value through the tied object — keeping
+                # the tied SV in the slot. Without this, ++ replaced
+                # the tied SV with a raw value and subsequent ops missed
+                # the tie entirely.
+                Perla::CodeGen::emit($cg, "({ StradaValue *__old = ");
+                Perla::CodeGen::gen_expr($cg, $node->{"operand"});
+                Perla::CodeGen::emit($cg, "; if (__old) strada_incref(__old); ");
+                Perla::CodeGen::emit($cg, "if (__builtin_expect(__old && !STRADA_IS_TAGGED_INT(__old) && __old->meta && __old->meta->is_tied, 0)) { ");
+                Perla::CodeGen::emit($cg, "  StradaValue *__fold = strada_tied_scalar_fetch(__old); ");
+                Perla::CodeGen::emit($cg, "  StradaValue *__inc = perla_increment(__fold); ");
+                Perla::CodeGen::emit($cg, "  strada_tied_scalar_store(__old, __inc); strada_decref(__inc); ");
+                Perla::CodeGen::emit($cg, "  strada_decref(__old); __old = __fold; ");
+                Perla::CodeGen::emit($cg, "} else { ");
+                Perla::CodeGen::gen_expr($cg, $node->{"operand"});
+                Perla::CodeGen::emit($cg, " = perla_increment(__old)");
+                Perla::CodeGen::_emit_our_sync($cg, $node->{"operand"});
+                Perla::CodeGen::emit($cg, "; } __old; })");
+            }
+        }
+        return;
+    }
+    # Postfix --
+    if ($op eq "--" && defined($node->{"postfix"}) && $node->{"postfix"} == 1) {
+        my int $op_type = $node->{"operand"}->{"type"};
+        if ($op_type == Perla::AST::N_ARROW_HASH() || $op_type == Perla::AST::N_HASH_ELEM()) {
+            Perla::CodeGen::Assign::_gen_hash_postfix_inc_dec($cg, $node->{"operand"}, "-");
+        } elsif ($op_type == Perla::AST::N_ARRAY_ELEM() || $op_type == Perla::AST::N_ARROW_ARRAY()) {
+            Perla::CodeGen::emit($cg, "({ StradaArray *__pi_av = strada_deref_array(");
+            my scalar $pd_an = ($op_type == Perla::AST::N_ARRAY_ELEM()) ? $node->{"operand"}->{"array"} : $node->{"operand"}->{"object"};
+            my int $pd_is_arrow = 0;
+            if (defined($node->{"operand"}->{"is_explicit_arrow"}) && $node->{"operand"}->{"is_explicit_arrow"} == 1) { $pd_is_arrow = 1; }
+            if ($pd_is_arrow == 0
+                && defined($pd_an) && $pd_an->{"type"} == Perla::AST::N_SCALAR_VAR()
+                && defined($pd_an->{"name"}) && $pd_an->{"name"} eq "_") {
+                Perla::CodeGen::emit($cg, "perla_at_");
+            } elsif ($pd_is_arrow == 0
+                && defined($pd_an) && $pd_an->{"type"} == Perla::AST::N_SCALAR_VAR()
+                && defined($pd_an->{"name"}) && index($pd_an->{"name"}, "::") > 0) {
+                my array @pdpn = Perla::CodeGen::_split_pkg_qual_name($pd_an);
+                Perla::CodeGen::emit($cg, "perla_array_get(\"" . $pdpn[0] . "\", \"" . $pdpn[1] . "\")");
+            } else {
+                Perla::CodeGen::gen_expr($cg, $pd_an);
+            }
+            Perla::CodeGen::emit($cg, "); int __pi_idx = (int)strada_to_int(");
+            Perla::CodeGen::gen_expr($cg, $node->{"operand"}->{"index"});
+            Perla::CodeGen::emit($cg, "); if (__pi_idx < 0 && __pi_av) __pi_idx += strada_array_length(__pi_av); ");
+            Perla::CodeGen::emit($cg, "StradaValue *__pi_old = strada_array_get(__pi_av, __pi_idx); strada_incref(__pi_old); ");
+            Perla::CodeGen::emit($cg, "StradaValue *__pi_new = STRADA_MAKE_TAGGED_INT(strada_to_int(__pi_old) - 1); ");
+            Perla::CodeGen::emit($cg, "strada_array_set(__pi_av, __pi_idx, __pi_new); __pi_old; })");
+        } elsif ($op_type == Perla::AST::N_DEREF_SCALAR()) {
+            # ${EXPR}-- — mirrors postfix ++ DEREF_SCALAR. Return OLD value.
+            Perla::CodeGen::emit($cg, "({ StradaValue *__dref = ");
+            Perla::CodeGen::gen_expr($cg, $node->{"operand"}->{"ref"});
+            Perla::CodeGen::emit($cg, "; StradaValue *__old = NULL; ");
+            Perla::CodeGen::emit($cg, "if (__dref && !STRADA_IS_TAGGED_INT(__dref) && __dref->type == STRADA_REF) { ");
+            Perla::CodeGen::emit($cg, "  if (strada_is_slot_ref(__dref)) { ");
+            Perla::CodeGen::emit($cg, "    StradaValue **__slot = (StradaValue**)__dref->value.ptr; ");
+            Perla::CodeGen::emit($cg, "    __old = *__slot; if (__old) strada_incref(__old); ");
+            Perla::CodeGen::emit($cg, "    StradaValue *__nv = STRADA_MAKE_TAGGED_INT(strada_to_int(__old) - 1); ");
+            Perla::CodeGen::emit($cg, "    if (*__slot) strada_decref(*__slot); *__slot = __nv; ");
+            Perla::CodeGen::emit($cg, "  } else if (__dref->value.rv) { ");
+            Perla::CodeGen::emit($cg, "    StradaValue *__tgt = __dref->value.rv; ");
+            Perla::CodeGen::emit($cg, "    __old = strada_new_undef(); strada_overwrite_in_place(__old, __tgt); ");
+            Perla::CodeGen::emit($cg, "    StradaValue *__nv = STRADA_MAKE_TAGGED_INT(strada_to_int(__tgt) - 1); ");
+            Perla::CodeGen::emit($cg, "    strada_overwrite_in_place(__tgt, __nv); strada_decref(__nv); ");
+            Perla::CodeGen::emit($cg, "  } ");
+            Perla::CodeGen::emit($cg, "} ");
+            Perla::CodeGen::emit($cg, "if (!__old) __old = strada_new_undef(); __old; })");
+        } else {
+            if (Perla::CodeGen::_is_pkg_qualified_scalar($node->{"operand"}) == 1) {
+                Perla::CodeGen::_emit_pkg_scalar_inc_postfix($cg, $node->{"operand"}, "-");
+            } else {
+                # Use perla_decrement so overloaded `--` dispatches on
+                # blessed refs (CPAN overload's '--' slot). Tagged ints
+                # and plain numbers stay on the fast path inside the
+                # helper. Tied-scalar dispatch — see postfix ++.
+                Perla::CodeGen::emit($cg, "({ StradaValue *__old = ");
+                Perla::CodeGen::gen_expr($cg, $node->{"operand"});
+                Perla::CodeGen::emit($cg, "; if (__old) strada_incref(__old); ");
+                Perla::CodeGen::emit($cg, "if (__builtin_expect(__old && !STRADA_IS_TAGGED_INT(__old) && __old->meta && __old->meta->is_tied, 0)) { ");
+                Perla::CodeGen::emit($cg, "  StradaValue *__fold = strada_tied_scalar_fetch(__old); ");
+                Perla::CodeGen::emit($cg, "  StradaValue *__dec = perla_decrement(__fold); ");
+                Perla::CodeGen::emit($cg, "  strada_tied_scalar_store(__old, __dec); strada_decref(__dec); ");
+                Perla::CodeGen::emit($cg, "  strada_decref(__old); __old = __fold; ");
+                Perla::CodeGen::emit($cg, "} else { ");
+                Perla::CodeGen::gen_expr($cg, $node->{"operand"});
+                Perla::CodeGen::emit($cg, " = perla_decrement(__old)");
+                Perla::CodeGen::_emit_our_sync($cg, $node->{"operand"});
+                Perla::CodeGen::emit($cg, "; } __old; })");
+            }
+        }
+        return;
+    }
+    # Prefix ++
+    if ($op eq "++" && defined($node->{"prefix"}) && $node->{"prefix"} == 1) {
+        my int $op_type = $node->{"operand"}->{"type"};
+        if ($op_type == Perla::AST::N_ARROW_HASH() || $op_type == Perla::AST::N_HASH_ELEM()) {
+            Perla::CodeGen::Assign::_gen_hash_compound_assign($cg, $node->{"operand"}, "+", Perla::AST::node_with(Perla::AST::N_INT_LIT(), "value", "1"));
+        } elsif ($op_type == Perla::AST::N_ARRAY_ELEM() || $op_type == Perla::AST::N_ARROW_ARRAY()) {
+            # ++$arr[i] or ++$ref->[i]: read-modify-write via array_set.
+            Perla::CodeGen::emit($cg, "({ StradaArray *__pi_av = strada_deref_array(");
+            my scalar $pre_an = ($op_type == Perla::AST::N_ARRAY_ELEM()) ? $node->{"operand"}->{"array"} : $node->{"operand"}->{"object"};
+            my int $pre_is_arrow = 0;
+            if (defined($node->{"operand"}->{"is_explicit_arrow"}) && $node->{"operand"}->{"is_explicit_arrow"} == 1) { $pre_is_arrow = 1; }
+            if ($pre_is_arrow == 0
+                && defined($pre_an) && $pre_an->{"type"} == Perla::AST::N_SCALAR_VAR()
+                && defined($pre_an->{"name"}) && $pre_an->{"name"} eq "_") {
+                Perla::CodeGen::emit($cg, "perla_at_");
+            } elsif ($pre_is_arrow == 0
+                && defined($pre_an) && $pre_an->{"type"} == Perla::AST::N_SCALAR_VAR()
+                && defined($pre_an->{"name"}) && index($pre_an->{"name"}, "::") > 0) {
+                my array @prepn = Perla::CodeGen::_split_pkg_qual_name($pre_an);
+                Perla::CodeGen::emit($cg, "perla_array_get(\"" . $prepn[0] . "\", \"" . $prepn[1] . "\")");
+            } else {
+                Perla::CodeGen::gen_expr($cg, $pre_an);
+            }
+            Perla::CodeGen::emit($cg, "); int __pi_idx = (int)strada_to_int(");
+            Perla::CodeGen::gen_expr($cg, $node->{"operand"}->{"index"});
+            Perla::CodeGen::emit($cg, "); if (__pi_idx < 0 && __pi_av) __pi_idx += strada_array_length(__pi_av); ");
+            Perla::CodeGen::emit($cg, "StradaValue *__pi_new = STRADA_MAKE_TAGGED_INT(strada_to_int(strada_array_get(__pi_av, __pi_idx)) + 1); ");
+            Perla::CodeGen::emit($cg, "strada_array_set(__pi_av, __pi_idx, __pi_new); __pi_new; })");
+        } elsif ($op_type == Perla::AST::N_DEREF_SCALAR()) {
+            # ++${EXPR} — increment and return the NEW value.
+            Perla::CodeGen::emit($cg, "({ StradaValue *__dref = ");
+            Perla::CodeGen::gen_expr($cg, $node->{"operand"}->{"ref"});
+            Perla::CodeGen::emit($cg, "; StradaValue *__ret = NULL; ");
+            Perla::CodeGen::emit($cg, "if (__dref && !STRADA_IS_TAGGED_INT(__dref) && __dref->type == STRADA_REF) { ");
+            Perla::CodeGen::emit($cg, "  if (strada_is_slot_ref(__dref)) { ");
+            Perla::CodeGen::emit($cg, "    StradaValue **__slot = (StradaValue**)__dref->value.ptr; ");
+            Perla::CodeGen::emit($cg, "    StradaValue *__nv = perla_increment(*__slot); ");
+            Perla::CodeGen::emit($cg, "    if (*__slot) strada_decref(*__slot); *__slot = __nv; ");
+            Perla::CodeGen::emit($cg, "    strada_incref(__nv); __ret = __nv; ");
+            Perla::CodeGen::emit($cg, "  } else if (__dref->value.rv) { ");
+            Perla::CodeGen::emit($cg, "    StradaValue *__tgt = __dref->value.rv; ");
+            Perla::CodeGen::emit($cg, "    StradaValue *__nv = perla_increment(__tgt); ");
+            Perla::CodeGen::emit($cg, "    strada_overwrite_in_place(__tgt, __nv); strada_decref(__nv); ");
+            Perla::CodeGen::emit($cg, "    strada_incref(__tgt); __ret = __tgt; ");
+            Perla::CodeGen::emit($cg, "  } ");
+            Perla::CodeGen::emit($cg, "} ");
+            Perla::CodeGen::emit($cg, "if (!__ret) __ret = strada_new_undef(); __ret; })");
+        } else {
+            if (Perla::CodeGen::_is_pkg_qualified_scalar($node->{"operand"}) == 1) {
+                Perla::CodeGen::_emit_pkg_scalar_inc_prefix($cg, $node->{"operand"}, "+");
+            } else if (Perla::CodeGen::_is_our_unqual_scalar($cg, $node->{"operand"}) == 1) {
+                # Wrap in a statement-expression so we can sync after.
+                Perla::CodeGen::emit($cg, "({ ");
+                Perla::CodeGen::gen_expr($cg, $node->{"operand"});
+                Perla::CodeGen::emit($cg, " = perla_increment(");
+                Perla::CodeGen::gen_expr($cg, $node->{"operand"});
+                Perla::CodeGen::emit($cg, ")");
+                Perla::CodeGen::_emit_our_sync($cg, $node->{"operand"});
+                Perla::CodeGen::emit($cg, "; ");
+                Perla::CodeGen::gen_expr($cg, $node->{"operand"});
+                Perla::CodeGen::emit($cg, "; })");
+            } else {
+                # Use perla_increment for magic string-or-number inc.
+                # Tied-scalar dispatch (see postfix ++ for rationale):
+                # ++tied fetches → increments → stores → returns new.
+                Perla::CodeGen::emit($cg, "({ StradaValue *__tg = ");
+                Perla::CodeGen::gen_expr($cg, $node->{"operand"});
+                Perla::CodeGen::emit($cg, "; StradaValue *__r; ");
+                Perla::CodeGen::emit($cg, "if (__builtin_expect(__tg && !STRADA_IS_TAGGED_INT(__tg) && __tg->meta && __tg->meta->is_tied, 0)) { ");
+                Perla::CodeGen::emit($cg, "  StradaValue *__fold = strada_tied_scalar_fetch(__tg); ");
+                Perla::CodeGen::emit($cg, "  StradaValue *__inc = perla_increment(__fold); ");
+                Perla::CodeGen::emit($cg, "  strada_tied_scalar_store(__tg, __inc); ");
+                Perla::CodeGen::emit($cg, "  strada_decref(__fold); __r = __inc; ");
+                Perla::CodeGen::emit($cg, "} else { ");
+                Perla::CodeGen::gen_expr($cg, $node->{"operand"});
+                Perla::CodeGen::emit($cg, " = perla_increment(__tg); __r = ");
+                Perla::CodeGen::gen_expr($cg, $node->{"operand"});
+                Perla::CodeGen::emit($cg, "; } __r; })");
+            }
+        }
+        return;
+    }
+    # Prefix --
+    if ($op eq "--" && defined($node->{"prefix"}) && $node->{"prefix"} == 1) {
+        my int $op_type = $node->{"operand"}->{"type"};
+        if ($op_type == Perla::AST::N_ARROW_HASH() || $op_type == Perla::AST::N_HASH_ELEM()) {
+            Perla::CodeGen::Assign::_gen_hash_compound_assign($cg, $node->{"operand"}, "-", Perla::AST::node_with(Perla::AST::N_INT_LIT(), "value", "1"));
+        } elsif ($op_type == Perla::AST::N_ARRAY_ELEM() || $op_type == Perla::AST::N_ARROW_ARRAY()) {
+            # --$arr[i] or --$ref->[i]: read-modify-write via array_set.
+            Perla::CodeGen::emit($cg, "({ StradaArray *__pi_av = strada_deref_array(");
+            my scalar $prd_an = ($op_type == Perla::AST::N_ARRAY_ELEM()) ? $node->{"operand"}->{"array"} : $node->{"operand"}->{"object"};
+            my int $prd_is_arrow = 0;
+            if (defined($node->{"operand"}->{"is_explicit_arrow"}) && $node->{"operand"}->{"is_explicit_arrow"} == 1) { $prd_is_arrow = 1; }
+            if ($prd_is_arrow == 0
+                && defined($prd_an) && $prd_an->{"type"} == Perla::AST::N_SCALAR_VAR()
+                && defined($prd_an->{"name"}) && $prd_an->{"name"} eq "_") {
+                Perla::CodeGen::emit($cg, "perla_at_");
+            } elsif ($prd_is_arrow == 0
+                && defined($prd_an) && $prd_an->{"type"} == Perla::AST::N_SCALAR_VAR()
+                && defined($prd_an->{"name"}) && index($prd_an->{"name"}, "::") > 0) {
+                my array @prdpn = Perla::CodeGen::_split_pkg_qual_name($prd_an);
+                Perla::CodeGen::emit($cg, "perla_array_get(\"" . $prdpn[0] . "\", \"" . $prdpn[1] . "\")");
+            } else {
+                Perla::CodeGen::gen_expr($cg, $prd_an);
+            }
+            Perla::CodeGen::emit($cg, "); int __pi_idx = (int)strada_to_int(");
+            Perla::CodeGen::gen_expr($cg, $node->{"operand"}->{"index"});
+            Perla::CodeGen::emit($cg, "); if (__pi_idx < 0 && __pi_av) __pi_idx += strada_array_length(__pi_av); ");
+            Perla::CodeGen::emit($cg, "StradaValue *__pi_new = STRADA_MAKE_TAGGED_INT(strada_to_int(strada_array_get(__pi_av, __pi_idx)) - 1); ");
+            Perla::CodeGen::emit($cg, "strada_array_set(__pi_av, __pi_idx, __pi_new); __pi_new; })");
+        } elsif ($op_type == Perla::AST::N_DEREF_SCALAR()) {
+            # --${EXPR} — decrement and return the NEW value.
+            Perla::CodeGen::emit($cg, "({ StradaValue *__dref = ");
+            Perla::CodeGen::gen_expr($cg, $node->{"operand"}->{"ref"});
+            Perla::CodeGen::emit($cg, "; StradaValue *__ret = NULL; ");
+            Perla::CodeGen::emit($cg, "if (__dref && !STRADA_IS_TAGGED_INT(__dref) && __dref->type == STRADA_REF) { ");
+            Perla::CodeGen::emit($cg, "  if (strada_is_slot_ref(__dref)) { ");
+            Perla::CodeGen::emit($cg, "    StradaValue **__slot = (StradaValue**)__dref->value.ptr; ");
+            Perla::CodeGen::emit($cg, "    StradaValue *__nv = STRADA_MAKE_TAGGED_INT(strada_to_int(*__slot) - 1); ");
+            Perla::CodeGen::emit($cg, "    if (*__slot) strada_decref(*__slot); *__slot = __nv; ");
+            Perla::CodeGen::emit($cg, "    strada_incref(__nv); __ret = __nv; ");
+            Perla::CodeGen::emit($cg, "  } else if (__dref->value.rv) { ");
+            Perla::CodeGen::emit($cg, "    StradaValue *__tgt = __dref->value.rv; ");
+            Perla::CodeGen::emit($cg, "    StradaValue *__nv = STRADA_MAKE_TAGGED_INT(strada_to_int(__tgt) - 1); ");
+            Perla::CodeGen::emit($cg, "    strada_overwrite_in_place(__tgt, __nv); strada_decref(__nv); ");
+            Perla::CodeGen::emit($cg, "    strada_incref(__tgt); __ret = __tgt; ");
+            Perla::CodeGen::emit($cg, "  } ");
+            Perla::CodeGen::emit($cg, "} ");
+            Perla::CodeGen::emit($cg, "if (!__ret) __ret = strada_new_undef(); __ret; })");
+        } else {
+            if (Perla::CodeGen::_is_pkg_qualified_scalar($node->{"operand"}) == 1) {
+                Perla::CodeGen::_emit_pkg_scalar_inc_prefix($cg, $node->{"operand"}, "-");
+            } else if (Perla::CodeGen::_is_our_unqual_scalar($cg, $node->{"operand"}) == 1) {
+                # Use perla_decrement so blessed-ref `--` overload fires.
+                # Without this, `--$obj` collapsed to
+                # `$obj = STRADA_MAKE_TAGGED_INT(0 - 1)` = -1, clobbering
+                # the blessed ref with a plain int.
+                Perla::CodeGen::emit($cg, "({ ");
+                Perla::CodeGen::gen_expr($cg, $node->{"operand"});
+                Perla::CodeGen::emit($cg, " = perla_decrement(");
+                Perla::CodeGen::gen_expr($cg, $node->{"operand"});
+                Perla::CodeGen::emit($cg, ")");
+                Perla::CodeGen::_emit_our_sync($cg, $node->{"operand"});
+                Perla::CodeGen::emit($cg, "; ");
+                Perla::CodeGen::gen_expr($cg, $node->{"operand"});
+                Perla::CodeGen::emit($cg, "; })");
+            } else {
+                # See comment above re: perla_decrement.
+                # Tied-scalar dispatch (see postfix ++ for rationale).
+                Perla::CodeGen::emit($cg, "({ StradaValue *__tg = ");
+                Perla::CodeGen::gen_expr($cg, $node->{"operand"});
+                Perla::CodeGen::emit($cg, "; StradaValue *__r; ");
+                Perla::CodeGen::emit($cg, "if (__builtin_expect(__tg && !STRADA_IS_TAGGED_INT(__tg) && __tg->meta && __tg->meta->is_tied, 0)) { ");
+                Perla::CodeGen::emit($cg, "  StradaValue *__fold = strada_tied_scalar_fetch(__tg); ");
+                Perla::CodeGen::emit($cg, "  StradaValue *__dec = perla_decrement(__fold); ");
+                Perla::CodeGen::emit($cg, "  strada_tied_scalar_store(__tg, __dec); ");
+                Perla::CodeGen::emit($cg, "  strada_decref(__fold); __r = __dec; ");
+                Perla::CodeGen::emit($cg, "} else { ");
+                Perla::CodeGen::gen_expr($cg, $node->{"operand"});
+                Perla::CodeGen::emit($cg, " = perla_decrement(__tg); __r = ");
+                Perla::CodeGen::gen_expr($cg, $node->{"operand"});
+                Perla::CodeGen::emit($cg, "; } __r; })");
+            }
+        }
+        return;
+    }
+    # Unary `+EXPR` — Perl uses this to disambiguate parsing (e.g. inside
+    # a hash subscript: `$h->{+shift}` is `$h->{shift}` not the literal key
+    # "shift"). Semantically a no-op in scalar context — just evaluate the
+    # operand and pass through.
+    if ($op eq "+") {
+        Perla::CodeGen::gen_expr($cg, $node->{"operand"});
+        return;
+    }
+    Perla::CodeGen::emit($cg, "strada_new_undef() /* TODO: unop " . $op . " */");
+}

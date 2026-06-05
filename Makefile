@@ -156,7 +156,11 @@ PERLA_CODEGEN_MODS = \
     lib/Perla/CodeGen/Eval.o \
     lib/Perla/CodeGen/Subst.o \
     lib/Perla/CodeGen/Interp.o \
-    lib/Perla/CodeGen/Subs.o
+    lib/Perla/CodeGen/Subs.o \
+    lib/Perla/CodeGen/Call.o \
+    lib/Perla/CodeGen/Assign.o \
+    lib/Perla/CodeGen/Operator.o \
+    lib/Perla/CodeGen/Method.o
 
 # CodeGen sub-modules: need -L pointing at the lib root so cross-module `use`
 # (e.g. Interp.strada's `use Perla::CodeGen::Escape;`) resolves. Without it the

@@ -1,0 +1,1004 @@
+# Perla::CodeGen::Method - Method-call code generation.
+#
+# Extracted from CodeGen.strada. Owns _gen_method_call (Perl method dispatch:
+# direct, SUPER::, dynamic, ->can, indirect) plus the format/lexical helpers
+# (_collect_format_sub_lex_refs, _collect_format_lex_refs,
+# _rewrite_format_body_for_lex) used when a method body references format
+# templates capturing lexicals.
+#
+# Calls back into the main Perla::CodeGen via body-less `extern func` decls
+# (can't `use` it: cycle). Uses sibling Perla::CodeGen::Call for the shared
+# argument-marshalling helpers (_gen_push_args) and sub resolution
+# (_resolve_sub).
+
+use Perla::AST;
+use Perla::Lexer;
+use Perla::Parser;
+use Perla::CodeGen::Predicate;
+use Perla::CodeGen::Call;
+
+package Perla::CodeGen::Method;
+
+# Forward decls for Perla::CodeGen helpers we call inline.
+extern func Perla::CodeGen::c_var(str $name) str;
+extern func Perla::CodeGen::emit(scalar $cg, str $s) void;
+extern func Perla::CodeGen::expr_is_borrowed(scalar $node) int;
+extern func Perla::CodeGen::gen_expr(scalar $cg, scalar $node) void;
+extern func Perla::CodeGen::sub_cname_q(str $qname) str;
+
+func _gen_method_call(scalar $cg, scalar $node) void {
+    my str $method = $node->{"method"};
+    my scalar $args = $node->{"args"};
+    my int $argc = scalar(@{$args});
+
+    # `constant->import( NAME => VALUE, ... )` — the constant pragma invoked
+    # as a method (not `use constant`). A direct method call gives no reliable
+    # runtime caller package, so resolve it at compile time ($cg->{"pkg"}) and
+    # hand it to perla_constant_import_pkg explicitly. Real-world:
+    # Class::Accessor::Grouped's `package __CAG_ENV__; constant->import(
+    # NO_SUBNAME => ... )`. Without this the constant installed in the wrong
+    # package and `__CAG_ENV__::NO_SUBNAME` died "Undefined subroutine".
+    if (($method eq "import" || $method eq "unimport") && defined($node->{"object"})) {
+        my scalar $ci_obj = $node->{"object"};
+        my int $ci_is_constant = 0;
+        if (($ci_obj->{"type"} == Perla::AST::N_CALL() || $ci_obj->{"type"} == Perla::AST::N_STR_LIT())
+            && defined($ci_obj->{"name"}) && $ci_obj->{"name"} eq "constant") { $ci_is_constant = 1; }
+        if ($ci_obj->{"type"} == Perla::AST::N_STR_LIT() && defined($ci_obj->{"value"}) && $ci_obj->{"value"} eq "constant") { $ci_is_constant = 1; }
+        if ($ci_is_constant == 1 && $method eq "import") {
+            Perla::CodeGen::emit($cg, "({ StradaValue *__ci_a = strada_new_array(); StradaArray *__ci_av = strada_deref_array(__ci_a); ");
+            Perla::CodeGen::emit($cg, "strada_array_push_take(__ci_av, strada_new_str(\"constant\")); ");
+            my int $ci_i = 0;
+            while ($ci_i < $argc) {
+                Perla::CodeGen::emit($cg, "{ int __sav_wl_ci = __perla_want_list; __perla_want_list = 1; StradaValue *__ci_v = ");
+                Perla::CodeGen::gen_expr($cg, $args->[$ci_i]);
+                Perla::CodeGen::emit($cg, "; __perla_want_list = __sav_wl_ci; ");
+                Perla::CodeGen::emit($cg, "if (__ci_v && !STRADA_IS_TAGGED_INT(__ci_v) && __ci_v->type == STRADA_ARRAY) { StradaArray *__ci_fa = __ci_v->value.av; for (size_t __ci_fi = 0; __ci_fi < __ci_fa->size; __ci_fi++) { StradaValue *__ci_e = __ci_fa->elements[__ci_fa->head + __ci_fi]; if (__ci_e) strada_incref(__ci_e); strada_array_push_take(__ci_av, __ci_e); } strada_decref(__ci_v); } ");
+                Perla::CodeGen::emit($cg, "else { strada_array_push_take(__ci_av, __ci_v); } } ");
+                $ci_i = $ci_i + 1;
+            }
+            Perla::CodeGen::emit($cg, "perla_constant_import_pkg(\"" . $cg->{"pkg"} . "\", __ci_a); strada_decref(__ci_a); STRADA_MAKE_TAGGED_INT(1); })");
+            return;
+        }
+    }
+
+    # Built-in methods: isa(), can()
+    if ($method eq "isa" && $argc >= 1) {
+        # Check if object is a static class name (bare word / N_CALL with no args)
+        my scalar $obj_node = $node->{"object"};
+        my int $is_static_class = 0;
+        my str $class_name = "";
+        # EXPLICIT parens make it a function CALL, not a class name:
+        # `Foo->method` is a class-method call, but `Foo()->method` calls Foo()
+        # and invokes ->method on its RESULT (Perl semantics). Without the
+        # has_parens guard, `Foo()` collapsed to the bareword class "Foo" and
+        # the `()` was dropped — e.g. Types::Standard's
+        # `Value()->inline_check('$val')` became `"Value"->inline_check(...)`
+        # → "Can't locate object method inline_check via package Value".
+        # Affects every `SomeType()->inline_check/coercion/...` in Type::Tiny.
+        if (defined($obj_node) && $obj_node->{"type"} == Perla::AST::N_CALL() && defined($obj_node->{"name"}) && scalar(@{$obj_node->{"args"}}) == 0
+            && !(defined($obj_node->{"has_parens"}) && $obj_node->{"has_parens"} == 1)) {
+            my str $cn = $obj_node->{"name"};
+            if (length($cn) > 0 && char_at($cn, 0) >= 65 && char_at($cn, 0) <= 90) {
+                $is_static_class = 1;
+                $class_name = $cn;
+            }
+        }
+        # Perl's isa returns 1 for true, "" (empty string) for false —
+        # NOT 0. Code that does `print $obj->isa('X')` or builds strings
+        # from the result depends on this convention.
+        #
+        # User-defined `sub isa` override: dispatch through the normal
+        # method machinery when the package has its own `isa` slot
+        # (i.e. a non-UNIVERSAL one). Without this, `\$obj->isa("X")`
+        # always called perla_isa_check directly, bypassing the user
+        # override and breaking classes that proxy isa for fake bases.
+        if ($is_static_class == 1) {
+            Perla::CodeGen::emit($cg, "({ StradaValue *__isa_res; ");
+            Perla::CodeGen::emit($cg, "PerlGlob *__isag = perla_glob_get(perla_stash_get_or_create(\"" . $class_name . "\"), \"isa\"); ");
+            Perla::CodeGen::emit($cg, "if (__isag && __isag->slots[PERLA_SLOT_CODE]) { ");
+            # User override: dispatch as a normal method call
+            Perla::CodeGen::emit($cg, "  StradaValue *__ia = strada_new_array(); StradaArray *__iav = strada_deref_array(__ia); ");
+            Perla::CodeGen::emit($cg, "  strada_array_push_take(__iav, strada_new_str(\"" . $class_name . "\")); ");
+            Perla::CodeGen::emit($cg, "  strada_array_push_take(__iav, ");
+            Perla::CodeGen::gen_expr($cg, $args->[0]);
+            Perla::CodeGen::emit($cg, "); __isa_res = perla_call_code(__isag->slots[PERLA_SLOT_CODE], __ia); strada_decref(__ia); ");
+            Perla::CodeGen::emit($cg, "} else { ");
+            Perla::CodeGen::emit($cg, "  char *__tc = strada_to_str(");
+            Perla::CodeGen::gen_expr($cg, $args->[0]);
+            Perla::CodeGen::emit($cg, "); int __r = perla_isa_check(\"" . $class_name . "\", __tc); free(__tc); ");
+            Perla::CodeGen::emit($cg, "  __isa_res = __r ? STRADA_MAKE_TAGGED_INT(1) : strada_new_str(\"\"); ");
+            Perla::CodeGen::emit($cg, "} __isa_res; })");
+        } else {
+            Perla::CodeGen::emit($cg, "({ StradaValue *__io = ");
+            Perla::CodeGen::gen_expr($cg, $node->{"object"});
+            Perla::CodeGen::emit($cg, "; const char *__bp = perla_blessed(__io); ");
+            Perla::CodeGen::emit($cg, "char *__cn = NULL; if (!__bp && __io && !STRADA_IS_TAGGED_INT(__io) && __io->type == STRADA_STR) __cn = strada_to_str(__io); ");
+            Perla::CodeGen::emit($cg, "const char *__ipkg = __bp ? __bp : (__cn ? __cn : \"\"); ");
+            Perla::CodeGen::emit($cg, "StradaValue *__ires; ");
+            Perla::CodeGen::emit($cg, "PerlGlob *__isag = __ipkg[0] ? perla_glob_get(perla_stash_get_or_create(__ipkg), \"isa\") : NULL; ");
+            Perla::CodeGen::emit($cg, "if (__isag && __isag->slots[PERLA_SLOT_CODE]) { ");
+            Perla::CodeGen::emit($cg, "  StradaValue *__ia = strada_new_array(); StradaArray *__iav = strada_deref_array(__ia); ");
+            Perla::CodeGen::emit($cg, "  strada_incref(__io); strada_array_push_take(__iav, __io); ");
+            Perla::CodeGen::emit($cg, "  strada_array_push_take(__iav, ");
+            Perla::CodeGen::gen_expr($cg, $args->[0]);
+            Perla::CodeGen::emit($cg, "); __ires = perla_call_code(__isag->slots[PERLA_SLOT_CODE], __ia); strada_decref(__ia); ");
+            Perla::CodeGen::emit($cg, "} else { ");
+            Perla::CodeGen::emit($cg, "  char *__tc = strada_to_str(");
+            Perla::CodeGen::gen_expr($cg, $args->[0]);
+            Perla::CodeGen::emit($cg, "); int __r = __ipkg[0] ? perla_isa_check(__ipkg, __tc) : 0; free(__tc); ");
+            Perla::CodeGen::emit($cg, "  __ires = __r ? STRADA_MAKE_TAGGED_INT(1) : strada_new_str(\"\"); ");
+            Perla::CodeGen::emit($cg, "} if (__cn) free(__cn); __ires; })");
+        }
+        return;
+    }
+    if ($method eq "can" && $argc >= 1) {
+        # Real Perl `can` returns a CODE ref, not a bool. Returning a
+        # tagged int (1/0) breaks any caller that does `$cref->(args)`
+        # on the result — Module::Runtime::use_module reached via
+        # Clone::Choose's `__PACKAGE__->can("clone")` is the canonical
+        # case. Route through perla_can_code which returns the actual
+        # value stored in the SLOT_CODE (a STRADA_STR sub-name, a
+        # CPOINTER for native impls, or a STRADA_REF closure) so
+        # `$u->("Storable")` dispatches the same way `&$u("Storable")`
+        # would on a real coderef.
+        #
+        # Static-class fast path: when the invocant is a bareword
+        # N_CALL with uppercase initial (e.g. `Foo->can(...)`), bake
+        # the class name as a literal C string. Without this, the
+        # bareword would route through the 0-arg lookup path and die
+        # under strict 'subs' since the class isn't a sub.
+        my scalar $can_obj = $node->{"object"};
+        my int $can_is_static = 0;
+        my str $can_class = "";
+        if (defined($can_obj) && $can_obj->{"type"} == Perla::AST::N_CALL()
+            && defined($can_obj->{"name"})
+            && (!defined($can_obj->{"args"}) || scalar(@{$can_obj->{"args"}}) == 0)
+            && !(defined($can_obj->{"has_parens"}) && $can_obj->{"has_parens"} == 1)) {
+            my str $cn = $can_obj->{"name"};
+            if (length($cn) > 0 && char_at($cn, 0) >= 65 && char_at($cn, 0) <= 90) {
+                $can_is_static = 1;
+                $can_class = $cn;
+            } elsif (length($cn) > 0 && Perla::CodeGen::Call::_resolve_sub($cg, $cn) eq "") {
+                # Lowercase bareword (e.g. `main`, `mypkg`) that ISN'T
+                # a registered sub: treat as class name. Perl exempts
+                # `bareword->method` from strict subs for any IDENT.
+                $can_is_static = 1;
+                $can_class = $cn;
+            }
+        }
+        if ($can_is_static == 1) {
+            Perla::CodeGen::emit($cg, "({ char *__mn = strada_to_str(");
+            Perla::CodeGen::gen_expr($cg, $args->[0]);
+            Perla::CodeGen::emit($cg, "); StradaValue *__r = perla_can_code(\"" . $can_class . "\", __mn); free(__mn); __r; })");
+            return;
+        }
+        Perla::CodeGen::emit($cg, "({ StradaValue *__co = ");
+        Perla::CodeGen::gen_expr($cg, $node->{"object"});
+        Perla::CodeGen::emit($cg, "; const char *__bp = perla_blessed(__co); ");
+        Perla::CodeGen::emit($cg, "char *__cn = NULL; if (!__bp && __co && !STRADA_IS_TAGGED_INT(__co) && __co->type == STRADA_STR) __cn = strada_to_str(__co); ");
+        Perla::CodeGen::emit($cg, "const char *__cpkg = __bp ? __bp : (__cn ? __cn : \"\"); ");
+        Perla::CodeGen::emit($cg, "char *__mn = strada_to_str(");
+        Perla::CodeGen::gen_expr($cg, $args->[0]);
+        Perla::CodeGen::emit($cg, "); StradaValue *__r = perla_can_code(__cpkg, __mn); free(__mn); if (__cn) free(__cn); __r; })");
+        return;
+    }
+
+    # Class->method() — static method call (e.g., LazyAccessor->new(...))
+    # Object is a bareword (N_CALL with no args, uppercase first letter).
+    # Skip this block when the method name is a variable (dynamic dispatch)
+    # — otherwise `Class->$method` baked the literal variable name into
+    # the C call as if it were the method name.
+    my int $is_dynamic_disp = 0;
+    if (defined($node->{"dynamic_method"}) && $node->{"dynamic_method"} == 1) {
+        $is_dynamic_disp = 1;
+    }
+    my scalar $obj_node = $node->{"object"};
+    if ($is_dynamic_disp == 0 && defined($obj_node) && $obj_node->{"type"} == Perla::AST::N_CALL() &&
+        (!defined($obj_node->{"args"}) || scalar(@{$obj_node->{"args"}}) == 0)) {
+        my str $class_name = $obj_node->{"name"};
+        # STDIN/STDOUT/STDERR as bareword invocant: build an on-the-fly
+        # STRADA_FILEHANDLE wrapper around the libc stream so the
+        # dispatch sees the right invocant type. We don't keep a global
+        # v_STDOUT (just an extern declaration, no actual symbol), so
+        # synthesize one here for the duration of the call.
+        if ($class_name eq "STDIN" || $class_name eq "STDOUT" || $class_name eq "STDERR") {
+            my str $stream = "stdout";
+            if ($class_name eq "STDIN") { $stream = "stdin"; }
+            if ($class_name eq "STDERR") { $stream = "stderr"; }
+            Perla::CodeGen::emit($cg, "({ StradaValue *__stdfh = strada_new_filehandle(" . $stream . "); ");
+            Perla::CodeGen::emit($cg, "StradaValue *__a = strada_new_array(); StradaArray *__av = strada_deref_array(__a); ");
+            Perla::CodeGen::emit($cg, "strada_incref(__stdfh); strada_array_push_take(__av, __stdfh); ");
+            Perla::CodeGen::Call::_gen_push_args($cg, $args, $argc);
+            Perla::CodeGen::emit($cg, "StradaValue *__mr = perla_method_dispatch(__stdfh, \"" . $method . "\", __a); ");
+            # Don't close the libc stream — clear the FILE* before decref
+            # so strada_close (on free) doesn't try to fclose stdin/out/err.
+            Perla::CodeGen::emit($cg, "if (__stdfh->type == STRADA_FILEHANDLE) __stdfh->value.fh = NULL; ");
+            Perla::CodeGen::emit($cg, "strada_decref(__stdfh); strada_decref(__a); __mr; })");
+            return;
+        }
+        if (length($class_name) > 0 && char_at($class_name, 0) >= 65 && char_at($class_name, 0) <= 90) {
+            # Check if method is defined in the class (direct call) or needs dispatch
+            my str $qname = $class_name . "::" . $method;
+            my int $has_direct = 0;
+            my scalar $subs_check = $cg->{"subs"};
+            if (defined($subs_check->{$qname})) { $has_direct = 1; }
+            if ($has_direct == 1) {
+                # Direct static call WITH a runtime override check. Real
+                # Perl always goes through the symbol table for method
+                # dispatch, so `*Foo::bar = sub {...}` after the fact
+                # MUST take effect. Without this check, perla bypasses
+                # the typeglob slot — `*{'Foo::method'} = sub { }` and
+                # similar monkey-patches silently no-op.
+                # Pattern: peek the glob's CODE slot. If it's been
+                # overridden (now a CLOSURE / CPOINTER, not the original
+                # STRADA_STR sub-name), call via perla_call_code. Else
+                # fall back to the direct C-symbol call (fast path).
+                my str $fname = Perla::CodeGen::sub_cname_q($qname);
+                Perla::CodeGen::emit($cg, "({ StradaValue *__a = strada_new_array(); StradaArray *__av = strada_deref_array(__a); ");
+                # push_take the fresh class-name string so its rc=1
+                # isn't leaked by push's incref + decref(__a) cycle.
+                Perla::CodeGen::emit($cg, "strada_array_push_take(__av, strada_new_str(\"" . $class_name . "\")); ");
+                Perla::CodeGen::Call::_gen_push_args($cg, $args, $argc);
+                Perla::CodeGen::emit($cg, "StradaValue *__mr; ");
+                # Cache the PerlGlob* per call site — pkg/method are
+                # compile-time constants and the glob's heap address is
+                # stable once allocated (only the stash entries[] array
+                # reallocs, not the glob structs). Eliminates the per-call
+                # O(n) stash-walk + glob-walk strcmp loop.
+                Perla::CodeGen::emit($cg, "{ static PerlGlob *__og_c = NULL; PerlGlob *__og = __og_c; ");
+                Perla::CodeGen::emit($cg, "  if (__builtin_expect(!__og, 0)) { __og = perla_glob_get_or_create(perla_stash_get_or_create(\"" . $class_name . "\"), \"" . $method . "\"); __og_c = __og; } ");
+                Perla::CodeGen::emit($cg, "  StradaValue *__os = __og->slots[PERLA_SLOT_CODE]; ");
+                Perla::CodeGen::emit($cg, "  if (__builtin_expect(__os && !STRADA_IS_TAGGED_INT(__os) ");
+                Perla::CodeGen::emit($cg, "      && (__os->type == STRADA_CLOSURE || __os->type == STRADA_CPOINTER ");
+                Perla::CodeGen::emit($cg, "          || (__os->type == STRADA_REF && __os->value.rv && !STRADA_IS_TAGGED_INT(__os->value.rv) ");
+                Perla::CodeGen::emit($cg, "              && (__os->value.rv->type == STRADA_CLOSURE || __os->value.rv->type == STRADA_CPOINTER))), 0)) { ");
+                Perla::CodeGen::emit($cg, "    __mr = perla_call_code(__os, __a); ");
+                Perla::CodeGen::emit($cg, "  } else { ");
+                Perla::CodeGen::emit($cg, "    __mr = " . $fname . "(__a); ");
+                Perla::CodeGen::emit($cg, "  } } strada_decref(__a); __mr; })");
+            } else {
+                # Method dispatch (inherited method)
+                Perla::CodeGen::emit($cg, "({ StradaValue *__a = strada_new_array(); StradaArray *__av = strada_deref_array(__a); ");
+                Perla::CodeGen::emit($cg, "strada_array_push_take(__av, strada_new_str(\"" . $class_name . "\")); ");
+                Perla::CodeGen::Call::_gen_push_args($cg, $args, $argc);
+                # The dispatch arg also passes a fresh class-name str — that's
+                # passed through perla_method_dispatch which doesn't take
+                # ownership, so it just leaks at the moment. The standard
+                # method_dispatch fix has to happen in perla_stash.c.
+                Perla::CodeGen::emit($cg, "StradaValue *__mr = perla_method_dispatch(strada_new_str(\"" . $class_name . "\"), \"" . $method . "\", __a); ");
+                Perla::CodeGen::emit($cg, "strada_decref(__a); __mr; })");
+            }
+            return;
+        }
+    }
+
+    # Dynamic method dispatch: $obj->$method_var — resolve at runtime.
+    # Two forms:
+    #   $obj->$var          -> method name is a plain scalar variable
+    #   $obj->${ EXPR }     -> method name is an arbitrary expression
+    # The parser records the variable in $method (for the simple form) or
+    # stashes the AST in $method_expr (for the braced form).
+    #
+    # In Perl, `$obj->$x(args)` has *two* meanings depending on what $x
+    # is: if $x is a string, it's a by-name method dispatch; if $x is a
+    # code ref (CODE/CLOSURE), Perl calls the code directly with $obj
+    # as the first arg (bypassing method lookup). YAML::Mo uses the
+    # code-ref form — `$self->$_new_error(@_)` where $_new_error is a
+    # closure. Without the ref check, strada_to_str(CLOSURE) stringifies
+    # to "CPOINTER(0x...)" and we dispatch by that bogus method name.
+    if (defined($node->{"dynamic_method"}) && $node->{"dynamic_method"} == 1) {
+        # `Class->$method` — when the object is a bareword class
+        # (N_CALL with no args), emit the class name as a literal
+        # string. Otherwise the bareword goes through gen_expr's
+        # sub-call path and trips strict 'subs'. Mirrors the same
+        # logic in the general method-call code path below.
+        my int $dyn_obj_is_bareword_class = 0;
+        my str $dyn_obj_class_lit = "";
+        my scalar $__dm_obj = $node->{"object"};
+        if (defined($__dm_obj) && $__dm_obj->{"type"} == Perla::AST::N_CALL()
+            && defined($__dm_obj->{"name"})
+            && (!defined($__dm_obj->{"args"}) || scalar(@{$__dm_obj->{"args"}}) == 0)) {
+            my str $bn = $__dm_obj->{"name"};
+            if (length($bn) > 0) {
+                my int $is_ident_shape = 1;
+                my int $ci = 0;
+                while ($ci < length($bn)) {
+                    my str $cc = substr($bn, $ci, 1);
+                    if (!(($cc ge "a" && $cc le "z") || ($cc ge "A" && $cc le "Z")
+                          || ($cc ge "0" && $cc le "9") || $cc eq "_" || $cc eq ":")) {
+                        $is_ident_shape = 0;
+                        $ci = length($bn);
+                    } else {
+                        $ci = $ci + 1;
+                    }
+                }
+                if ($is_ident_shape == 1 && Perla::CodeGen::Call::_resolve_sub($cg, $bn) eq "") {
+                    $dyn_obj_is_bareword_class = 1;
+                    $dyn_obj_class_lit = $bn;
+                }
+            }
+        }
+        Perla::CodeGen::emit($cg, "({ StradaValue *__obj = ");
+        if ($dyn_obj_is_bareword_class == 1) {
+            Perla::CodeGen::emit($cg, "strada_new_str(\"" . $dyn_obj_class_lit . "\")");
+        } else {
+            Perla::CodeGen::gen_expr($cg, $node->{"object"});
+        }
+        if (defined($node->{"method_expr"})) {
+            Perla::CodeGen::emit($cg, "; StradaValue *__mn = ");
+            Perla::CodeGen::gen_expr($cg, $node->{"method_expr"});
+            Perla::CodeGen::emit($cg, "; strada_incref(__mn); ");
+        } else {
+            # `$obj->$_` reads $_ via perla_dollar_underscore (the
+            # canonical $_ slot updated by foreach/map/grep/sort), not
+            # Perla::CodeGen::c_var("_") which is the unrelated file-scope v__ global.
+            # Required for `$obj->$_(...)  for qw/m1 m2/` idioms (e.g.
+            # DBIx::Class::Schema::clone line 1013).
+            my str $mn_var = ($method eq "_") ? "perla_dollar_underscore" : Perla::CodeGen::c_var($method);
+            Perla::CodeGen::emit($cg, "; StradaValue *__mn = " . $mn_var . "; if (__mn) strada_incref(__mn); ");
+        }
+        Perla::CodeGen::emit($cg, "StradaValue *__a = strada_new_array(); StradaArray *__av = strada_deref_array(__a); ");
+        Perla::CodeGen::emit($cg, "strada_array_push(__av, __obj); ");
+        Perla::CodeGen::Call::_gen_push_args($cg, $args, $argc);
+        Perla::CodeGen::emit($cg, "StradaValue *__mr; ");
+        # Detect code-ref form: plain CLOSURE/CPOINTER, or REF to those.
+        Perla::CodeGen::emit($cg, "int __is_code = 0; StradaValue *__code = __mn; ");
+        Perla::CodeGen::emit($cg, "if (__mn && !STRADA_IS_TAGGED_INT(__mn)) { ");
+        Perla::CodeGen::emit($cg, "  if (__mn->type == STRADA_CLOSURE || __mn->type == STRADA_CPOINTER) { __is_code = 1; } ");
+        Perla::CodeGen::emit($cg, "  else if (__mn->type == STRADA_REF && __mn->value.rv && !STRADA_IS_TAGGED_INT(__mn->value.rv) ");
+        Perla::CodeGen::emit($cg, "           && (__mn->value.rv->type == STRADA_CLOSURE || __mn->value.rv->type == STRADA_CPOINTER)) { __is_code = 1; __code = __mn->value.rv; } ");
+        Perla::CodeGen::emit($cg, "} ");
+        Perla::CodeGen::emit($cg, "if (__is_code) { __mr = perla_call_code(__code, __a); } ");
+        Perla::CodeGen::emit($cg, "else { char *__dyn_method = strada_to_str(__mn); __mr = perla_method_dispatch(__obj, __dyn_method, __a); free(__dyn_method); } ");
+        # Skip caller's incref — see comment near the main method dispatch.
+        Perla::CodeGen::emit($cg, "strada_decref(__mn); strada_decref(__a); __mr; })");
+        return;
+    }
+
+    # SUPER::method — call parent class method via runtime dispatch
+    if (length($method) > 7 && substr($method, 0, 7) eq "SUPER::") {
+        my str $super_method = substr($method, 7, length($method) - 7);
+        my int $super_obj_borrowed = Perla::CodeGen::expr_is_borrowed($node->{"object"});
+        Perla::CodeGen::emit($cg, "({ StradaValue *__obj = ");
+        Perla::CodeGen::gen_expr($cg, $node->{"object"});
+        Perla::CodeGen::emit($cg, "; StradaValue *__a = strada_new_array(); StradaArray *__av = strada_deref_array(__a); ");
+        if ($super_obj_borrowed == 1) {
+            Perla::CodeGen::emit($cg, "strada_array_push(__av, __obj); ");
+        } else {
+            Perla::CodeGen::emit($cg, "strada_array_push_take(__av, __obj); ");
+        }
+        Perla::CodeGen::Call::_gen_push_args($cg, $args, $argc);
+        Perla::CodeGen::emit($cg, "StradaValue *__mr = perla_super_dispatch(__obj, \"" . $cg->{"pkg"} . "\", \"" . $super_method . "\", __a); ");
+        Perla::CodeGen::emit($cg, "strada_decref(__a); __mr; })");
+        return;
+    }
+
+    my int $is_super = 0;
+    my str $super_method = $method;
+
+    # Try to dispatch: check blessed package + ISA hierarchy
+    my scalar $subs = $cg->{"subs"};
+    my array @sub_names = keys($subs);
+    my int $si = 0;
+    my int $found = 0;
+    my str $only_fname = "";
+    my str $only_qname = "";
+    my str $dispatch_method = $super_method;  # use stripped name for SUPER::
+
+    # First pass: count how many packages define this method
+    while ($si < scalar(@sub_names)) {
+        my str $qname = $sub_names[$si];
+        my str $suffix = "::" . $dispatch_method;
+        my int $slen = length($suffix);
+        my int $qlen = length($qname);
+        if ($qlen > $slen && substr($qname, $qlen - $slen, $slen) eq $suffix) {
+            my str $mpkg = substr($qname, 0, $qlen - $slen);
+            if ($is_super == 0 || $mpkg ne $cg->{"pkg"}) {
+                $found++;
+                $only_fname = Perla::CodeGen::sub_cname_q($qname);
+                $only_qname = $qname;
+            }
+        }
+        $si++;
+    }
+
+    # Optimization: if exactly one package defines this method, call directly (skip dispatch)
+    # BUT: skip optimization if receiver is a method call result (type unknown at compile time)
+    my int $receiver_is_method = 0;
+    if (defined($node->{"object"}) && ($node->{"object"}->{"type"} == Perla::AST::N_METHOD() || $node->{"object"}->{"type"} == Perla::AST::N_CALL())) {
+        $receiver_is_method = 1;
+    }
+    if ($found == 1 && $is_super == 0 && $receiver_is_method == 0 && 0) {
+        # NOTE: __direct method dispatch disabled — runtime stubs registered via
+        # perla_code_set need perla_method_dispatch to be found. Direct calls
+        # bypass the stash and call the compiled version, ignoring overrides.
+        my scalar $mpinfo = $cg->{"sub_params"}->{$only_qname};
+        if (defined($mpinfo) && $mpinfo->{"arity"} == $argc + 1 && Perla::CodeGen::Predicate::args_are_simple($args, $argc) == 1) {
+            # Direct-arg call: no array allocation at all
+            Perla::CodeGen::emit($cg, "({ StradaValue *__obj = ");
+            Perla::CodeGen::gen_expr($cg, $node->{"object"});
+            Perla::CodeGen::emit($cg, "; " . $only_fname . "__direct(__obj");
+            my int $ai = 0;
+            while ($ai < $argc) {
+                Perla::CodeGen::emit($cg, ", ");
+                Perla::CodeGen::gen_expr($cg, $args->[$ai]);
+                $ai++;
+            }
+            # Trailing perla_args_full = NULL (build from named params).
+            Perla::CodeGen::emit($cg, ", NULL); })");
+        } else if ($argc == 0) {
+            # Single-package, no extra args: stack-allocated 1-element array.
+            # stack_args1_init incref's __obj (mirrors heap-array push so
+            # `shift @_` inside the callee doesn't underflow refcount).
+            # Post-call: decref only the elements still in the array
+            # (matches what strada_decref(heap_array) would have done by
+            # walking [head, head+size) on free) — if the callee shifted,
+            # size=0 and the element is now owned by the callee's local,
+            # which will decref via its own scope cleanup.
+            Perla::CodeGen::emit($cg, "({ StradaValue *__obj = ");
+            Perla::CodeGen::gen_expr($cg, $node->{"object"});
+            Perla::CodeGen::emit($cg, "; StradaStackArgs1 __sa; strada_stack_args1_init(&__sa, __obj); ");
+            Perla::CodeGen::emit($cg, "StradaValue *__sa_rv = " . $only_fname . "(&__sa.sv); ");
+            Perla::CodeGen::emit($cg, "for (size_t __sai = 0; __sai < __sa.av.size; __sai++) { StradaValue *__sae = __sa.av.elements[__sa.av.head + __sai]; if (__sae && !STRADA_IS_TAGGED_INT(__sae)) strada_decref(__sae); } __sa_rv; })");
+        } else {
+            # Single-package, with extra args: need heap array
+            Perla::CodeGen::emit($cg, "({ StradaValue *__obj = ");
+            Perla::CodeGen::gen_expr($cg, $node->{"object"});
+            Perla::CodeGen::emit($cg, "; StradaValue *__a = strada_new_array(); StradaArray *__av = strada_deref_array(__a); ");
+            Perla::CodeGen::emit($cg, "strada_array_push(__av, __obj); ");
+            Perla::CodeGen::Call::_gen_push_args($cg, $args, $argc);
+            Perla::CodeGen::emit($cg, "StradaValue *__mr = " . $only_fname . "(__a); strada_incref(__mr); strada_decref(__a); __mr; })");
+        }
+        return;
+    }
+
+    # Build args array with $self as first element (multi-dispatch case).
+    # Force scalar context around the receiver expression: if the receiver
+    # is itself a method/call (i.e. `$x->A->B`), A's return is being USED
+    # as B's invocant, which is scalar context in Perl. Without this save/
+    # set/restore, A inherits the outer statement's want_list (often -1 /
+    # void) and wantarray inside A returns undef — DBIC's `->search`
+    # throws "->search is *not* a mutator, calling it in void context".
+    # Use push_take for owned invocants (method chain: `$x->A->B`, the
+    # A result is owned and should transfer its ref to __a, not get
+    # incref'd). For variable invocants ($obj->method, $self->method),
+    # the variable retains its slot ref and we incref via push.
+    my int $obj_borrowed = Perla::CodeGen::expr_is_borrowed($node->{"object"});
+    # Bareword-as-class-name shortcut: `main->method`, `Foo->method`,
+    # `Some::Pkg->method` etc — the parser left the object as an N_CALL
+    # with no args. Evaluating it as a sub call trips strict 'subs' for
+    # the unregistered bareword (perl exempts these because of the `->`
+    # context). Emit the name as a literal string so the method dispatcher
+    # treats it as a class name (perla_method_dispatch already accepts a
+    # STRADA_STR class-name invocant).
+    my int $obj_is_bareword_class = 0;
+    my str $obj_class_lit = "";
+    my scalar $__mc_obj = $node->{"object"};
+    if (defined($__mc_obj) && $__mc_obj->{"type"} == Perla::AST::N_CALL()
+        && defined($__mc_obj->{"name"})
+        && (!defined($__mc_obj->{"args"}) || scalar(@{$__mc_obj->{"args"}}) == 0)) {
+        my str $bn = $__mc_obj->{"name"};
+        # Only IDENT-shaped names (letters/digits/_/::). Skip anything
+        # that's already a registered sub (those should dispatch normally).
+        if (length($bn) > 0) {
+            my int $is_ident_shape = 1;
+            my int $ci = 0;
+            while ($ci < length($bn)) {
+                my str $cc = substr($bn, $ci, 1);
+                if (!(($cc ge "a" && $cc le "z") || ($cc ge "A" && $cc le "Z")
+                      || ($cc ge "0" && $cc le "9") || $cc eq "_" || $cc eq ":")) {
+                    $is_ident_shape = 0;
+                    $ci = length($bn);
+                } else {
+                    $ci = $ci + 1;
+                }
+            }
+            if ($is_ident_shape == 1 && Perla::CodeGen::Call::_resolve_sub($cg, $bn) eq "") {
+                # Exclude known builtins that take no args / are named
+                # unaries: `shift->method`, `pop->method`,
+                # `caller->method`, etc. should actually call the
+                # builtin and use the return as invocant — not treat
+                # the builtin's name as a bareword class. Without this,
+                # `sub throw { die shift->new(@_) }` died because
+                # `shift` was bound as the class string.
+                if ($bn eq "shift" || $bn eq "pop" || $bn eq "time"
+                    || $bn eq "caller" || $bn eq "wantarray"
+                    || $bn eq "fileno" || $bn eq "eof"
+                    || $bn eq "ref" || $bn eq "defined"
+                    || $bn eq "scalar" || $bn eq "blessed"
+                    || $bn eq "reftype" || $bn eq "length") {
+                    # Skip — let the call evaluate normally.
+                } else {
+                    $obj_is_bareword_class = 1;
+                    $obj_class_lit = $bn;
+                }
+            }
+        }
+    }
+    # Stack-allocated args wrapper for the single-arg case ($obj->method()
+    # with no extra args). Saves the per-call heap array alloc + push
+    # incref + decref-walk cost. Only safe when the callee can't escape
+    # @_ as a REF outliving the call — the receivers we route here
+    # (bench_oop `$c->increment()` is the canonical case) always
+    # take @_ as a borrowed accessor for $_[0]. Pkg-bareword-class
+    # invocants stay on the heap-args path so the just-malloc'd
+    # class-name string can transfer ownership cleanly.
+    my int $use_stack_args = 0;
+    if ($argc == 0 && $obj_is_bareword_class == 0) {
+        $use_stack_args = 1;
+    }
+    Perla::CodeGen::emit($cg, "({ StradaValue *__obj = ({ int __sav_wl_obj = __perla_want_list; __perla_want_list = 0; StradaValue *__inner_obj = ");
+    if ($obj_is_bareword_class == 1) {
+        Perla::CodeGen::emit($cg, "strada_new_str(\"" . $obj_class_lit . "\")");
+    } else {
+        Perla::CodeGen::gen_expr($cg, $node->{"object"});
+    }
+    if ($use_stack_args == 1) {
+        # Stack args path — no heap array, no push/decref dance. The
+        # wrapper is refcount=INT_MAX so any incidental incref/decref
+        # by the callee is a no-op.
+        Perla::CodeGen::emit($cg, "; __perla_want_list = __sav_wl_obj; __inner_obj; }); StradaStackArgs1 __sa; strada_stack_args1_init(&__sa, __obj); ");
+    } else {
+        Perla::CodeGen::emit($cg, "; __perla_want_list = __sav_wl_obj; __inner_obj; }); StradaValue *__a = strada_new_array(); StradaArray *__av = strada_deref_array(__a); ");
+        if ($obj_borrowed == 1) {
+            Perla::CodeGen::emit($cg, "strada_array_push(__av, __obj); ");
+        } else {
+            Perla::CodeGen::emit($cg, "strada_array_push_take(__av, __obj); ");
+        }
+        Perla::CodeGen::Call::_gen_push_args($cg, $args, $argc);
+    }
+
+    # Multiple packages define this method — full dispatch
+    Perla::CodeGen::emit($cg, "StradaValue *__result = NULL; int __dispatched = 0; ");
+    Perla::CodeGen::emit($cg, "const char *__pkg = perla_blessed(__obj); ");
+
+    # First pass: assign branch IDs and emit all static cache decls
+    # together BEFORE the if/elseif chain. Mixing `static X = NULL;`
+    # declarations between if-branches is illegal C (`else without a
+    # previous if`); group them up front.
+    if (!defined($cg->{"dispatch_branch_counter"})) {
+        $cg->{"dispatch_branch_counter"} = 0;
+    }
+    my array @br_ids = ();
+    my array @br_pkgs = ();
+    my array @br_qnames = ();
+    $si = 0;
+    while ($si < scalar(@sub_names)) {
+        my str $qname = $sub_names[$si];
+        my str $suffix = "::" . $dispatch_method;
+        my int $slen = length($suffix);
+        my int $qlen = length($qname);
+        if ($qlen > $slen && substr($qname, $qlen - $slen, $slen) eq $suffix) {
+            my str $pkg = substr($qname, 0, $qlen - $slen);
+            if (!($is_super == 1 && $pkg eq $cg->{"pkg"})
+                && !exists($cg->{"moose_pkgs"}->{$pkg})) {
+                my int $br_n = $cg->{"dispatch_branch_counter"};
+                $cg->{"dispatch_branch_counter"} = $br_n + 1;
+                push(@br_ids, $br_n);
+                push(@br_pkgs, $pkg);
+                push(@br_qnames, $qname);
+                Perla::CodeGen::emit($cg, "static const char *__pkg_c_" . $br_n . " = NULL; ");
+                Perla::CodeGen::emit($cg, "static PerlGlob *__og_c_" . $br_n . " = NULL; ");
+            }
+        }
+        $si++;
+    }
+
+    $si = 0;
+    $found = 0;
+    while ($si < scalar(@br_ids)) {
+        my int $br_n = $br_ids[$si];
+        my str $pkg = $br_pkgs[$si];
+        my str $qname = $br_qnames[$si];
+        my str $fname = Perla::CodeGen::sub_cname_q($qname);
+        # Already filtered by first pass; emit branches in order.
+            my str $pkg_c_var = "__pkg_c_" . $br_n;
+            my str $og_c_var = "__og_c_" . $br_n;
+            my str $cond = "__pkg && (__pkg == " . $pkg_c_var . " || (!" . $pkg_c_var . " && strcmp(__pkg, \"" . $pkg . "\") == 0))";
+            my str $branch_kw = "if";
+            if ($found > 0) { $branch_kw = "else if"; }
+            Perla::CodeGen::emit($cg, $branch_kw . " (" . $cond . ") { ");
+            Perla::CodeGen::emit($cg, "if (__builtin_expect(!" . $pkg_c_var . ", 0)) " . $pkg_c_var . " = __pkg; ");
+            Perla::CodeGen::emit($cg, "PerlGlob *__og = " . $og_c_var . "; ");
+            Perla::CodeGen::emit($cg, "if (__builtin_expect(!__og, 0)) { __og = perla_glob_get_or_create(perla_stash_get_or_create(\"" . $pkg . "\"), \"" . $dispatch_method . "\"); " . $og_c_var . " = __og; } ");
+            Perla::CodeGen::emit($cg, "StradaValue *__os = __og->slots[PERLA_SLOT_CODE]; ");
+            Perla::CodeGen::emit($cg, "if (__builtin_expect(__os && !STRADA_IS_TAGGED_INT(__os) ");
+            Perla::CodeGen::emit($cg, "    && (__os->type == STRADA_CLOSURE || __os->type == STRADA_CPOINTER ");
+            Perla::CodeGen::emit($cg, "        || (__os->type == STRADA_REF && __os->value.rv && !STRADA_IS_TAGGED_INT(__os->value.rv) ");
+            Perla::CodeGen::emit($cg, "            && (__os->value.rv->type == STRADA_CLOSURE || __os->value.rv->type == STRADA_CPOINTER))), 0)) { ");
+            if ($use_stack_args == 1) {
+                Perla::CodeGen::emit($cg, "  __result = perla_call_code(__os, &__sa.sv); ");
+                Perla::CodeGen::emit($cg, "} else { __result = " . $fname . "(&__sa.sv); } __dispatched = 1; } ");
+            } else {
+                Perla::CodeGen::emit($cg, "  __result = perla_call_code(__os, __a); ");
+                Perla::CodeGen::emit($cg, "} else { __result = " . $fname . "(__a); } __dispatched = 1; } ");
+            }
+            $found++;
+        $si++;
+    }
+    if ($found > 0) {
+        $si = 0;
+        while ($si < scalar(@sub_names)) {
+            my str $qname = $sub_names[$si];
+            my str $suffix = "::" . $dispatch_method;
+            my int $slen = length($suffix);
+            my int $qlen = length($qname);
+            if ($qlen > $slen && substr($qname, $qlen - $slen, $slen) eq $suffix) {
+                my str $pkg = substr($qname, 0, $qlen - $slen);
+                if ($is_super == 1 && $pkg eq $cg->{"pkg"}) { $si++; next; }
+                my str $fname = Perla::CodeGen::sub_cname_q($qname);
+                # Skip isa-based fallback: it can call parent method instead of child's override.
+                # perla_method_dispatch handles inheritance correctly.
+            }
+            $si++;
+        }
+        # Last resort: use runtime method dispatch instead of static fallback
+        # Static fallback can cause infinite recursion when the same method name
+        # exists in both parent and child classes (e.g., search -> rs -> search)
+        if ($use_stack_args == 1) {
+            Perla::CodeGen::emit($cg, "if (!__dispatched) { __result = perla_method_dispatch(__obj, \"" . $dispatch_method . "\", &__sa.sv); __dispatched = 1; } ");
+        } else {
+            Perla::CodeGen::emit($cg, "if (!__dispatched) { __result = perla_method_dispatch(__obj, \"" . $dispatch_method . "\", __a); __dispatched = 1; } ");
+        }
+    }
+    # Runtime method dispatch fallback: check the stash for methods not known at compile time
+    # (e.g., from precompiled modules loaded via .o files)
+    if ($found == 0) {
+        if ($use_stack_args == 1) {
+            Perla::CodeGen::emit($cg, "if (!__dispatched) { __result = perla_method_dispatch(__obj, \"" . $dispatch_method . "\", &__sa.sv); __dispatched = 1; } ");
+        } else {
+            Perla::CodeGen::emit($cg, "if (!__dispatched) { __result = perla_method_dispatch(__obj, \"" . $dispatch_method . "\", __a); __dispatched = 1; } ");
+        }
+    }
+    # AUTOLOAD fallback: if no method was dispatched, try AUTOLOAD
+    if ($use_stack_args == 1) {
+        Perla::CodeGen::emit($cg, "if (!__dispatched && __pkg) { StradaValue *__al = perla_try_autoload(__pkg, \"" . $dispatch_method . "\", __obj, &__sa.sv); if (__al) { __result = __al; __dispatched = 1; } } ");
+    } else {
+        Perla::CodeGen::emit($cg, "if (!__dispatched && __pkg) { StradaValue *__al = perla_try_autoload(__pkg, \"" . $dispatch_method . "\", __obj, __a); if (__al) { __result = __al; __dispatched = 1; } } ");
+    }
+    Perla::CodeGen::emit($cg, "if (!__result) __result = strada_new_undef(); ");
+    # @_ aliasing write-back for method calls. Same shape as plain sub
+    # calls — when an arg is a bare N_SCALAR_VAR, propagate any change
+    # the callee made to the slot back to the caller's variable. Index
+    # 0 of __a is the object, so user args start at 1.
+    #
+    # SKIP the whole writeback when any arg is a FLATTENING expression
+    # (%hash, @arr, %{$ref}, @{$ref}, a list-returning call, slice, range,
+    # qw, or a non-ref anon-list): such an arg occupies a variable number
+    # of slots, so the `$mwb_ai + 1` slot math is wrong for every arg after
+    # it. Worse, the callee's `my $self = shift` mutates the SHARED arg
+    # array, sliding later slots down — so a scalar-var arg's writeback
+    # reads a flattened value and clobbers the caller's lexical. Concrete
+    # victim: Type::Library::add_type's
+    # `'Type::Tiny'->new( library => $class, %{ $_[0] } )` overwrote $class
+    # with "name" (the typedef's first key), so every Type::Tiny type sub
+    # installed in package "name" instead of the library.
+    my int $mwb_has_flatten = 0;
+    {
+        my int $mwb_fi = 0;
+        while ($mwb_fi < $argc) {
+            my scalar $mwb_fa = $args->[$mwb_fi];
+            if (defined($mwb_fa)) {
+                my int $mwb_ft = $mwb_fa->{"type"};
+                if ($mwb_ft == Perla::AST::N_ARRAY_VAR()
+                    || $mwb_ft == Perla::AST::N_HASH_VAR()
+                    || $mwb_ft == Perla::AST::N_DEREF_ARRAY()
+                    || $mwb_ft == Perla::AST::N_DEREF_HASH()
+                    || $mwb_ft == Perla::AST::N_CALL()
+                    || $mwb_ft == Perla::AST::N_METHOD()
+                    || $mwb_ft == Perla::AST::N_MAP()
+                    || $mwb_ft == Perla::AST::N_GREP()
+                    || $mwb_ft == Perla::AST::N_SORT()
+                    || $mwb_ft == Perla::AST::N_RANGE()
+                    || $mwb_ft == Perla::AST::N_QWORD()
+                    || $mwb_ft == Perla::AST::N_ARRAY_SLICE()
+                    || $mwb_ft == Perla::AST::N_HASH_SLICE()
+                    || ($mwb_ft == Perla::AST::N_ANON_ARRAY()
+                        && !(defined($mwb_fa->{"is_ref"}) && $mwb_fa->{"is_ref"} == 1))) {
+                    $mwb_has_flatten = 1;
+                    last;
+                }
+            }
+            $mwb_fi = $mwb_fi + 1;
+        }
+    }
+    my int $mwb_ai = 0;
+    while ($mwb_has_flatten == 0 && $mwb_ai < $argc) {
+        my scalar $mwb_arg = $args->[$mwb_ai];
+        if (defined($mwb_arg) && $mwb_arg->{"type"} == Perla::AST::N_SCALAR_VAR()
+            && defined($mwb_arg->{"name"}) && length($mwb_arg->{"name"}) > 0
+            && index($mwb_arg->{"name"}, "::") < 0
+            && $mwb_arg->{"name"} ne "_" && $mwb_arg->{"name"} ne "@") {
+            my str $mwb_name = $mwb_arg->{"name"};
+            my int $mwb_is_ro = 0;
+            if (length($mwb_name) == 1) {
+                my int $mwb_c0 = char_at($mwb_name, 0);
+                if ($mwb_c0 >= 49 && $mwb_c0 <= 57) { $mwb_is_ro = 1; }
+                if ($mwb_name eq "&" || $mwb_name eq "`" || $mwb_name eq "'" || $mwb_name eq "+") { $mwb_is_ro = 1; }
+            }
+            if ($mwb_is_ro == 0) {
+                my str $mwb_cv = Perla::CodeGen::c_var($mwb_name);
+                # Arg slot in __a is at position $mwb_ai + 1 (slot 0 is __obj).
+                my int $mwb_slot = $mwb_ai + 1;
+                # `__av->head == 0` — the callee left @_ unshifted. __a is a
+                # fresh array (head 0) before dispatch; a callee `my $self =
+                # shift` slides head forward, after which slot $mwb_slot reads
+                # the wrong (slid) element. Mirrors the plain-sub-call
+                # writeback's __a_head_before guard.
+                Perla::CodeGen::emit($cg, "if (__av && __av->head == 0 && __av->size > " . $mwb_slot . ") { ");
+                Perla::CodeGen::emit($cg, "StradaValue *__mwb" . $mwb_ai . " = strada_array_get(__av, " . $mwb_slot . "); ");
+                Perla::CodeGen::emit($cg, "if (__mwb" . $mwb_ai . " != " . $mwb_cv . ") { ");
+                Perla::CodeGen::emit($cg, "if (__mwb" . $mwb_ai . ") strada_incref(__mwb" . $mwb_ai . "); ");
+                Perla::CodeGen::emit($cg, "strada_decref(" . $mwb_cv . "); " . $mwb_cv . " = __mwb" . $mwb_ai . "; } } ");
+            }
+        }
+        $mwb_ai = $mwb_ai + 1;
+    }
+    # Skip caller's incref — the callee's conditional incref (for borrowed
+    # returns like $_[0]) already transferred ownership. The strada_decref(__a)
+    # below balances push's incref for borrowed invocants (push_take for
+    # owned invocants already consumed the ref). Net: __result has exactly
+    # one logical owner.
+    if ($use_stack_args == 1) {
+        # Stack-args path: SV/AV are stack-resident (refcount=INT_MAX),
+        # but stack_args1_init incref'd __obj. Walk the post-call array
+        # range [head, head+size) and decref the elements still there
+        # — matches what strada_decref on a heap-allocated args array
+        # would have done by walking [head, head+size) on free. If the
+        # callee shifted, size=0 and ownership moved to the callee's
+        # local; otherwise we decref to balance init's incref.
+        Perla::CodeGen::emit($cg, "for (size_t __sai = 0; __sai < __sa.av.size; __sai++) { StradaValue *__sae = __sa.av.elements[__sa.av.head + __sai]; if (__sae && !STRADA_IS_TAGGED_INT(__sae)) strada_decref(__sae); } __result; })");
+    } else {
+        Perla::CodeGen::emit($cg, "strada_decref(__a); __result; })");
+    }
+}
+
+
+# --- Helper: format body lexical bridge ---
+# Scan a format body string for `$IDENT` references in value lines and
+# return the unique list of identifiers that are file-scope lexicals.
+# Value lines are the lines following any picture line containing `@`
+# or `^` fields. Only simple `$IDENT` references count (no `$h{k}`,
+# `$a[N]`, `$_->{x}`, etc. — those keep flowing through the runtime
+# parser, which already handles `$_`-chains and stash lookups).
+# Collect format-body value-line lex refs that are SUB-LOCAL — declared
+# in the current scope (declared_vars) but NOT in file_scope_vars or
+# our_vars. These need inline sync at every write site since the
+# file-scope sync helper can't `extern` stack-allocated lexicals.
+func _collect_format_sub_lex_refs(scalar $cg, str $body) array {
+    my array @refs = ();
+    my hash %seen = ();
+    my int $blen = length($body);
+    my int $i = 0;
+    my int $expect_values = 0;
+    while ($i < $blen) {
+        my int $eol = $i;
+        while ($eol < $blen && substr($body, $eol, 1) ne "\n") { $eol = $eol + 1; }
+        my str $line = substr($body, $i, $eol - $i);
+        my int $lln = length($line);
+        if ($expect_values == 1) {
+            my int $j = 0;
+            while ($j < $lln) {
+                my str $ch = substr($line, $j, 1);
+                if ($ch eq "\$" && $j + 1 < $lln) {
+                    my str $nc = substr($line, $j + 1, 1);
+                    if (($nc ge "a" && $nc le "z") || ($nc ge "A" && $nc le "Z") || $nc eq "_") {
+                        my int $ks = $j + 1;
+                        my int $ke = $ks;
+                        while ($ke < $lln) {
+                            my str $kc = substr($line, $ke, 1);
+                            if (($kc ge "a" && $kc le "z") || ($kc ge "A" && $kc le "Z") || ($kc ge "0" && $kc le "9") || $kc eq "_") {
+                                $ke = $ke + 1;
+                            } else { last; }
+                        }
+                        my str $name = substr($line, $ks, $ke - $ks);
+                        my int $is_special = 0;
+                        if ($name eq "_") { $is_special = 1; }
+                        if ($is_special == 0 && !defined($seen{$name})) {
+                            my int $is_file = 0;
+                            if (defined($cg->{"file_scope_vars"}) && defined($cg->{"file_scope_vars"}->{$name})) {
+                                $is_file = 1;
+                            }
+                            my int $is_sub_local = 0;
+                            if ($is_file == 0
+                                && defined($cg->{"declared_vars"})
+                                && defined($cg->{"declared_vars"}->{"v_" . $name})) {
+                                $is_sub_local = 1;
+                            }
+                            if ($is_sub_local == 1) {
+                                push(@refs, $name);
+                                $seen{$name} = 1;
+                            }
+                        }
+                        $j = $ke;
+                        next;
+                    }
+                }
+                $j = $j + 1;
+            }
+            $expect_values = 0;
+        } else {
+            my int $j = 0;
+            my int $has_field = 0;
+            while ($j < $lln) {
+                my str $cc = substr($line, $j, 1);
+                if ($cc eq "@" || $cc eq "^") {
+                    if ($j + 1 < $lln) {
+                        my str $nx = substr($line, $j + 1, 1);
+                        if ($nx eq "<" || $nx eq ">" || $nx eq "|" || $nx eq "#" || $nx eq "." || $nx eq "*") {
+                            $has_field = 1; last;
+                        }
+                    }
+                }
+                $j = $j + 1;
+            }
+            if ($has_field == 1) { $expect_values = 1; }
+        }
+        $i = $eol + 1;
+    }
+    return @refs;
+}
+
+func _collect_format_lex_refs(scalar $cg, str $body) array {
+    my array @refs = ();
+    my hash %seen = ();
+    my int $blen = length($body);
+    my int $i = 0;
+    my int $expect_values = 0;
+    while ($i < $blen) {
+        # Find end of line
+        my int $eol = $i;
+        while ($eol < $blen && substr($body, $eol, 1) ne "\n") { $eol = $eol + 1; }
+        my str $line = substr($body, $i, $eol - $i);
+        my int $lln = length($line);
+        if ($expect_values == 1) {
+            # Scan value line for `$IDENT`
+            my int $j = 0;
+            while ($j < $lln) {
+                my str $ch = substr($line, $j, 1);
+                if ($ch eq "\$" && $j + 1 < $lln) {
+                    my str $nc = substr($line, $j + 1, 1);
+                    if (($nc ge "a" && $nc le "z") || ($nc ge "A" && $nc le "Z") || $nc eq "_") {
+                        # Read ident
+                        my int $ks = $j + 1;
+                        my int $ke = $ks;
+                        while ($ke < $lln) {
+                            my str $kc = substr($line, $ke, 1);
+                            if (($kc ge "a" && $kc le "z") || ($kc ge "A" && $kc le "Z") || ($kc ge "0" && $kc le "9") || $kc eq "_") {
+                                $ke = $ke + 1;
+                            } else { last; }
+                        }
+                        my str $name = substr($line, $ks, $ke - $ks);
+                        # Skip special vars handled directly by the runtime
+                        # value parser ($_, $/, $\, etc.) — bridging them
+                        # to a stash slot would shadow the runtime's
+                        # global-mirror lookup. $_ in particular is
+                        # served by perla_dollar_underscore, not v__.
+                        my int $is_special = 0;
+                        if ($name eq "_") { $is_special = 1; }
+                        if ($is_special == 0 && !defined($seen{$name})) {
+                            my int $is_lex = 0;
+                            if (defined($cg->{"file_scope_vars"}) && defined($cg->{"file_scope_vars"}->{$name})) {
+                                $is_lex = 1;
+                            }
+                            # `our`/package vars also have a file-static C
+                            # local `v_NAME`, but assigning to them updates
+                            # only that local — NOT the stash glob slot the
+                            # format value-parser reads. Bridge them through
+                            # the same mangled-name sync so reassigned our-vars
+                            # render (the classic `our` format-report idiom).
+                            if ($is_lex == 0 && defined($cg->{"our_vars"}) && defined($cg->{"our_vars"}->{$name})) {
+                                $is_lex = 1;
+                            }
+                            if ($is_lex == 1) {
+                                push(@refs, $name);
+                                $seen{$name} = 1;
+                            }
+                        }
+                        $j = $ke;
+                        next;
+                    }
+                }
+                $j = $j + 1;
+            }
+            $expect_values = 0;
+        } else {
+            # Picture line? Has `@` or `^` field markers?
+            my int $j = 0;
+            my int $has_field = 0;
+            while ($j < $lln) {
+                my str $cc = substr($line, $j, 1);
+                if ($cc eq "@" || $cc eq "^") {
+                    if ($j + 1 < $lln) {
+                        my str $nx = substr($line, $j + 1, 1);
+                        if ($nx eq "<" || $nx eq ">" || $nx eq "|" || $nx eq "#" || $nx eq "." || $nx eq "*") {
+                            $has_field = 1; last;
+                        }
+                    }
+                }
+                $j = $j + 1;
+            }
+            if ($has_field == 1) { $expect_values = 1; }
+        }
+        $i = $eol + 1;
+    }
+    return @refs;
+}
+
+# Rewrite a format body in place: replace each `$IDENT` reference in a
+# value line with `$__perla_lex_IDENT` if IDENT is in the lex-refs list.
+# Picture lines stay untouched. Returns the new body string.
+func _rewrite_format_body_for_lex(str $body, scalar $refs_aref) str {
+    my array @refs = @{$refs_aref};
+    if (scalar(@refs) == 0) { return $body; }
+    my hash %ref_set = ();
+    my int $ri = 0;
+    while ($ri < scalar(@refs)) {
+        $ref_set{$refs[$ri]} = 1;
+        $ri = $ri + 1;
+    }
+    my str $out = "";
+    my int $blen = length($body);
+    my int $i = 0;
+    my int $in_values = 0;
+    while ($i < $blen) {
+        my int $eol = $i;
+        while ($eol < $blen && substr($body, $eol, 1) ne "\n") { $eol = $eol + 1; }
+        my str $line = substr($body, $i, $eol - $i);
+        my int $lln = length($line);
+        if ($in_values == 1) {
+            # Rewrite each `$IDENT` if IDENT in ref_set
+            my str $rline = "";
+            my int $j = 0;
+            while ($j < $lln) {
+                my str $ch = substr($line, $j, 1);
+                if ($ch eq "\$" && $j + 1 < $lln) {
+                    my str $nc = substr($line, $j + 1, 1);
+                    if (($nc ge "a" && $nc le "z") || ($nc ge "A" && $nc le "Z") || $nc eq "_") {
+                        my int $ks = $j + 1;
+                        my int $ke = $ks;
+                        while ($ke < $lln) {
+                            my str $kc = substr($line, $ke, 1);
+                            if (($kc ge "a" && $kc le "z") || ($kc ge "A" && $kc le "Z") || ($kc ge "0" && $kc le "9") || $kc eq "_") {
+                                $ke = $ke + 1;
+                            } else { last; }
+                        }
+                        my str $name = substr($line, $ks, $ke - $ks);
+                        if (defined($ref_set{$name})) {
+                            $rline = $rline . "\$__perla_lex_" . $name;
+                        } else {
+                            $rline = $rline . "\$" . $name;
+                        }
+                        $j = $ke;
+                        next;
+                    }
+                }
+                $rline = $rline . $ch;
+                $j = $j + 1;
+            }
+            $out = $out . $rline;
+            $in_values = 0;
+        } else {
+            $out = $out . $line;
+            # Detect picture line
+            my int $j = 0;
+            my int $has_field = 0;
+            while ($j < $lln) {
+                my str $cc = substr($line, $j, 1);
+                if ($cc eq "@" || $cc eq "^") {
+                    if ($j + 1 < $lln) {
+                        my str $nx = substr($line, $j + 1, 1);
+                        if ($nx eq "<" || $nx eq ">" || $nx eq "|" || $nx eq "#" || $nx eq "." || $nx eq "*") {
+                            $has_field = 1; last;
+                        }
+                    }
+                }
+                $j = $j + 1;
+            }
+            if ($has_field == 1) { $in_values = 1; }
+        }
+        if ($eol < $blen) { $out = $out . "\n"; }
+        $i = $eol + 1;
+    }
+    return $out;
+}
