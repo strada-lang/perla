@@ -895,12 +895,15 @@ func generate(scalar $ast) str {
     my int $li = 0;
     while ($li < scalar(@lines)) {
         my str $ln = $lines[$li];
+        # Hoist length() — a line can be a huge (529KB+) string literal; see
+        # the $__fln_len note in the function-body scan below.
+        my int $__ln_len = length($ln);
         # Track declarations: "static StradaValue *v_NAME" or "StradaValue *v_NAME"
         my int $dp = index($ln, "StradaValue *v_");
         while ($dp >= 0) {
             my int $vs = $dp + 13;
             my int $ve = $vs;
-            while ($ve < length($ln)) {
+            while ($ve < $__ln_len) {
                 my str $vc = substr($ln, $ve, 1);
                 if (($vc ge "a" && $vc le "z") || ($vc ge "A" && $vc le "Z") || ($vc ge "0" && $vc le "9") || $vc eq "_") { $ve++; } else { last; }
             }
@@ -911,7 +914,7 @@ func generate(scalar $ast) str {
         my int $up = index($ln, "v_");
         while ($up >= 0) {
             my int $ue = $up + 2;
-            while ($ue < length($ln)) {
+            while ($ue < $__ln_len) {
                 my str $uc = substr($ln, $ue, 1);
                 if (($uc ge "a" && $uc le "z") || ($uc ge "A" && $uc le "Z") || ($uc ge "0" && $uc le "9") || $uc eq "_") { $ue++; } else { last; }
             }
@@ -972,11 +975,12 @@ func generate(scalar $ast) str {
     my int $main_start = index($code, "int main(");
     if ($main_start < 0) { $main_start = 0; }
     my str $pre_main = substr($code, 0, $main_start);
+    my int $__pre_main_len = length($pre_main);
     my int $pdp = index($pre_main, "StradaValue *v_");
     while ($pdp >= 0) {
         my int $pvs = $pdp + 13;
         my int $pve = $pvs;
-        while ($pve < length($pre_main)) {
+        while ($pve < $__pre_main_len) {
             my str $pvc = substr($pre_main, $pve, 1);
             if (($pvc ge "a" && $pvc le "z") || ($pvc ge "A" && $pvc le "Z") || ($pvc ge "0" && $pvc le "9") || $pvc eq "_") { $pve++; } else { last; }
         }
@@ -992,10 +996,14 @@ func generate(scalar $ast) str {
         $ui++;
     }
     # Also auto-declare __local_save_* variables used in the code
+    # ($code is multi-MB for big programs — hoist length() out of the inner
+    # scan loop; recomputing it per character is O(n^2) and hung e.pl's
+    # cold-cache recompile of large modules.)
+    my int $__code_len = length($code);
     my int $lsp = index($code, "__local_save_");
     while ($lsp >= 0) {
         my int $lse = $lsp + 13;
-        while ($lse < length($code)) {
+        while ($lse < $__code_len) {
             my str $lsc = substr($code, $lse, 1);
             if (($lsc ge "a" && $lsc le "z") || ($lsc ge "A" && $lsc le "Z") || ($lsc ge "0" && $lsc le "9") || $lsc eq "_") { $lse++; } else { last; }
         }
@@ -1033,7 +1041,8 @@ func generate(scalar $ast) str {
             while ($fn_end < $len2 && $brace_depth > 0) {
                 my str $fl = $lines2[$fn_end];
                 my int $fi2 = 0;
-                while ($fi2 < length($fl)) {
+                my int $__fl_len = length($fl);
+                while ($fi2 < $__fl_len) {
                     my str $fc = substr($fl, $fi2, 1);
                     if ($fc eq "{") { $brace_depth++; }
                     if ($fc eq "}") { $brace_depth--; }
@@ -1047,12 +1056,18 @@ func generate(scalar $ast) str {
             my int $fli = $fn_start;
             while ($fli < $fn_end) {
                 my str $fln = $lines2[$fli];
+                # A single line can be huge (a 529KB string literal emitted as
+                # one PERLA_NEW_STR_LIT(...) — e.g. Locale::SubCountry::Codes'
+                # JSON). Hoist length() out of the per-char scan loops below;
+                # recomputing it per character is O(n^2) and hung e.pl's
+                # cold-cache recompile of such modules.
+                my int $__fln_len = length($fln);
                 # Track declarations: "StradaValue *v_NAME"
                 my int $dp2 = index($fln, "StradaValue *v_");
                 while ($dp2 >= 0) {
                     my int $vs2 = $dp2 + 13;
                     my int $ve2 = $vs2;
-                    while ($ve2 < length($fln)) {
+                    while ($ve2 < $__fln_len) {
                         my str $vc2 = substr($fln, $ve2, 1);
                         if (($vc2 ge "a" && $vc2 le "z") || ($vc2 ge "A" && $vc2 le "Z") || ($vc2 ge "0" && $vc2 le "9") || $vc2 eq "_") { $ve2++; } else { last; }
                     }
@@ -1064,7 +1079,7 @@ func generate(scalar $ast) str {
                 while ($up2 >= 0) {
                     if ($up2 == 0 || substr($fln, $up2 - 1, 1) eq " " || substr($fln, $up2 - 1, 1) eq "(" || substr($fln, $up2 - 1, 1) eq "," || substr($fln, $up2 - 1, 1) eq "*" || substr($fln, $up2 - 1, 1) eq "!") {
                         my int $ue2 = $up2 + 2;
-                        while ($ue2 < length($fln)) {
+                        while ($ue2 < $__fln_len) {
                             my str $uc2 = substr($fln, $ue2, 1);
                             if (($uc2 ge "a" && $uc2 le "z") || ($uc2 ge "A" && $uc2 le "Z") || ($uc2 ge "0" && $uc2 le "9") || $uc2 eq "_") { $ue2++; } else { last; }
                         }
