@@ -56,7 +56,7 @@ func gen_eval_replacement(scalar $cg, str $repl) void {
     Perla::CodeGen::emit($cg, "({ ");
     my int $si = 0;
     while ($si < $nstmts - 1) {
-        Perla::CodeGen::gen_stmt($cg, $stmts->[$si]);
+        Perla::CodeGen::Stmt::gen_stmt($cg, $stmts->[$si]);
         $si++;
     }
     my scalar $last_stmt = $stmts->[$nstmts - 1];

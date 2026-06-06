@@ -27,13 +27,13 @@ extern func Perla::CodeGen::_emit_pkg_scalar_inc_prefix(scalar $cg, scalar $node
 extern func Perla::CodeGen::_gen_expr_scalar(scalar $cg, scalar $node) void;
 extern func Perla::CodeGen::_is_our_unqual_scalar(scalar $cg, scalar $node) int;
 extern func Perla::CodeGen::_is_pkg_qualified_scalar(scalar $node) int;
-extern func Perla::CodeGen::_node_is_int(scalar $cg, scalar $node) int;
+extern func Perla::CodeGen::Stmt::_node_is_int(scalar $cg, scalar $node) int;
 extern func Perla::CodeGen::_split_pkg_qual_name(scalar $node) array;
 extern func Perla::CodeGen::c_var(str $name) str;
 extern func Perla::CodeGen::emit(scalar $cg, str $s) void;
 extern func Perla::CodeGen::expr_is_borrowed(scalar $node) int;
 extern func Perla::CodeGen::gen_expr(scalar $cg, scalar $node) void;
-extern func Perla::CodeGen::gen_stmt(scalar $cg, scalar $node) void;
+extern func Perla::CodeGen::Stmt::gen_stmt(scalar $cg, scalar $node) void;
 extern func Perla::CodeGen::has_perl_var(str $s) int;
 
 # --- Binary operations ---
@@ -255,7 +255,7 @@ func _gen_binop(scalar $cg, scalar $node) void {
         } else {
             $uv_ovf = "({ uint64_t __um; (__opl >= 0 && __opr >= 0 && !__builtin_mul_overflow((uint64_t)__opl, (uint64_t)__opr, &__um)) ? strada_new_uint(__um) : strada_new_num((double)__opl * (double)__opr); })";
         }
-        if (Perla::CodeGen::_node_is_int($cg, $node->{"left"}) == 1 && Perla::CodeGen::_node_is_int($cg, $node->{"right"}) == 1) {
+        if (Perla::CodeGen::Stmt::_node_is_int($cg, $node->{"left"}) == 1 && Perla::CodeGen::Stmt::_node_is_int($cg, $node->{"right"}) == 1) {
             # Int-typed operands: still need overflow check (perl auto-
             # promotes to float/UV on overflow). `12345678901 * 9876543210`
             # fits in int64 individually but the product overflows.
@@ -1115,7 +1115,7 @@ func _gen_binop(scalar $cg, scalar $node) void {
                     my scalar $__emb_stmts = $__emb_ast->{"stmts"};
                     my int $__embi = 0;
                     while ($__embi < scalar(@{$__emb_stmts})) {
-                        Perla::CodeGen::gen_stmt($cg, $__emb_stmts->[$__embi]);
+                        Perla::CodeGen::Stmt::gen_stmt($cg, $__emb_stmts->[$__embi]);
                         $__embi = $__embi + 1;
                     }
                 }

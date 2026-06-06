@@ -29,11 +29,11 @@ package Perla::CodeGen::Subs;
 extern func Perla::CodeGen::emit(scalar $cg, str $s) void;
 extern func Perla::CodeGen::ind(scalar $cg) void;
 extern func Perla::CodeGen::gen_expr(scalar $cg, scalar $node) void;
-extern func Perla::CodeGen::gen_stmt(scalar $cg, scalar $node) void;
-extern func Perla::CodeGen::gen_block_stmts(scalar $cg, scalar $node) void;
-extern func Perla::CodeGen::_compute_int_vars(scalar $cg, scalar $stmts) void;
+extern func Perla::CodeGen::Stmt::gen_stmt(scalar $cg, scalar $node) void;
+extern func Perla::CodeGen::Stmt::gen_block_stmts(scalar $cg, scalar $node) void;
+extern func Perla::CodeGen::Stmt::_compute_int_vars(scalar $cg, scalar $stmts) void;
 extern func Perla::CodeGen::gen_expr_safe(scalar $cg, scalar $node) void;
-extern func Perla::CodeGen::gen_if_capture_return(scalar $cg, scalar $node, str $ret_var) void;
+extern func Perla::CodeGen::Stmt::gen_if_capture_return(scalar $cg, scalar $node, str $ret_var) void;
 extern func Perla::CodeGen::c_var(str $name) str;
 extern func Perla::CodeGen::c_var_a(str $name) str;
 extern func Perla::CodeGen::c_var_h(str $name) str;
@@ -791,12 +791,12 @@ func gen_sub_def(scalar $cg, scalar $node) void {
         if (defined($node->{"body"})) {
             my scalar $stmts = $node->{"body"}->{"stmts"};
             # int type-inference (M1): compute int-eligible locals for this sub.
-            Perla::CodeGen::_compute_int_vars($cg, $stmts);
+            Perla::CodeGen::Stmt::_compute_int_vars($cg, $stmts);
             if (defined($stmts) && scalar(@{$stmts}) > $bind_skip) {
                 my int $last_s = scalar(@{$stmts}) - 1;
                 my int $si = $bind_skip;  # skip the param-extraction statement(s)
                 while ($si < $last_s) {
-                    Perla::CodeGen::gen_stmt($cg, $stmts->[$si]);
+                    Perla::CodeGen::Stmt::gen_stmt($cg, $stmts->[$si]);
                     $si++;
                 }
                 # Handle last statement: if it's an expression, capture
@@ -815,7 +815,7 @@ func gen_sub_def(scalar $cg, scalar $node) void {
                         # to the trailing return path which now picks up
                         # __ret_val if any branch ran.
                         Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "StradaValue *__ret_val = NULL;\n");
-                        Perla::CodeGen::gen_if_capture_return($cg, $last_stmt, "__ret_val");
+                        Perla::CodeGen::Stmt::gen_if_capture_return($cg, $last_stmt, "__ret_val");
                         # Restore local vars + cleanup before returning
                         if (defined($cg->{"local_vars"})) {
                             my array @lv_r = keys(%{$cg->{"local_vars"}});
@@ -868,7 +868,7 @@ func gen_sub_def(scalar $cg, scalar $node) void {
                         # placeholder — neither the assignment nor the package
                         # mirror runs, and a sibling `sub get_X { our $X; $X }`
                         # reads undef.
-                        Perla::CodeGen::gen_stmt($cg, $last_stmt);
+                        Perla::CodeGen::Stmt::gen_stmt($cg, $last_stmt);
                     } else {
                         # Expression — capture as return value.
                         # CRITICAL: incref __ret_val BEFORE decref'ing the
@@ -1354,7 +1354,7 @@ func gen_sub_def(scalar $cg, scalar $node) void {
                 my int $last = scalar(@{$stmts}) - 1;
                 my int $si = 0;
                 while ($si < $last) {
-                    Perla::CodeGen::gen_stmt($cg, $stmts->[$si]);
+                    Perla::CodeGen::Stmt::gen_stmt($cg, $stmts->[$si]);
                     $si++;
                 }
                 my scalar $last_stmt = $stmts->[$last];
@@ -1362,7 +1362,7 @@ func gen_sub_def(scalar $cg, scalar $node) void {
                 if ($last_t == Perla::AST::N_RETURN()
                     || $last_t == Perla::AST::N_IF()
                     || $last_t == Perla::AST::N_UNLESS()) {
-                    Perla::CodeGen::gen_stmt($cg, $last_stmt);
+                    Perla::CodeGen::Stmt::gen_stmt($cg, $last_stmt);
                     # If the last stmt was a control-flow that didn't
                     # actually return (e.g. if-without-else fell
                     # through), fall back to undef. C requires every
@@ -1388,7 +1388,7 @@ func gen_sub_def(scalar $cg, scalar $node) void {
                 my int $last_s = scalar(@{$body_stmts}) - 1;
                 my int $si3 = 0;
                 while ($si3 < $last_s) {
-                    Perla::CodeGen::gen_stmt($cg, $body_stmts->[$si3]);
+                    Perla::CodeGen::Stmt::gen_stmt($cg, $body_stmts->[$si3]);
                     $si3++;
                 }
                 # If last statement is an expression (not if/while/etc.), return it
@@ -1403,7 +1403,7 @@ func gen_sub_def(scalar $cg, scalar $node) void {
                     if (!$is_anon_sub && ($lst == Perla::AST::N_IF() || $lst == Perla::AST::N_UNLESS())) {
                         # Implicit-return-from-if (see gen_if_capture_return).
                         Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "{ StradaValue *__ret_val = NULL;\n");
-                        Perla::CodeGen::gen_if_capture_return($cg, $last_stmt, "__ret_val");
+                        Perla::CodeGen::Stmt::gen_if_capture_return($cg, $last_stmt, "__ret_val");
                         Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "if (__ret_val) strada_incref(__ret_val); strada_cleanup_drain_to(__perla_cleanup_mark); ");
                         # Sub-local scalar cleanup (see __direct branch).
                         my int $__nl1_i = 0;
@@ -1437,7 +1437,7 @@ func gen_sub_def(scalar $cg, scalar $node) void {
                         $lst == Perla::AST::N_OUR() || $lst == Perla::AST::N_STATE())) {
                         # Control flow or declaration — generate as statement.
                         # See companion __direct branch above for the N_OUR/N_STATE rationale.
-                        Perla::CodeGen::gen_stmt($cg, $last_stmt);
+                        Perla::CodeGen::Stmt::gen_stmt($cg, $last_stmt);
                     } else {
                         # Expression — return its value (Perl implicit return).
                         # Drain THIS function's cleanup pushes (params + body
@@ -1510,7 +1510,7 @@ func gen_sub_def(scalar $cg, scalar $node) void {
                     }
                 }
             } else {
-                Perla::CodeGen::gen_block_stmts($cg, $node->{"body"});
+                Perla::CodeGen::Stmt::gen_block_stmts($cg, $node->{"body"});
             }
         }
     }

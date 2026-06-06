@@ -160,7 +160,8 @@ PERLA_CODEGEN_MODS = \
     lib/Perla/CodeGen/Call.o \
     lib/Perla/CodeGen/Assign.o \
     lib/Perla/CodeGen/Operator.o \
-    lib/Perla/CodeGen/Method.o
+    lib/Perla/CodeGen/Method.o \
+    lib/Perla/CodeGen/Stmt.o
 
 # CodeGen sub-modules: need -L pointing at the lib root so cross-module `use`
 # (e.g. Interp.strada's `use Perla::CodeGen::Escape;`) resolves. Without it the

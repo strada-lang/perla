@@ -25,6 +25,7 @@ use Perla::CodeGen::Call;
 use Perla::CodeGen::Assign;
 use Perla::CodeGen::Operator;
 use Perla::CodeGen::Method;
+use Perla::CodeGen::Stmt;
 use Perla::CodeGen;
 use Perla;
 use Perla::StradaGen;
