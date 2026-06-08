@@ -690,17 +690,32 @@ func _cc_opt_flags_for(str $c_file) str {
         # is large enough to actually need OOM protection, or when the
         # caller explicitly opts in via PERLA_GCC_SHRINK_HEAP=1.
         my int $big = 0;
-        if (core::getenv("PERLA_GCC_SHRINK_HEAP") eq "1") {
-            $big = 1;
+        my str $shrink_env = core::getenv("PERLA_GCC_SHRINK_HEAP");
+        if ($shrink_env eq "1") {
+            $big = 1;                       # explicit opt-in: always shrink
+        } elsif ($shrink_env eq "0") {
+            $big = 0;                       # explicit opt-out: never shrink
         } elsif (length($c_file) > 0) {
             my int $sz = core::file_size($c_file);
-            # The aggressive ggc heap-shrink trades a LOT of compile time for
-            # lower peak RSS (it GC-thrashes cc1). It's only needed to keep the
-            # truly huge generated sources (e.g. Abe::App at ~24MB → 6GB RSS)
-            # under the OOM ceiling. A 1MB trigger was far too low: a moderate
-            # 1.5MB source (a typical `use DBI` program) went from ~2s to ~2min.
-            # Raise to 8MB — well above normal programs, well below the OOM case.
-            if ($sz > 8388608) { $big = 1; }
+            # The aggressive ggc heap-shrink (ggc-min-expand=0) GC-thrashes cc1:
+            # measured ~23x slower on a 35MB TU (54s -> >20min, never finished).
+            # It exists only to keep a huge generated source under the OOM
+            # ceiling — so apply it ONLY when cc1 would likely exceed THIS box's
+            # RAM, not blindly for every file past a fixed size (the old >8MB
+            # rule pessimized files that fit fine). cc1 peak RSS on these
+            # sources runs ~100-150 MB per MB of source (a 35MB TU peaked
+            # ~3.7GB); estimate at 150 MB/MB and compare against MemTotal. The
+            # decision is made in a one-line awk so we don't depend on Strada
+            # parsing /proc/meminfo: it prints 1 (shrink) / 0 (skip). Override
+            # with PERLA_GCC_SHRINK_HEAP=1 (force on) or =0 (force off).
+            if ($sz > 8388608) {
+                my str $decide = trim(core::qx("awk -v sz=" . $sz . " '/^MemTotal:/{ if (sz/1048576*150 > $2/1024) print 1; else print 0; exit }' /proc/meminfo 2>/dev/null"));
+                if ($decide eq "0") {
+                    $big = 0;               # comfortably fits in RAM -> fast un-shrunk compile
+                } else {
+                    $big = 1;               # estimate exceeds RAM, or RAM unreadable -> shrink (safe)
+                }
+            }
         }
         if ($big == 1) {
             $flags = $flags . " --param ggc-min-expand=0 --param ggc-min-heapsize=4096";
