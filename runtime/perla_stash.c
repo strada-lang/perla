@@ -14683,6 +14683,57 @@ void perla_emit_deep_recursion_warning(const char *pkg, const char *sub, const c
     }
 }
 
+/* Cold path of perla_call_push (declared in perla_stash.h). Handles the rare
+ * cases so the common case can be a tiny inline: the one-time
+ * PERLA_WARN_RECURSION getenv init, the deep-recursion warning, and the
+ * Sub::Util::set_subname / package-name overrides. perla_real_call_depth was
+ * already incremented by the inline caller, so we don't touch it here. The
+ * frame-write logic is byte-for-byte the original perla_call_push body. */
+void perla_call_push_slow(const char *pkg, const char *sub, const char *file, int line) {
+    if (perla_warn_recursion_enabled < 0) {
+        const char *e = getenv("PERLA_WARN_RECURSION");
+        perla_warn_recursion_enabled = (e && e[0]) ? 1 : 0;
+    }
+    if (perla_warn_recursion_enabled && perla_real_call_depth == PERLA_RECURSION_WARN_DEPTH) {
+        perla_emit_deep_recursion_warning(pkg, sub, file,
+            perla_pending_call_line ? perla_pending_call_line : line);
+    }
+    if (perla_call_depth < PERLA_CALL_STACK_SIZE) {
+        const char *eff_pkg = pkg;
+        const char *eff_sub = sub;
+        if (perla_pending_subname_override) {
+            const char *fq = perla_pending_subname_override;
+            const char *sep = strstr(fq, "::");
+            if (sep) {
+                /* "Pkg::name" → split into the frame's static scratch bufs. */
+                size_t plen = (size_t)(sep - fq);
+                static __thread char pkgbuf[256], subbuf[256];
+                if (plen >= sizeof(pkgbuf)) plen = sizeof(pkgbuf) - 1;
+                memcpy(pkgbuf, fq, plen); pkgbuf[plen] = 0;
+                const char *sub_part = sep + 2;
+                size_t slen = strlen(sub_part);
+                if (slen >= sizeof(subbuf)) slen = sizeof(subbuf) - 1;
+                memcpy(subbuf, sub_part, slen); subbuf[slen] = 0;
+                eff_pkg = pkgbuf;
+                eff_sub = subbuf;
+            } else {
+                eff_sub = fq;
+            }
+            perla_pending_subname_override = NULL;
+        }
+        if (perla_pending_package_override) {
+            eff_pkg = perla_pending_package_override;
+            perla_pending_package_override = NULL;
+        }
+        perla_call_stack[perla_call_depth].package = eff_pkg;
+        perla_call_stack[perla_call_depth].subname = eff_sub;
+        perla_call_stack[perla_call_depth].file = file;
+        perla_call_stack[perla_call_depth].line = perla_pending_call_line ? perla_pending_call_line : line;
+        perla_pending_call_line = 0;
+        perla_call_depth++;
+    }
+}
+
 /* ===== File-test stat cache =====
  * Holds the last path that flowed through `-e $path` (and friends). The
  * `_X _` token in YAML::Tiny/File::Spec/IO::Socket::SSL reuses this. */

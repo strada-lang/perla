@@ -334,54 +334,35 @@ StradaValue *perla_smartmatch(StradaValue *lhs, StradaValue *rhs);
 extern __thread const char *perla_pending_subname_override;
 extern __thread const char *perla_pending_package_override;
 
+/* Cold path of perla_call_push: the lazy PERLA_WARN_RECURSION getenv init,
+ * the deep-recursion warning, and Sub::Util::set_subname / package-name
+ * overrides. Split out (and NOT inlined) so the common case below stays a
+ * handful of instructions gcc inlines at every call site, instead of the
+ * large out-of-line constprop clone the original produced — perla_call_push
+ * was ~38% of instructions on a recursion/call-heavy workload (fib). The
+ * inline has already incremented perla_real_call_depth before delegating. */
+void perla_call_push_slow(const char *pkg, const char *sub, const char *file, int line);
+
 static inline void perla_call_push(const char *pkg, const char *sub, const char *file, int line) {
     perla_real_call_depth++;
-    if (perla_warn_recursion_enabled < 0) {
-        const char *e = getenv("PERLA_WARN_RECURSION");
-        perla_warn_recursion_enabled = (e && e[0]) ? 1 : 0;
+    /* Cold iff a name/package override is pending, or recursion-warning is
+     * enabled, or the enabled-flag is still its uninitialized -1 sentinel
+     * (first call → slow path does the one-time getenv). In the hot path all
+     * three are 0/NULL, so this is a single predicted-not-taken branch. */
+    if (__builtin_expect(perla_warn_recursion_enabled != 0
+            || perla_pending_subname_override != NULL
+            || perla_pending_package_override != NULL, 0)) {
+        perla_call_push_slow(pkg, sub, file, line);
+        return;
     }
-    if (perla_warn_recursion_enabled && perla_real_call_depth == PERLA_RECURSION_WARN_DEPTH) {
-        perla_emit_deep_recursion_warning(pkg, sub, file,
-            perla_pending_call_line ? perla_pending_call_line : line);
-    }
-    if (perla_call_depth < PERLA_CALL_STACK_SIZE) {
-        const char *eff_pkg = pkg;
-        const char *eff_sub = sub;
-        if (perla_pending_subname_override) {
-            const char *fq = perla_pending_subname_override;
-            const char *sep = strstr(fq, "::");
-            if (sep) {
-                /* "Pkg::name" → split — copy into call frame's static
-                 * scratch strings. Simplest: leak strdup; the frame's
-                 * lifetime is bounded by the function call so this is
-                 * negligible. */
-                size_t plen = (size_t)(sep - fq);
-                static __thread char pkgbuf[256], subbuf[256];
-                if (plen >= sizeof(pkgbuf)) plen = sizeof(pkgbuf) - 1;
-                memcpy(pkgbuf, fq, plen); pkgbuf[plen] = 0;
-                const char *sub_part = sep + 2;
-                size_t slen = strlen(sub_part);
-                if (slen >= sizeof(subbuf)) slen = sizeof(subbuf) - 1;
-                memcpy(subbuf, sub_part, slen); subbuf[slen] = 0;
-                eff_pkg = pkgbuf;
-                eff_sub = subbuf;
-            } else {
-                eff_sub = fq;
-            }
-            perla_pending_subname_override = NULL;
-        }
-        if (perla_pending_package_override) {
-            eff_pkg = perla_pending_package_override;
-            perla_pending_package_override = NULL;
-        }
-        perla_call_stack[perla_call_depth].package = eff_pkg;
-        perla_call_stack[perla_call_depth].subname = eff_sub;
+    if (__builtin_expect(perla_call_depth < PERLA_CALL_STACK_SIZE, 1)) {
+        perla_call_stack[perla_call_depth].package = pkg;
+        perla_call_stack[perla_call_depth].subname = sub;
         perla_call_stack[perla_call_depth].file = file;
-        /* Prefer the call-site line (set by codegen via
-         * perla_pending_call_line just before the call) over the
-         * literal `line` argument (which is 0 from the function-entry
-         * push). Reset after consume so a follow-on call without a
-         * fresh set doesn't inherit a stale line. */
+        /* Prefer the call-site line (set by codegen via perla_pending_call_line
+         * just before the call) over the literal `line` arg (0 from the
+         * function-entry push). Reset after consume so a follow-on call without
+         * a fresh set doesn't inherit a stale line. */
         perla_call_stack[perla_call_depth].line = perla_pending_call_line ? perla_pending_call_line : line;
         perla_pending_call_line = 0;
         perla_call_depth++;
