@@ -8,6 +8,15 @@ use Perla::Lexer;
 
 package Perla::Parser;
 
+# POSIX shell single-quote escape: wrap in '...' and turn each embedded ' into
+# the 4-char sequence '\'' . Makes module names, resolved .pm paths, lib paths,
+# and the perla binary path safe as single /bin/sh -c words in the auto-build
+# spawn, defeating command injection from `use lib "..."` and crafted filenames
+# (security audit S2: H6).
+func _shq(str $s) str {
+    return "'" . replace_all($s, "'", "'\\''") . "'";
+}
+
 func reset_modules() void {
     # no-op - state is now in parser context
 }
@@ -2710,7 +2719,7 @@ func _load_module(scalar $p, str $module) scalar {
                             }
                         }
                         my str $__plib_env = "";
-                        if (length($__plib) > 0) { $__plib_env = "PERLA5LIB=" . $__plib . " "; }
+                        if (length($__plib) > 0) { $__plib_env = "PERLA5LIB=" . _shq($__plib) . " "; }
                         # Propagate the dep-handling mode to the spawned child.
                         # Without PERLA_PRECOMPILE_DEPS the child ran a plain
                         # `perla -M`, treated project-local lib/ as a non-tree,
@@ -2721,7 +2730,7 @@ func _load_module(scalar $p, str $module) scalar {
                         # in the recursion reference + auto-build its deps.
                         if ($precompile_deps == 1) { $__plib_env = $__plib_env . "PERLA_PRECOMPILE_DEPS=1 "; }
                         if ($prefer_shared == 1) { $__plib_env = $__plib_env . "PERLA_SHARED=1 "; }
-                        my str $cmd = $__plib_env . "PERLA_MODULE_NAME=" . $module . " PERLA_BUILDING_LIST=" . $__new_bl . " " . $perla_bin . " -M " . $full . " 2>&1";
+                        my str $cmd = $__plib_env . "PERLA_MODULE_NAME=" . _shq($module) . " PERLA_BUILDING_LIST=" . _shq($__new_bl) . " " . _shq($perla_bin) . " -M " . _shq($full) . " 2>&1";
                         _dbg("    spawn: " . $cmd);
                         core::qx($cmd);
                         $o_exists = core::file_exists($ocand);
@@ -2812,7 +2821,7 @@ func _load_module(scalar $p, str $module) scalar {
                             }
                         }
                         my str $__plib_env = "";
-                        if (length($__plib) > 0) { $__plib_env = "PERLA5LIB=" . $__plib . " "; }
+                        if (length($__plib) > 0) { $__plib_env = "PERLA5LIB=" . _shq($__plib) . " "; }
                         # Propagate the dep-handling mode to the spawned child.
                         # Without PERLA_PRECOMPILE_DEPS the child ran a plain
                         # `perla -M`, treated project-local lib/ as a non-tree,
@@ -2823,7 +2832,7 @@ func _load_module(scalar $p, str $module) scalar {
                         # in the recursion reference + auto-build its deps.
                         if ($precompile_deps == 1) { $__plib_env = $__plib_env . "PERLA_PRECOMPILE_DEPS=1 "; }
                         if ($prefer_shared == 1) { $__plib_env = $__plib_env . "PERLA_SHARED=1 "; }
-                        my str $cmd = $__plib_env . "PERLA_MODULE_NAME=" . $module . " PERLA_BUILDING_LIST=" . $__new_bl . " " . $perla_bin . " -M " . $full . " 2>&1";
+                        my str $cmd = $__plib_env . "PERLA_MODULE_NAME=" . _shq($module) . " PERLA_BUILDING_LIST=" . _shq($__new_bl) . " " . _shq($perla_bin) . " -M " . _shq($full) . " 2>&1";
                             _dbg("    spawn (precompile-deps sibling): " . $cmd);
                             core::qx($cmd);
                         }
@@ -2959,7 +2968,7 @@ func _load_module(scalar $p, str $module) scalar {
                             }
                         }
                         my str $__plib_env = "";
-                        if (length($__plib) > 0) { $__plib_env = "PERLA5LIB=" . $__plib . " "; }
+                        if (length($__plib) > 0) { $__plib_env = "PERLA5LIB=" . _shq($__plib) . " "; }
                         # Propagate the dep-handling mode to the spawned child.
                         # Without PERLA_PRECOMPILE_DEPS the child ran a plain
                         # `perla -M`, treated project-local lib/ as a non-tree,
@@ -2970,7 +2979,7 @@ func _load_module(scalar $p, str $module) scalar {
                         # in the recursion reference + auto-build its deps.
                         if ($precompile_deps == 1) { $__plib_env = $__plib_env . "PERLA_PRECOMPILE_DEPS=1 "; }
                         if ($prefer_shared == 1) { $__plib_env = $__plib_env . "PERLA_SHARED=1 "; }
-                        my str $cmd = $__plib_env . "PERLA_MODULE_NAME=" . $module . " PERLA_BUILDING_LIST=" . $__new_bl . " " . $perla_bin . " -M " . $full . " 2>&1";
+                        my str $cmd = $__plib_env . "PERLA_MODULE_NAME=" . _shq($module) . " PERLA_BUILDING_LIST=" . _shq($__new_bl) . " " . _shq($perla_bin) . " -M " . _shq($full) . " 2>&1";
                         _dbg("    spawn: " . $cmd);
                         core::qx($cmd);
                         if (core::file_exists($ocand) == 1 || core::file_exists($socand) == 1) {

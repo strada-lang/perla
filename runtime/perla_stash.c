@@ -14324,6 +14324,25 @@ static const char *perla_private_tmpdir(void) {
     return g_perla_priv_tmpdir;
 }
 
+/* POSIX shell single-quote escape into `out` (capacity outsz): wrap in '...'
+ * and turn each ' into the 4-char sequence '\'' . Returns out. Makes an
+ * untrusted module name / path safe as ONE /bin/sh -c word in the popen'd
+ * `perla -M` build command (security audit M2). On overflow the result is
+ * truncated but stays a well-formed single-quoted word. */
+static const char *perla_shq(const char *s, char *out, size_t outsz) {
+    size_t o = 0;
+    if (outsz == 0) return out;
+    if (outsz < 3) { out[0] = '\0'; return out; }
+    out[o++] = '\'';
+    for (const char *p = s; *p && o + 5 < outsz; p++) {
+        if (*p == '\'') { out[o++] = '\''; out[o++] = '\\'; out[o++] = '\''; out[o++] = '\''; }
+        else out[o++] = *p;
+    }
+    out[o++] = '\'';
+    out[o] = '\0';
+    return out;
+}
+
 StradaValue *perla_eval_string(StradaValue *code_sv, const char *current_pkg) {
     if (!code_sv || STRADA_IS_TAGGED_INT(code_sv)) {
         return strada_new_undef();
@@ -23584,13 +23603,21 @@ StradaValue *perla_require_module(StradaValue *module_sv) {
 #else
         const char *_no_tls = "";
 #endif
-        char cmd[4096];
+        char cmd[16384];
+        /* Shell-quote every interpolated value: module (from `require $expr`,
+         * attacker-controllable) and build_pm_path are the audited vectors;
+         * the perla/strada paths are quoted for defense-in-depth (M2). */
+        char _mq[2048], _pq[4200], _sdq[2048], _ppq[2048];
+        perla_shq(module, _mq, sizeof(_mq));
+        perla_shq(build_pm_path, _pq, sizeof(_pq));
         if (g_perla_path[0] && g_strada_dir[0]) {
+            perla_shq(g_strada_dir, _sdq, sizeof(_sdq));
+            perla_shq(g_perla_path, _ppq, sizeof(_ppq));
             snprintf(cmd, sizeof(cmd), "%sSTRADA_DIR=%s PERLA_MODULE_NAME=%s PERLA_BUILD_PM_SO=1 %s%s -M %s 2>&1",
-                     _no_tls, g_strada_dir, module, _pp_deps, g_perla_path, build_pm_path);
+                     _no_tls, _sdq, _mq, _pp_deps, _ppq, _pq);
         } else {
             snprintf(cmd, sizeof(cmd), "%sPERLA_MODULE_NAME=%s PERLA_BUILD_PM_SO=1 %sperla -M %s 2>&1",
-                     _no_tls, module, _pp_deps, build_pm_path);
+                     _no_tls, _mq, _pp_deps, _pq);
         }
         if (perla_debug_mode()) fprintf(stderr, "[require] compiling: %s%s\n", cmd, dir_writable ? "" : " (staged)");
         FILE *proc = popen(cmd, "r");

@@ -80,8 +80,35 @@ StradaValue **__perla_sort_ctx[16] = {0};
 StradaValue **__perla_cell[64] = {0};
 }
 
+# POSIX shell single-quote escape: wrap in '...' and turn each embedded ' into
+# the 4-char sequence '\'' . Makes an arbitrary string safe as ONE /bin/sh -c
+# word, defeating all metacharacter injection from untrusted file paths, module
+# names, lib paths, and env values (security audit S2: H5, M3, M4, L2, L3).
+func _shq(str $s) str {
+    return "'" . replace_all($s, "'", "'\\''") . "'";
+}
+
+# Shell-quote a whitespace-separated list of paths (e.g. the linker object
+# list): quote each token individually so the words stay separate args while
+# any metacharacters inside a path are neutralized. (Paths containing literal
+# spaces were already unsupported by the space-joined form.)
+func _shq_list(str $s) str {
+    my array @parts = split(" ", trim($s));
+    my str $out = "";
+    my int $i = 0;
+    while ($i < scalar(@parts)) {
+        my str $p = trim($parts[$i]);
+        if (length($p) > 0) {
+            if (length($out) > 0) { $out = $out . " "; }
+            $out = $out . _shq($p);
+        }
+        $i++;
+    }
+    return $out;
+}
+
 func _find_xs_file(str $dir) str {
-    my str $cmd = "ls " . $dir . "/*.xs 2>/dev/null";
+    my str $cmd = "ls " . _shq($dir) . "/*.xs 2>/dev/null";
     my str $ls_out = core::qx($cmd);
     if (length($ls_out) == 0) { return ""; }
     my str $first = $ls_out;
@@ -549,7 +576,7 @@ func _fix_codegen_edge_cases(str $code) str {
             my str $objs_str = trim(substr($result, $link_pos2 + 22, $link_end2 - $link_pos2 - 22));
             if (length($objs_str) > 0) {
                 # Get exported symbols from .o files
-                my str $nm_out = core::qx("nm -g " . $objs_str . " 2>/dev/null | grep ' T perla_sub_' | awk '{print $3}'");
+                my str $nm_out = core::qx("nm -g " . _shq_list($objs_str) . " 2>/dev/null | grep ' T perla_sub_' | awk '{print $3}'");
                 my array @syms = split("\n", trim($nm_out));
                 my int $si2 = 0;
                 while ($si2 < size(@syms)) {
@@ -856,7 +883,7 @@ func _compile_c(str $c_file, str $exe, str $strada_dir, str $cc, str $extra_objs
             if (length($opath2) > 0) {
                 my int $is_pmo2 = (length($opath2) > 5 && substr($opath2, length($opath2) - 5, 5) eq ".pm.o");
                 if ($is_pmo2 == 1) {
-                    my str $globals2 = core::qx("nm -g " . $opath2 . " 2>/dev/null | grep ' T perla_sub_' | awk '{print $3}'");
+                    my str $globals2 = core::qx("nm -g " . _shq($opath2) . " 2>/dev/null | grep ' T perla_sub_' | awk '{print $3}'");
                     my array @gl2 = split("\n", $globals2);
                     my int $gi2 = 0;
                     my str $loc_list = "";
@@ -871,7 +898,7 @@ func _compile_c(str $c_file, str $exe, str $strada_dir, str $cc, str $extra_objs
                         my str $loc_file = "/tmp/perla_loc_" . core::getpid() . "_" . $oi2 . ".syms";
                         my str $tmp_o = "/tmp/perla_loc_" . core::getpid() . "_" . $oi2 . ".pm.o";
                         core::spew($loc_file, $loc_list);
-                        core::qx("objcopy --localize-symbols=" . $loc_file . " " . $opath2 . " " . $tmp_o . " 2>&1");
+                        core::qx("objcopy --localize-symbols=" . _shq($loc_file) . " " . _shq($opath2) . " " . _shq($tmp_o) . " 2>&1");
                         if (core::file_exists($tmp_o) == 1) {
                             $opath2 = $tmp_o;
                         }
@@ -1256,8 +1283,8 @@ func _jit_run_line(str $source, int $n, str $prepend, str $libenv, str $strada_d
     # $prepend re-declares prior-line vars as `our` so they adopt their persisted
     # stash values in this line's module; the line's own assignments sync back.
     core::spew($pm, "package main;\n" . $prepend . $source . "\n1;\n");
-    my str $cmd = $libenv . "STRADA_DIR='" . $strada_dir
-        . "' PERLA_BUILD_PM_SO_ONLY=1 '" . $perla_bin . "' -M '" . $pm . "' 2>&1";
+    my str $cmd = $libenv . "STRADA_DIR=" . _shq($strada_dir)
+        . " PERLA_BUILD_PM_SO_ONLY=1 " . _shq($perla_bin) . " -M " . _shq($pm) . " 2>&1";
     my str $out = core::qx($cmd);
     if (core::file_exists($so) != 1) {
         if (length($out) > 0) { say(STDERR, trim($out)); }
@@ -1322,7 +1349,7 @@ func _run_jit_repl() int {
         $lpi++;
     }
     my str $libenv = "";
-    if (length($libpath) > 0) { $libenv = "PERLA_LIB='" . $libpath . "' "; }
+    if (length($libpath) > 0) { $libenv = "PERLA_LIB=" . _shq($libpath) . " "; }
     my str $buffer = "";
     my int $n = 0;
     my int $running = 1;
@@ -1792,7 +1819,7 @@ func main() int {
             }
             # Enumerate .pm files via `find`. Much simpler than threading
             # a recursive Strada walker; `find` is universally available.
-            my str $find_cmd = "find " . $input . " -type f -name '*.pm' 2>/dev/null";
+            my str $find_cmd = "find " . _shq($input) . " -type f -name '*.pm' 2>/dev/null";
             my str $find_out = core::qx($find_cmd);
             my array @pm_files = split("\n", $find_out);
             my int $total = 0;
@@ -1822,7 +1849,7 @@ func main() int {
                         $skipped++;
                     }
                     if ($need_build == 1) {
-                        my str $cmd = $perla_bin . " -M " . $pm . " 2>&1";
+                        my str $cmd = _shq($perla_bin) . " -M " . _shq($pm) . " 2>&1";
                         my str $out = core::qx($cmd);
                         if (core::file_exists($o_path) == 1) {
                             $done++;
@@ -2518,10 +2545,10 @@ func main() int {
         if (len > 0) { buf[len] = '\0'; strada_decref(perla_exe_path); perla_exe_path = strada_new_str(buf); }
     }
     if (length($perla_exe_path) > 0) {
-        my str $run_cmd = "PERLA_PATH=" . $perla_exe_path . " STRADA_DIR=" . $strada_dir . " " . $exe_path;
+        my str $run_cmd = "PERLA_PATH=" . _shq($perla_exe_path) . " STRADA_DIR=" . _shq($strada_dir) . " " . _shq($exe_path);
         my int $ai = 0;
         while ($ai < scalar(@script_args)) {
-            $run_cmd = $run_cmd . " " . $script_args[$ai];
+            $run_cmd = $run_cmd . " " . _shq($script_args[$ai]);
             $ai++;
         }
         my int $ret = core::system($run_cmd);
@@ -2529,7 +2556,7 @@ func main() int {
         if (length($eval_code) > 0) { core::unlink($input); }
         return $ret;
     }
-    my str $run_cmd = $exe_path;
+    my str $run_cmd = _shq($exe_path);
     my int $ai = 0;
     while ($ai < scalar(@script_args)) {
         $run_cmd = $run_cmd . " " . $script_args[$ai];
