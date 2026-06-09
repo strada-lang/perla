@@ -24,6 +24,12 @@ package Perla::CodeGen;
 
 func generate(scalar $ast) str {
     my scalar $sb = sb_new(65536);
+    # PERLA_PHASE_TIME=1: split codegen into the AST-walk/emit phase and the
+    # post-pass (whole-$code scan/splice) phase. Inline CLOCK_MONOTONIC reads
+    # (distinct timespec names per block — same C function scope).
+    my int $__pt = (core::getenv("PERLA_PHASE_TIME") eq "1") ? 1 : 0;
+    my num $__g0 = 0.0;
+    __C__ { struct timespec __ta; clock_gettime(CLOCK_MONOTONIC, &__ta); strada_decref(__g0); __g0 = strada_new_num((double)__ta.tv_sec + (double)__ta.tv_nsec/1e9); }
     my hash %cg = ();
     $cg{"sb"} = $sb;
     $cg{"indent"} = 0;
@@ -817,6 +823,8 @@ func generate(scalar $ast) str {
     }
 
     my str $code = sb_to_string($sb);
+    my num $__g1 = 0.0;
+    __C__ { struct timespec __tb; clock_gettime(CLOCK_MONOTONIC, &__tb); strada_decref(__g1); __g1 = strada_new_num((double)__tb.tv_sec + (double)__tb.tv_nsec/1e9); }
     # The generated C is manipulated below (and in perla.strada's fix passes)
     # with byte-offset index()/substr() surgery — e.g. the auto-declared-vars
     # post-pass splices a block at `index($code, "int main(")`. If a non-ASCII
@@ -1192,6 +1200,11 @@ func generate(scalar $ast) str {
         }
     }
 
+    if ($__pt == 1) {
+        my num $__g2 = 0.0;
+        __C__ { struct timespec __tc; clock_gettime(CLOCK_MONOTONIC, &__tc); strada_decref(__g2); __g2 = strada_new_num((double)__tc.tv_sec + (double)__tc.tv_nsec/1e9); }
+        say(STDERR, "[gen] emit=" . ($__g1 - $__g0) . "s postpass=" . ($__g2 - $__g1) . "s");
+    }
     return $code;
 }
 

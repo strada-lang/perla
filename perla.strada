@@ -125,10 +125,22 @@ func _compile_with_xs(str $source, str $input, str $xs_file, str $c_file) str {
 }
 
 func _compile_with_xs_lib(str $source, str $input, str $xs_file, str $c_file, scalar $lib_paths) str {
-    # Compile with explicit lib paths
+    # Compile with explicit lib paths. PERLA_PHASE_TIME=1 prints a coarse
+    # lex/parse/codegen breakdown to stderr — handy for spotting whether a slow
+    # build is parse-bound or emit-bound (on big inlined module trees it is
+    # roughly evenly split). CodeGen::generate further splits codegen into
+    # emit vs post-pass under the same flag.
+    my int $pt = (core::getenv("PERLA_PHASE_TIME") eq "1") ? 1 : 0;
+    my num $ta = _mono();
     my array @tokens = Perla::Lexer::lex($source);
+    my num $tb = _mono();
     my scalar $ast = Perla::Parser::parse_with_file_context(@tokens, $lib_paths, {}, $input);
+    my num $tc = _mono();
     my str $code = Perla::CodeGen::generate($ast);
+    my num $td = _mono();
+    if ($pt == 1) {
+        say(STDERR, "[phase] lex=" . ($tb - $ta) . "s parse=" . ($tc - $tb) . "s codegen=" . ($td - $tc) . "s");
+    }
     if (length($xs_file) == 0) { return $code; }
     if (core::file_exists($xs_file) != 1) { return $code; }
     my str $xs_src = core::slurp($xs_file);
@@ -735,6 +747,20 @@ func _cc_opt_flags_for(str $c_file) str {
 # the `[perla]` prefix used for module-resolution events so cc calls
 # are easy to spot in the noise), times it via CLOCK_MONOTONIC, and
 # prints a summary line on completion.
+
+# Monotonic seconds, for the coarse compile-phase timing emitted under
+# PERLA_PHASE_TIME=1 (see _compile_with_xs_lib and CodeGen::generate).
+func _mono() num {
+    my num $t = 0.0;
+    __C__ {
+        struct timespec __ts;
+        clock_gettime(CLOCK_MONOTONIC, &__ts);
+        strada_decref(t);
+        t = strada_new_num((double)__ts.tv_sec + (double)__ts.tv_nsec / 1e9);
+    }
+    return $t;
+}
+
 func _run_cc(str $cmd) str {
     my int $dbg = 0;
     if (core::getenv("PERLA_DEBUG") eq "1") { $dbg = 1; }
