@@ -46,6 +46,18 @@ extern func Perla::CodeGen::safe_ident(str $name) str;
 func gen_stmt(scalar $cg, scalar $node) void {
     my int $type = $node->{"type"};
 
+    # -g source mapping: a `#line N "file.pl"` directive makes the C compiler's
+    # DWARF attribute this statement's generated C to the original Perl line, so
+    # gdb can break/step on the .pl. `#line` is a preprocessor directive, valid
+    # on its own line in any C context (including `({ })` stmt-expressions).
+    # Gated on -g (emit_line) so normal builds keep C-level line attribution for
+    # codegen diagnosis.
+    if (defined($cg->{"emit_line"}) && $cg->{"emit_line"} == 1
+        && defined($node->{"line"}) && defined($cg->{"filename"})) {
+        Perla::CodeGen::emit($cg, "\n#line " . ($node->{"line"} + 0) . " \""
+            . Perla::CodeGen::Escape::escape_c_str("" . $cg->{"filename"}) . "\"\n");
+    }
+
     # Statement-context pre-declaration for an inline `my` buried in a
     # list-destructure assignment LHS: `($h->{k}, my $x) = LIST;`. _gen_assign
     # rewrites the inline N_MY to a plain scalar/array/hash assignment but never

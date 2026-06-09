@@ -1678,6 +1678,9 @@ func main() int {
             # alongside the binary so gdb has source to step through.
             $debug_g = 1;
             $keep_c = 1;
+            # Emit `#line` directives so gdb maps the generated C back to the
+            # .pl source (CodeGen reads PERLA_LINE_DIRECTIVES into emit_line).
+            core::setenv("PERLA_LINE_DIRECTIVES", "1");
         } elsif ($arg eq "-O0" || $arg eq "-O1" || $arg eq "-O2"
               || $arg eq "-O3" || $arg eq "-Os" || $arg eq "-Ofast") {
             $opt_level = $arg;

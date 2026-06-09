@@ -1,8 +1,10 @@
 # Debugging perla-compiled programs with gdb
 
 perla compiles your Perl to C, then to a native binary. With the `-g` flag you
-get a fully gdb-debuggable executable: DWARF line info, working backtraces, and
-the generated C kept next to your program so you can step through it.
+get a fully gdb-debuggable executable: DWARF line info, working backtraces, and —
+via `#line` directives perla emits — gdb maps straight to your **original Perl
+source**. `break myprog.pl:42`, `list`, `step`, and backtraces all show the
+`.pl`. (The generated C is also kept next to the binary for reference.)
 
 ```bash
 perla -g -o myprog myprog.pl     # build with debug info; keeps myprog.c
@@ -17,8 +19,13 @@ gdb ./myprog
    off — `-fno-var-tracking -fno-asynchronous-unwind-tables` — for speed and
    smaller binaries, which is why ordinary `perla` binaries can't show locals or
    reliable backtraces even though they keep a symbol table.)
-3. Implies `--keep`, so the generated `<base>.c` stays next to the binary. gdb's
-   DWARF points at that file for source-level stepping (`list`, `step`, etc.).
+3. Emits `#line N "yourfile.pl"` directives before each statement's generated C,
+   so the DWARF line table maps back to your **Perl** source — `break file.pl:N`,
+   `list`, `step`, and backtraces all show the `.pl`. (A few statement kinds
+   whose AST node lacks a line — e.g. a bare `return` or implicit param binding —
+   map to the nearest preceding line.)
+4. Implies `--keep`, so the generated `<base>.c` stays next to the binary for
+   reference (e.g. to see exactly what C a statement expands to).
 
 Without `-g`, default binaries are *not* stripped — `.symtab` is present, so you
 can still set breakpoints by C symbol name — but there's no DWARF, so no source
@@ -26,8 +33,10 @@ lines, locals, or args.
 
 ## Name mapping: Perl → generated C
 
-gdb works on the generated C, so you set breakpoints and inspect values using the
-C names perla emits. The mapping is mechanical:
+Source view, breakpoints (`break file.pl:N`), and backtraces are in terms of your
+Perl. But **values** are still inspected with the C names perla emits — every
+Perl value is a `StradaValue *`, so you read it via the name map below plus
+`strada_to_str` (see further down). The mapping is mechanical:
 
 | Perl                     | C symbol                         |
 |--------------------------|----------------------------------|

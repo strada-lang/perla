@@ -35,6 +35,9 @@ func generate(scalar $ast) str {
     $cg{"indent"} = 0;
     $cg{"pkg"} = "main";
     $cg{"filename"} = defined($ast->{"filename"}) ? $ast->{"filename"} : "(eval)";
+    # -g (PERLA_LINE_DIRECTIVES): emit `#line N "file.pl"` before each statement
+    # so gdb's DWARF maps the generated C back to the original Perl source.
+    $cg{"emit_line"} = (core::getenv("PERLA_LINE_DIRECTIVES") eq "1") ? 1 : 0;
     $cg{"lib_paths"} = defined($ast->{"lib_paths"}) ? $ast->{"lib_paths"} : [];
     $cg{"subs"} = {};          # name -> 1 (for forward decls)
     $cg{"anon_subs"} = [];     # collected anonymous sub nodes
