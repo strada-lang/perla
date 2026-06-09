@@ -2032,6 +2032,16 @@ void perla_init(void) {
      * subroutine &warnings::register_categories called". */
     perla_code_set("warnings", "register_categories", strada_cpointer_new((void*)perla_noop_undef));
     perla_code_set("warnings", "register_category",   strada_cpointer_new((void*)perla_noop_undef));
+    /* Runtime warnings-category queries (used by Moose/DBIx::Class/Type::Tiny
+     * at run time). perla doesn't track per-category warning bits, so report
+     * "off"/false (the common default for these checks) and make warnif a
+     * no-op — and, crucially, never die. Previously these fell through to a
+     * runtime `require warnings`, which pulled in the real warnings.pm ->
+     * Carp.pm -> an `eval STRING` that wedged the process (t/159_warnings_runtime
+     * hung). Native stubs keep these calls fast and deterministic. */
+    perla_code_set("warnings", "enabled",       strada_cpointer_new((void*)perla_noop_undef));
+    perla_code_set("warnings", "warnif",        strada_cpointer_new((void*)perla_noop_undef));
+    perla_code_set("warnings", "fatal_enabled", strada_cpointer_new((void*)perla_noop_undef));
     /* Internals::* — Perl's internal builtins used by constant.pm, Readonly,
      * Type::Tiny's constant caching, etc. perla doesn't enforce the readonly
      * flag or expose refcounts, so these are no-ops. Without SvREADONLY,
