@@ -792,35 +792,57 @@ static char* bind_params_at(const char *sql, StradaValue *binds, size_t start_id
     StradaArray *av = strada_deref_array(binds);
     if (!av || av->size <= start_idx) return strdup(sql);
 
-    /* Count ? placeholders */
     size_t sql_len = strlen(sql);
-    size_t result_cap = sql_len * 2 + 4096;
+    size_t result_cap = sql_len + 64;   /* grows on demand below */
     char *result = malloc(result_cap);
-    char *out = result;
+    if (!result) return NULL;
+    size_t len = 0;
     size_t bind_idx = start_idx;
+
+    /* Bound values are UNBOUNDED user data (strada_to_str of an arbitrary
+     * scalar), so the buffer MUST grow per-write. The old fixed
+     * malloc(sql_len*2 + 4096) was sized by the SQL *template* only and
+     * overflowed the heap on any bound value larger than the slack (security
+     * audit H4). Ensure room for `extra` more bytes (plus the trailing NUL)
+     * before each write, doubling as needed. */
+    #define BP_ENSURE(extra) do { \
+        size_t _need = len + (size_t)(extra) + 1; \
+        if (_need > result_cap) { \
+            while (result_cap < _need) result_cap *= 2; \
+            char *_nb = realloc(result, result_cap); \
+            if (!_nb) { free(result); return NULL; } \
+            result = _nb; \
+        } \
+    } while (0)
 
     for (size_t i = 0; i < sql_len; i++) {
         if (sql[i] == '?' && bind_idx < av->size) {
             StradaValue *val = strada_array_get(av, bind_idx++);
             if (!val || (!STRADA_IS_TAGGED_INT(val) && val->type == STRADA_UNDEF)) {
-                memcpy(out, "NULL", 4);
-                out += 4;
+                BP_ENSURE(4);
+                memcpy(result + len, "NULL", 4);
+                len += 4;
             } else {
                 char *s = strada_to_str(val);
-                *out++ = '\'';
-                /* Escape single quotes */
+                /* Worst case: every char is a single-quote (doubled), plus the
+                 * two surrounding quotes. */
+                BP_ENSURE(strlen(s) * 2 + 2);
+                result[len++] = '\'';
                 for (char *p = s; *p; p++) {
-                    if (*p == '\'') *out++ = '\'';
-                    *out++ = *p;
+                    if (*p == '\'') result[len++] = '\'';
+                    result[len++] = *p;
                 }
-                *out++ = '\'';
+                result[len++] = '\'';
                 free(s);
             }
         } else {
-            *out++ = sql[i];
+            BP_ENSURE(1);
+            result[len++] = sql[i];
         }
     }
-    *out = '\0';
+    BP_ENSURE(0);
+    result[len] = '\0';
+    #undef BP_ENSURE
     return result;
 }
 

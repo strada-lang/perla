@@ -10503,6 +10503,31 @@ done:
     return matched ? STRADA_MAKE_TAGGED_INT(1) : strada_new_str("");
 }
 
+/* Grow-and-retry formatted append: advances *len only by the bytes actually
+ * written, growing *buf to fit. Returns 0 on success, -1 on OOM (buffer left
+ * valid + NUL-terminated). Replaces the old "len += snprintf()-return" idiom
+ * whose unsigned (cap - len) underflow let a long message overflow the heap
+ * (security audit H1). Signature matches _append_utf8/_dumper_append. */
+static int perla_strbuf_appendf(char **buf, size_t *len, size_t *cap, const char *fmt, ...) {
+    for (;;) {
+        va_list ap;
+        va_start(ap, fmt);
+        size_t avail = (*cap > *len) ? (*cap - *len) : 0;
+        int n = vsnprintf(*buf + *len, avail, fmt, ap);
+        va_end(ap);
+        if (n < 0) return -1;
+        if ((size_t)n < avail) { *len += (size_t)n; return 0; }
+        size_t need = *len + (size_t)n + 1;
+        size_t ncap = *cap ? *cap : 1024;
+        while (ncap < need) ncap *= 2;
+        char *nb = (char *)realloc(*buf, ncap);
+        if (!nb) return -1;
+        *buf = nb;
+        *cap = ncap;
+        /* retry with the grown buffer */
+    }
+}
+
 StradaValue *perla_carp_longmess(StradaValue *args) {
     StradaArray *av = args ? strada_deref_array(args) : NULL;
     char *m = NULL;
@@ -10525,8 +10550,7 @@ StradaValue *perla_carp_longmess(StradaValue *args) {
         if (f && f[0]) file0 = f;
         line0 = perla_call_stack[perla_call_depth - 1].line;
     }
-    int n = snprintf(out + len, cap - len, "%s at %s line %d.\n", m, file0, line0);
-    if (n > 0) len += (size_t)n;
+    perla_strbuf_appendf(&out, &len, &cap, "%s at %s line %d.\n", m, file0, line0);
 
     /* Then "\tPKG::SUB() called at FILE line N." for each caller above. */
     for (int i = perla_call_depth - 2; i >= 0; i--) {
@@ -10540,22 +10564,15 @@ StradaValue *perla_carp_longmess(StradaValue *args) {
          * frame's file/line as an approximation). */
         const char *file = perla_call_stack[i].file ? perla_call_stack[i].file : "<unknown>";
         int line = perla_call_stack[i].line;
-        if (cap - len < 512) {
-            cap *= 2;
-            char *nb = (char *)realloc(out, cap);
-            if (!nb) break;
-            out = nb;
-        }
         /* Synthetic eval-block frame: print as "eval {...} called at ..."
          * with no PKG:: prefix (matches perl's Carp output). */
         if (sub && strcmp(sub, "(eval)") == 0) {
-            n = snprintf(out + len, cap - len, "\teval {...} called at %s line %d.\n",
-                         file, line);
+            perla_strbuf_appendf(&out, &len, &cap, "\teval {...} called at %s line %d.\n",
+                                 file, line);
         } else {
-            n = snprintf(out + len, cap - len, "\t%s::%s() called at %s line %d.\n",
-                         pkg, sub, file, line);
+            perla_strbuf_appendf(&out, &len, &cap, "\t%s::%s() called at %s line %d.\n",
+                                 pkg, sub, file, line);
         }
-        if (n > 0) len += (size_t)n;
     }
     free(m);
     StradaValue *r = strada_new_str(out);
