@@ -2077,6 +2077,15 @@ func main() int {
 
         my str $so_file = $base . ".pm.so";
         my str $inc_flags = " -I" . $runtime_dir . " -I" . $perla_runtime_dir . $pcre2_flags;
+        # NO_TLS module build (set by a NO_TLS/tcc main binary's runtime
+        # require). Compile the .pm.o/.pm.so without __thread so their globals
+        # (strada_call_context, perla_real_call_depth, perla_pending_*) resolve
+        # to the plain globals the NO_TLS main exports — otherwise a dlopen'd
+        # .pm.so faults dereferencing a TLS address. Applied to both the .o and
+        # .so builds via $inc_flags.
+        if (core::getenv("PERLA_MODULE_NO_TLS") eq "1") {
+            $inc_flags = $inc_flags . " -DSTRADA_NO_TLS";
+        }
 
         # Eval STRING / runtime require only need the .pm.so (dlopened
         # at runtime). Skipping the .pm.o cuts a full gcc invocation per
@@ -2313,6 +2322,16 @@ func main() int {
             say(STDERR, "[perla]   [" . $__lpi . "] " . $lib_paths->[$__lpi]);
             $__lpi++;
         }
+    }
+
+    # tcc target: force-inline every module (skip precompiled .pm.o/.pm.so) so
+    # the whole program is one NO_TLS translation unit — the gcc/TLS artifacts
+    # can't link against the tcc-compiled main object. The Parser reads
+    # PERLA_TARGET_TCC. tcc is in effect iff `--cc tcc`, or run-mode
+    # (no -o) with PERLA_CC=tcc (mirrors the cc selection below).
+    if ($cc_override eq "tcc"
+        || (length($cc_override) == 0 && length($output) == 0 && _detect_cc() eq "tcc")) {
+        core::setenv("PERLA_TARGET_TCC", "1");
     }
 
     # Compile Perl to C

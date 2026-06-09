@@ -14501,11 +14501,19 @@ StradaValue *perla_eval_string(StradaValue *code_sv, const char *current_pkg) {
      * stash slots (and thus persist across eval-body .so loads). */
     const char *pad_on = getenv("PERLA_REPL_PAD");
     const char *eval_pad_env = (pad_on && pad_on[0] == '1') ? "PERLA_REPL_PAD=1 " : "";
+    /* NO_TLS (tcc) main: compile the eval-STRING snippet's .pm.so NO_TLS too,
+     * else it faults on a __thread global when dlopen'd into the plain-global
+     * main (same class as runtime require). */
+#ifdef STRADA_NO_TLS
+    const char *eval_no_tls = "PERLA_MODULE_NO_TLS=1 ";
+#else
+    const char *eval_no_tls = "";
+#endif
     if (g_perla_path[0] && g_strada_dir[0]) {
-        snprintf(cmd, sizeof(cmd), "%s%sSTRADA_DIR=%s PERLA_BUILD_PM_SO_ONLY=1 %s%s -M %s 2>&1",
-                 eval_pad_env, eval_lib_env, g_strada_dir, eval_cc_env, g_perla_path, pm_path);
+        snprintf(cmd, sizeof(cmd), "%s%s%sSTRADA_DIR=%s PERLA_BUILD_PM_SO_ONLY=1 %s%s -M %s 2>&1",
+                 eval_no_tls, eval_pad_env, eval_lib_env, g_strada_dir, eval_cc_env, g_perla_path, pm_path);
     } else if (g_perla_path[0]) {
-        snprintf(cmd, sizeof(cmd), "%s%sPERLA_BUILD_PM_SO_ONLY=1 %s%s -M %s 2>&1", eval_pad_env, eval_lib_env, eval_cc_env, g_perla_path, pm_path);
+        snprintf(cmd, sizeof(cmd), "%s%s%sPERLA_BUILD_PM_SO_ONLY=1 %s%s -M %s 2>&1", eval_no_tls, eval_pad_env, eval_lib_env, eval_cc_env, g_perla_path, pm_path);
     } else {
         /* Perla not available — return error */
         extern StradaValue *perla_eval_error;
@@ -23415,9 +23423,20 @@ StradaValue *perla_require_module(StradaValue *module_sv) {
         src_dir[sizeof(src_dir) - 1] = 0;
         char *last_slash = strrchr(src_dir, '/');
         int dir_writable = 1;
+#ifdef STRADA_NO_TLS
+        /* A NO_TLS (tcc) main binary must build dlopen'd modules NO_TLS too,
+         * at a DISTINCT staging path so they never collide with the gcc/TLS
+         * cache (next to source, or /tmp/perla_sys_*). A .pm.so built with
+         * __thread globals faults when dlopen'd into the plain-global main. */
+        const int __force_stage = 1;
+        const char *__stage_prefix = "perla_tcc_";
+#else
+        const int __force_stage = 0;
+        const char *__stage_prefix = "perla_sys_";
+#endif
         if (last_slash) {
             *last_slash = 0;
-            if (access(src_dir, W_OK) != 0) {
+            if (__force_stage || access(src_dir, W_OK) != 0) {
                 dir_writable = 0;
                 /* Build a sanitized basename: convert '/' (none) and the
                  * .pm tail to a flat unique name. Use the module name
@@ -23434,7 +23453,7 @@ StradaValue *perla_require_module(StradaValue *module_sv) {
                 }
                 flat[fp] = 0;
                 snprintf(build_pm_path, sizeof(build_pm_path),
-                         "/tmp/perla_sys_%s.pm", flat);
+                         "/tmp/%s%s.pm", __stage_prefix, flat);
                 /* Copy source .pm to staging path. */
                 FILE *src_f = fopen(pm_path, "r");
                 FILE *dst_f = fopen(build_pm_path, "w");
@@ -23483,13 +23502,20 @@ StradaValue *perla_require_module(StradaValue *module_sv) {
         const char *_pp_deps = (getenv("PERLA_RUNTIME_PRECOMPILE_DEPS")
                                 && getenv("PERLA_RUNTIME_PRECOMPILE_DEPS")[0] == '1')
                                ? "PERLA_PRECOMPILE_DEPS=1 " : "";
+        /* NO_TLS (tcc) main: tell the `perla -M` child to compile the staged
+         * module's .pm.o/.pm.so without __thread so they match this binary. */
+#ifdef STRADA_NO_TLS
+        const char *_no_tls = "PERLA_MODULE_NO_TLS=1 ";
+#else
+        const char *_no_tls = "";
+#endif
         char cmd[4096];
         if (g_perla_path[0] && g_strada_dir[0]) {
-            snprintf(cmd, sizeof(cmd), "STRADA_DIR=%s PERLA_MODULE_NAME=%s PERLA_BUILD_PM_SO=1 %s%s -M %s 2>&1",
-                     g_strada_dir, module, _pp_deps, g_perla_path, build_pm_path);
+            snprintf(cmd, sizeof(cmd), "%sSTRADA_DIR=%s PERLA_MODULE_NAME=%s PERLA_BUILD_PM_SO=1 %s%s -M %s 2>&1",
+                     _no_tls, g_strada_dir, module, _pp_deps, g_perla_path, build_pm_path);
         } else {
-            snprintf(cmd, sizeof(cmd), "PERLA_MODULE_NAME=%s PERLA_BUILD_PM_SO=1 %sperla -M %s 2>&1",
-                     module, _pp_deps, build_pm_path);
+            snprintf(cmd, sizeof(cmd), "%sPERLA_MODULE_NAME=%s PERLA_BUILD_PM_SO=1 %sperla -M %s 2>&1",
+                     _no_tls, module, _pp_deps, build_pm_path);
         }
         if (perla_debug_mode()) fprintf(stderr, "[require] compiling: %s%s\n", cmd, dir_writable ? "" : " (staged)");
         FILE *proc = popen(cmd, "r");

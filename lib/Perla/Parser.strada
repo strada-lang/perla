@@ -3158,6 +3158,17 @@ func _load_module(scalar $p, str $module) scalar {
     my str $so_path = $found_path . ".so";
     my int $o_exists = core::file_exists($o_path);
     my int $so_exists = core::file_exists($so_path);
+    # tcc target: ignore precompiled artifacts and inline the module instead.
+    # The .pm.o/.pm.so are gcc-built with TLS (__thread); they can't link
+    # against the tcc-compiled NO_TLS main object ("TLS reference ... mismatches
+    # non-TLS reference"). Inlining keeps the whole program in one NO_TLS
+    # translation unit. The driver sets PERLA_TARGET_TCC when --cc tcc (or
+    # run-mode PERLA_CC=tcc) is in effect. tcc compiles big TUs ~90x faster than
+    # gcc, so the larger single unit is cheap.
+    if (core::getenv("PERLA_TARGET_TCC") eq "1") {
+        $o_exists = 0;
+        $so_exists = 0;
+    }
     # Freshness check: a stale .pm.o/.pm.so older than the .pm source
     # silently masked source edits — perla blindly dlopen()'d the stale
     # artifact and ran old compiled code, so warn/print/sub-body changes
