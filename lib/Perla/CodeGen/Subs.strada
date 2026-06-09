@@ -17,6 +17,7 @@
 
 use Perla::AST;
 use Perla::CodeGen::Collect;
+use Perla::CodeGen::Escape;
 
 package Perla::CodeGen::Subs;
 
@@ -558,7 +559,7 @@ func gen_sub_def(scalar $cg, scalar $node) void {
         $cg->{"indent"} = 1;
 
         # Push call stack for caller()
-        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "perla_call_push(\"" . $pkg . "\", \"" . $name . "\", \"" . $cg->{"filename"} . "\", 0);\n");
+        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "perla_call_push(\"" . Perla::CodeGen::Escape::escape_c_str($pkg) . "\", \"" . Perla::CodeGen::Escape::escape_c_str($name) . "\", \"" . Perla::CodeGen::Escape::escape_c_str("" . $cg->{"filename"}) . "\", 0);\n");
 
         # Populate a local perla_at_ from the positional params so the body
         # can reference @_ correctly. Real Perl: `my ($a, $b) = @_` doesn't
@@ -1084,7 +1085,7 @@ func gen_sub_def(scalar $cg, scalar $node) void {
     # Push call stack for caller()
     my str $fn_file = "" . $cg->{"filename"};
     if (length($fn_file) == 0) { $fn_file = "(unknown)"; }
-    Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "perla_call_push(\"" . $pkg . "\", \"" . $name . "\", \"" . $fn_file . "\", 0);\n");
+    Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "perla_call_push(\"" . Perla::CodeGen::Escape::escape_c_str($pkg) . "\", \"" . Perla::CodeGen::Escape::escape_c_str($name) . "\", \"" . Perla::CodeGen::Escape::escape_c_str($fn_file) . "\", 0);\n");
 
     # Save cleanup-stack baseline (see comment on the __direct path).
     Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "int __perla_cleanup_mark = strada_cleanup_mark();\n");

@@ -492,7 +492,7 @@ func generate(scalar $ast) str {
     ind(\%cg); emit(\%cg, "errno = 0;\n\n");
 
     # Push main call frame for caller() support
-    ind(\%cg); emit(\%cg, "perla_call_push(\"main\", \"(main)\", \"" . $cg{"filename"} . "\", 0);\n");
+    ind(\%cg); emit(\%cg, "perla_call_push(\"main\", \"(main)\", \"" . Perla::CodeGen::Escape::escape_c_str("" . $cg{"filename"}) . "\", 0);\n");
 
     # Per-call mark for `local $h->{k} = v` save records — captures the
     # current global chain head so we can unwind back to it on exit. The
@@ -1459,7 +1459,7 @@ func generate_module(scalar $ast, str $mod_name) str {
     # that follow register accessors in the WRONG package and `$obj->attr`
     # later misses dispatch with "Can't locate object method ... via
     # package ...". The frame is popped at end-of-init.
-    emit(\%cg, "    perla_call_push(\"" . $mod_name . "\", \"(init)\", \"" . $cg{"filename"} . "\", 0);\n");
+    emit(\%cg, "    perla_call_push(\"" . Perla::CodeGen::Escape::escape_c_str($mod_name) . "\", \"(init)\", \"" . Perla::CodeGen::Escape::escape_c_str("" . $cg{"filename"}) . "\", 0);\n");
     # Mark this stash as fully inlined so a runtime `require` of this
     # module short-circuits past the compile+dlopen path. Without this,
     # require() falls back to "is the stash non-empty" — which is wrong
@@ -1937,7 +1937,7 @@ func _gen_our(scalar $cg, scalar $node) void {
                     my scalar $elem = $elems->[$ei];
                     my int $et = $elem->{"type"};
                     if ($et == Perla::AST::N_STR_LIT()) {
-                        ind($cg); emit($cg, "perla_isa_push(\"" . $pkg . "\", \"" . $elem->{"value"} . "\");\n");
+                        ind($cg); emit($cg, "perla_isa_push(\"" . Perla::CodeGen::Escape::escape_c_str($pkg) . "\", \"" . Perla::CodeGen::Escape::escape_c_str($elem->{"value"}) . "\");\n");
                     } elsif ($et == Perla::AST::N_INTERP_STR()) {
                         # If the interp string has no `$var`/`@var` refs,
                         # treat as literal. Otherwise evaluate at runtime
@@ -1947,29 +1947,29 @@ func _gen_our(scalar $cg, scalar $node) void {
                         # (which perla_isa_push would then try to load as a
                         # module named with a dollar sign).
                         if (has_perl_var($elem->{"value"}) == 0) {
-                            ind($cg); emit($cg, "perla_isa_push(\"" . $pkg . "\", \"" . $elem->{"value"} . "\");\n");
+                            ind($cg); emit($cg, "perla_isa_push(\"" . Perla::CodeGen::Escape::escape_c_str($pkg) . "\", \"" . Perla::CodeGen::Escape::escape_c_str($elem->{"value"}) . "\");\n");
                         } else {
                             ind($cg); emit($cg, "{ char *__ipn = strada_to_str(");
                             gen_expr($cg, $elem);
-                            emit($cg, "); perla_isa_push(\"" . $pkg . "\", __ipn); free(__ipn); }\n");
+                            emit($cg, "); perla_isa_push(\"" . Perla::CodeGen::Escape::escape_c_str($pkg) . "\", __ipn); free(__ipn); }\n");
                         }
                     } else {
                         ind($cg); emit($cg, "{ char *__ipn = strada_to_str(");
                         gen_expr($cg, $elem);
-                        emit($cg, "); perla_isa_push(\"" . $pkg . "\", __ipn); free(__ipn); }\n");
+                        emit($cg, "); perla_isa_push(\"" . Perla::CodeGen::Escape::escape_c_str($pkg) . "\", __ipn); free(__ipn); }\n");
                     }
                     $ei++;
                 }
             } elsif ($init->{"type"} == Perla::AST::N_STR_LIT()) {
                 # Single string: our @ISA = ('Parent')
-                ind($cg); emit($cg, "perla_isa_push(\"" . $pkg . "\", \"" . $init->{"value"} . "\");\n");
+                ind($cg); emit($cg, "perla_isa_push(\"" . Perla::CodeGen::Escape::escape_c_str($pkg) . "\", \"" . Perla::CodeGen::Escape::escape_c_str($init->{"value"}) . "\");\n");
             } elsif ($init->{"type"} == Perla::AST::N_INTERP_STR()) {
                 if (has_perl_var($init->{"value"}) == 0) {
-                    ind($cg); emit($cg, "perla_isa_push(\"" . $pkg . "\", \"" . $init->{"value"} . "\");\n");
+                    ind($cg); emit($cg, "perla_isa_push(\"" . Perla::CodeGen::Escape::escape_c_str($pkg) . "\", \"" . Perla::CodeGen::Escape::escape_c_str($init->{"value"}) . "\");\n");
                 } else {
                     ind($cg); emit($cg, "{ char *__ipn = strada_to_str(");
                     gen_expr($cg, $init);
-                    emit($cg, "); perla_isa_push(\"" . $pkg . "\", __ipn); free(__ipn); }\n");
+                    emit($cg, "); perla_isa_push(\"" . Perla::CodeGen::Escape::escape_c_str($pkg) . "\", __ipn); free(__ipn); }\n");
                 }
             }
             return;
@@ -3668,7 +3668,7 @@ func gen_expr(scalar $cg, scalar $node) void {
         my str $__ev_pkg_expr = "main";
         if (defined($cg->{"pkg"})) { $__ev_pkg_expr = "" . $cg->{"pkg"}; }
         emit($cg, "perla_pending_call_line = " . $__ev_pln_expr . "; ");
-        emit($cg, "perla_call_push(\"" . $__ev_pkg_expr . "\", \"(eval)\", \"" . $cg->{"filename"} . "\", 0); ");
+        emit($cg, "perla_call_push(\"" . Perla::CodeGen::Escape::escape_c_str($__ev_pkg_expr) . "\", \"(eval)\", \"" . Perla::CodeGen::Escape::escape_c_str("" . $cg->{"filename"}) . "\", 0); ");
         emit($cg, "if (perla_eval_error) strada_decref(perla_eval_error); ");
         emit($cg, "perla_eval_error = strada_new_str(\"\"); ");
         emit($cg, "jmp_buf *__ev_jb = STRADA_TRY_PUSH(); ");

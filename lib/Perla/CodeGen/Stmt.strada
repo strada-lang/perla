@@ -2066,7 +2066,7 @@ func gen_stmt(scalar $cg, scalar $node) void {
         my str $__ev_pkg_stmt = "main";
         if (defined($cg->{"pkg"})) { $__ev_pkg_stmt = "" . $cg->{"pkg"}; }
         Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "  perla_pending_call_line = " . $__ev_pln_stmt . ";\n");
-        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "  perla_call_push(\"" . $__ev_pkg_stmt . "\", \"(eval)\", \"" . $cg->{"filename"} . "\", 0);\n");
+        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "  perla_call_push(\"" . Perla::CodeGen::Escape::escape_c_str($__ev_pkg_stmt) . "\", \"(eval)\", \"" . Perla::CodeGen::Escape::escape_c_str("" . $cg->{"filename"}) . "\", 0);\n");
         # Save want_list. die's longjmp bypasses the per-statement save/restore
         # inside the body, so without this the void-context (-1) set around an
         # inner statement leaks out and corrupts later list-vs-scalar dispatch
