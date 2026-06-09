@@ -4,9 +4,9 @@
 
 ## Remediation status
 
-**18 of 19 findings fixed** (all HIGH + all MEDIUM + 5 of 6 LOW); 1 deferred.
+**19 of 19 findings fixed** (all HIGH + all MEDIUM + all LOW).
 The detailed findings below are retained for reference, but each is now closed
-(or explicitly deferred) per the table:
+per the table:
 
 | Findings | Fix commit |
 |----------|------------|
@@ -15,7 +15,7 @@ The detailed findings below are retained for reference, but each is now closed
 | H7, H8, M5 | `266a8ce` — codegen C-injection (`escape_c_str` on `@ISA`/filenames) |
 | H5, H6, M2, M3, M4, L2, L3 | `66f6ce6` — command injection (`_shq`/`perla_shq` shell quoting) |
 | L1, L4, L5 | `4233e02` — conninfo quoting, driver `/tmp`, hex-float exponent DoS |
-| **L6** | **deferred** — heredoc O(prefix×N) re-splice DoS; LOW, needs a careful lexer refactor + heredoc test coverage (see L6 below) |
+| L6 | heredoc O(prefix×N) re-splice DoS — replaced per-heredoc whole-source re-splice with O(1) skip-ranges; added `t/164_heredoc.pl` (14 checks). Differential: 0.55s vs 3.11s on 4000 heredocs |
 
 Each fix was verified with a differential test (AddressSanitizer for the
 overflows; neutralized PoCs for injection), the full suite (167/167), add.pl

@@ -32,8 +32,28 @@ func lex(str $source) array {
     $lx{"len"} = $len;
     $lx{"line"} = 1;
 
+    # Heredoc body skip-ranges. Instead of splicing each heredoc body out of
+    # $source (which rebuilt the whole string per heredoc → O(prefix*N), a DoS
+    # on a file with many heredocs — audit L6), the heredoc handler records the
+    # body's [start,end) and the main loop jumps $pos over it in O(1). Ranges
+    # are recorded in source order (a heredoc body always follows its `<<DELIM`),
+    # so a single advancing index suffices. $hd_consumed marks the furthest body
+    # end seen so far, so a SECOND heredoc on the same line starts its body scan
+    # after the first one's body (matching the old splice, which removed body A
+    # so body B became "the next line").
+    my array @hd_skip_start = ();
+    my array @hd_skip_end = ();
+    my int $hd_skip_i = 0;
+    my int $hd_consumed = 0;
+
     while ($lx{"pos"} < $len) {
         my int $pos = $lx{"pos"};
+        # Skip past any consumed heredoc body the scan position has reached.
+        if ($hd_skip_i < scalar(@hd_skip_start) && $pos >= $hd_skip_start[$hd_skip_i]) {
+            $lx{"pos"} = $hd_skip_end[$hd_skip_i];
+            $hd_skip_i = $hd_skip_i + 1;
+            next;
+        }
         my str $ch = substr($source, $pos, 1);
 
         # Newlines
@@ -1747,6 +1767,10 @@ func lex(str $source) array {
                     while ($line_end < $len && substr($source, $line_end, 1) ne "\n") { $line_end++; }
                     my int $body_scan = $line_end;
                     if ($body_scan < $len) { $body_scan = $body_scan + 1; }
+                    # A second heredoc on the same line starts its body after the
+                    # previous heredoc's body (which the old code achieved by
+                    # splicing body A out so body B became "the next line").
+                    if ($body_scan < $hd_consumed) { $body_scan = $hd_consumed; }
                     my str $body = "";
                     my int $body_end = $body_scan;
                     while ($body_end < $len) {
@@ -1823,13 +1847,13 @@ func lex(str $source) array {
                     # Splice out [body_scan..body_end) from source so the line
                     # numbers stay roughly correct AND the rest of the current
                     # line (after `<<'EOC'`) is still tokenized naturally.
-                    my str $before = substr($source, 0, $body_scan);
-                    my str $after = "";
-                    if ($body_end < $len) { $after = substr($source, $body_end); }
-                    $source = $before . $after;
-                    $len = core::byte_length($source);
-                    $lx{"src"} = $source;
-                    $lx{"len"} = $len;
+                    # Record the body range to skip rather than rebuilding the
+                    # whole source string (the O(prefix*N) DoS — audit L6). The
+                    # main loop jumps $pos over [body_scan,body_end) when it
+                    # reaches it; $source/$len stay untouched.
+                    push(@hd_skip_start, $body_scan);
+                    push(@hd_skip_end, $body_end);
+                    if ($body_end > $hd_consumed) { $hd_consumed = $body_end; }
                     # Push the heredoc body as a STRING/DQSTRING token at the
                     # current position; subsequent loop iterations will continue
                     # from `$lx{"pos"}` which still points just past `<<'EOC'`.
