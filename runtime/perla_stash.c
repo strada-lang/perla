@@ -3865,8 +3865,13 @@ void perla_code_set_protected(const char *pkg, const char *name, StradaValue *va
 /* Set by perla_call_code right before invoking a closure/cpointer
  * when the SV has a Sub::Util::set_subname-attached name. Consumed
  * by the next perla_call_push inside the callee. */
+#ifdef STRADA_NO_TLS
+const char *perla_pending_subname_override = NULL;
+const char *perla_pending_package_override = NULL;
+#else
 __thread const char *perla_pending_subname_override = NULL;
 __thread const char *perla_pending_package_override = NULL;
+#endif
 
 /* Forward decl — definition lives much later in the file alongside
  * the rest of the Sub::Util machinery. */

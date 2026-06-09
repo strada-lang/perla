@@ -13,6 +13,33 @@
 
 #include "strada_runtime.h"
 
+/* --- tcc (--cc tcc) compatibility shims -------------------------------------
+ * tcc 0.9.27 lacks GCC's __builtin_expect and the overflow-checked arithmetic
+ * builtins perla emits for tagged-integer math (int64_t / uint64_t add, sub,
+ * mul). Provide them so the tcc backend can compile generated programs. Only
+ * active under __TINYC__ — gcc/clang use their real builtins. *(res) receives
+ * the wrapped result; the macro evaluates nonzero on overflow. Operand and
+ * result types match at every emission site (T op T -> T). */
+#ifdef __TINYC__
+#undef __builtin_expect
+#define __builtin_expect(x, c) (x)
+#define __builtin_add_overflow(a, b, res) ({ \
+    __typeof__(*(res)) __oa = (a), __ob = (b), __or; int __ov; \
+    if ((__typeof__(*(res)))-1 > 0) { __or = (__typeof__(*(res)))(__oa + __ob); __ov = (__or < __oa); } \
+    else { unsigned long long __u = (unsigned long long)__oa + (unsigned long long)__ob; \
+           __or = (__typeof__(*(res)))__u; __ov = (((__oa ^ __or) & (__ob ^ __or)) < 0); } \
+    *(res) = __or; __ov; })
+#define __builtin_sub_overflow(a, b, res) ({ \
+    __typeof__(*(res)) __oa = (a), __ob = (b), __or; int __ov; \
+    if ((__typeof__(*(res)))-1 > 0) { __or = (__typeof__(*(res)))(__oa - __ob); __ov = (__oa < __ob); } \
+    else { unsigned long long __u = (unsigned long long)__oa - (unsigned long long)__ob; \
+           __or = (__typeof__(*(res)))__u; __ov = (((__oa ^ __ob) & (__oa ^ __or)) < 0); } \
+    *(res) = __or; __ov; })
+#define __builtin_mul_overflow(a, b, res) ({ \
+    __typeof__(*(res)) __oa = (a), __ob = (b), __or = (__typeof__(*(res)))(__oa * __ob); \
+    *(res) = __or; (__oa != 0 && __or / __oa != __ob); })
+#endif
+
 /* Binary-safe string-literal constructor — uses sizeof on the literal so
  * embedded NUL bytes ("\x00""ABC", \0 mid-string) survive instead of being
  * truncated by strada_new_str's implicit strlen. The argument must be a real
@@ -331,8 +358,16 @@ StradaValue *perla_smartmatch(StradaValue *lhs, StradaValue *rhs);
  * SV has a Sub::Util::set_subname-attached name. Without this hook,
  * caller(0)[3] inside the called sub returned perla's internal
  * __perla_anon_N placeholder rather than the user-attached name. */
+/* STRADA_NO_TLS (the tcc backend): tcc has no __thread, and the runtime
+ * archive is built single-threaded with these as plain globals — so declare
+ * them without __thread there too, matching strada_runtime.h's TLS vars. */
+#ifdef STRADA_NO_TLS
+extern const char *perla_pending_subname_override;
+extern const char *perla_pending_package_override;
+#else
 extern __thread const char *perla_pending_subname_override;
 extern __thread const char *perla_pending_package_override;
+#endif
 
 /* Cold path of perla_call_push: the lazy PERLA_WARN_RECURSION getenv init,
  * the deep-recursion warning, and Sub::Util::set_subname / package-name

@@ -121,12 +121,12 @@ runtime/perla_runtime.a: $(RUNTIME_OBJ) $(PERLA_RUNTIME) runtime/perla_dbi.c run
 
 # TCC-compatible runtime archive (for REPL and -e mode)
 runtime/perla_runtime_tcc.a: $(RUNTIME_SRC) $(PERLA_RUNTIME) runtime/perla_dbi.c runtime/perla_tcc.h runtime/perla_tcc_inlines.c runtime/perla_xsloader.c runtime/perla_xsloader.h runtime/perla_perl_compat.h
-	$(CC) $(CFLAGS) -fPIC -DSTRADA_NO_TLS -c $(RUNTIME_SRC) -I$(RUNTIME_DIR) -o runtime/strada_runtime_tcc.o
-	$(CC) $(CFLAGS) -fPIC -DSTRADA_NO_TLS -c $(PERLA_RUNTIME) -I$(RUNTIME_DIR) -Iruntime -o runtime/perla_stash_tcc.o
-	$(CC) $(CFLAGS) -fPIC -DSTRADA_NO_TLS -c runtime/perla_dbi.c -I$(RUNTIME_DIR) -Iruntime -o runtime/perla_dbi_tcc.o
-	$(CC) $(CFLAGS) -fPIC -DSTRADA_NO_TLS -c runtime/perla_tcc_inlines.c -I$(RUNTIME_DIR) -Iruntime -o runtime/perla_tcc_inlines.o
-	$(CC) $(CFLAGS) -fPIC -DSTRADA_NO_TLS -c runtime/perla_moose_xs.c -I$(RUNTIME_DIR) -Iruntime -o runtime/perla_moose_xs_tcc.o
-	$(CC) $(CFLAGS) -fPIC -DSTRADA_NO_TLS -c runtime/perla_xsloader.c -I$(RUNTIME_DIR) -Iruntime -o runtime/perla_xsloader_tcc.o
+	$(CC) $(CFLAGS) -fno-pic -fno-pie -DSTRADA_NO_TLS -c $(RUNTIME_SRC) -I$(RUNTIME_DIR) -o runtime/strada_runtime_tcc.o
+	$(CC) $(CFLAGS) -fno-pic -fno-pie -DSTRADA_NO_TLS -c $(PERLA_RUNTIME) -I$(RUNTIME_DIR) -Iruntime -o runtime/perla_stash_tcc.o
+	$(CC) $(CFLAGS) -fno-pic -fno-pie -DSTRADA_NO_TLS -c runtime/perla_dbi.c -I$(RUNTIME_DIR) -Iruntime -o runtime/perla_dbi_tcc.o
+	$(CC) $(CFLAGS) -fno-pic -fno-pie -DSTRADA_NO_TLS -c runtime/perla_tcc_inlines.c -I$(RUNTIME_DIR) -Iruntime -o runtime/perla_tcc_inlines.o
+	$(CC) $(CFLAGS) -fno-pic -fno-pie -DSTRADA_NO_TLS -c runtime/perla_moose_xs.c -I$(RUNTIME_DIR) -Iruntime -o runtime/perla_moose_xs_tcc.o
+	$(CC) $(CFLAGS) -fno-pic -fno-pie -DSTRADA_NO_TLS -c runtime/perla_xsloader.c -I$(RUNTIME_DIR) -Iruntime -o runtime/perla_xsloader_tcc.o
 	ar rcs $@ runtime/strada_runtime_tcc.o runtime/perla_stash_tcc.o runtime/perla_dbi_tcc.o runtime/perla_tcc_inlines.o runtime/perla_moose_xs_tcc.o runtime/perla_xsloader_tcc.o
 
 # Combine library sources

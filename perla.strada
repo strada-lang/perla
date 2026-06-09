@@ -901,8 +901,31 @@ func _compile_c(str $c_file, str $exe, str $strada_dir, str $cc, str $extra_objs
             # runtime headers, otherwise `extern __thread int
             # strada_call_context;` in strada_runtime.h breaks tcc's parse.
             my str $tcc_defs = " -DSTRADA_NO_TLS" . $tcc_pcre2_def;
-            my str $cmd = "tcc -o " . $exe . " " . $c_file . $extra_objs . " " . $tcc_runtime . $tcc_pcre2 . " -I" . $runtime_dir . " -I" . $perla_rt_dir . $tcc_defs . $link_flags . " 2>&1";
-            return _run_cc($cmd);
+            my str $tcc_inc = " -I" . $runtime_dir . " -I" . $perla_rt_dir;
+            # Hybrid compile: tcc COMPILES the (often huge) generated C to a .o
+            # — the fast part, since cc1 is the real bottleneck (tcc is ~90x
+            # faster on big TUs: 0.6s vs 55s on a 35MB source). gcc/ld then
+            # LINKS, because tcc's own linker can't handle the GOT relocations
+            # in gcc-built archives (the historical "Unknown relocation type for
+            # got" wall). The tcc runtime archive is built NON-PIC (see the
+            # Makefile) so the -no-pie link accepts it; __floatundidf & friends
+            # — which gcc inlines but tcc emits as calls, so x86-64 libgcc omits
+            # them — are provided by perla_tcc_inlines.c in that archive.
+            my str $tcc_obj = $c_file . ".tcc.o";
+            core::unlink($tcc_obj);
+            my str $tcc_cmd = "tcc -w -c " . $c_file . $tcc_inc . $tcc_defs . " -o " . $tcc_obj . " 2>&1";
+            my str $tcc_out = _run_cc($tcc_cmd);
+            if (core::file_exists($tcc_obj) != 1) {
+                return $tcc_out;   # tcc compile error → surface it
+            }
+            # gcc/ld link, non-PIE (runtime is non-PIC). -DSTRADA_NO_TLS so any
+            # sibling .c (XS hooks) in $extra_objs gcc compiles here use the
+            # same plain-global convention as the tcc object + the NO_TLS
+            # runtime, rather than __thread.
+            my str $link_cmd = "gcc -no-pie -Wl,-z,noexecstack -DSTRADA_NO_TLS -o " . $exe . " " . $tcc_obj . $extra_objs . " " . $tcc_runtime . $tcc_pcre2 . $tcc_inc . $tcc_pcre2_def . $link_flags . " 2>&1";
+            my str $link_out = _run_cc($link_cmd);
+            core::unlink($tcc_obj);
+            return $link_out;
         }
     }
 

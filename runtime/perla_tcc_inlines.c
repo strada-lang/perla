@@ -160,3 +160,18 @@ int strada_is_slot_ref(StradaValue *sv) {
     if (!sv || STRADA_IS_TAGGED_INT(sv)) return 0;
     return (sv->type == STRADA_REF && sv->value.rv != NULL) ? 1 : 0;
 }
+
+/* ---- libgcc soft-float helpers for the tcc backend ------------------------
+ * gcc inlines 64-bit integer <-> floating conversions on x86-64, so x86-64
+ * libgcc does NOT ship these symbols — but tcc emits calls to them (e.g.
+ * __floatundidf for an unsigned-64 -> double in tagged-int math). Provide
+ * them here so the tcc-compiled object links (pulled from perla_runtime_tcc.a
+ * only when referenced). All are exact-cast trivial. */
+double   __floatdidf(int64_t x)   { return (double)x; }
+double   __floatundidf(uint64_t x){ return (double)x; }
+float    __floatdisf(int64_t x)   { return (float)x; }
+float    __floatundisf(uint64_t x){ return (float)x; }
+int64_t  __fixdfdi(double x)      { return (int64_t)x; }
+uint64_t __fixunsdfdi(double x)   { return (uint64_t)x; }
+int64_t  __fixsfdi(float x)       { return (int64_t)x; }
+uint64_t __fixunssfdi(float x)    { return (uint64_t)x; }
