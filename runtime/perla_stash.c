@@ -14278,6 +14278,52 @@ static int perla_eval_code_needs_semi(const char *code) {
     return 1;
 }
 
+/* Per-process PRIVATE temp directory (0700, owned by the running user) for all
+ * eval-STRING and module-staging artifacts (.pm/.c/.o/.so/.deps). Created once
+ * via mkdtemp(3) under $TMPDIR (or /tmp). Because the directory is 0700 and
+ * owned by us, a local attacker cannot pre-plant a symlink or a malicious .so
+ * inside it — which closes the predictable-/tmp-path symlink/TOCTOU and the
+ * dlopen-of-attacker-controlled-object local code-execution vulnerabilities
+ * (security audit H2, H3, M1). Returns a cached path with NO trailing slash,
+ * or NULL if creation failed (callers then fall back to the legacy /tmp name,
+ * preserving availability). */
+static char g_perla_priv_tmpdir[1024] = "";
+
+/* Remove the private temp dir's (flat) contents and the dir itself at exit, so
+ * it doesn't accumulate one dir per run. Only flat files are placed here. */
+static void perla_priv_tmpdir_cleanup(void) {
+    if (!g_perla_priv_tmpdir[0]) return;
+    DIR *d = opendir(g_perla_priv_tmpdir);
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            if (e->d_name[0] == '.' &&
+                (e->d_name[1] == '\0' || (e->d_name[1] == '.' && e->d_name[2] == '\0')))
+                continue;
+            char p[2048];
+            snprintf(p, sizeof(p), "%s/%s", g_perla_priv_tmpdir, e->d_name);
+            unlink(p);
+        }
+        closedir(d);
+    }
+    rmdir(g_perla_priv_tmpdir);
+}
+
+static const char *perla_private_tmpdir(void) {
+    static int initialized = 0;
+    if (initialized) return g_perla_priv_tmpdir[0] ? g_perla_priv_tmpdir : NULL;
+    initialized = 1;
+    const char *base = getenv("TMPDIR");
+    if (!base || !base[0]) base = "/tmp";
+    char tmpl[1024];
+    int n = snprintf(tmpl, sizeof(tmpl), "%s/perla.XXXXXX", base);
+    if (n < 0 || (size_t)n >= sizeof(tmpl)) return NULL;
+    if (!mkdtemp(tmpl)) return NULL;   /* mkdtemp creates it mode 0700 */
+    snprintf(g_perla_priv_tmpdir, sizeof(g_perla_priv_tmpdir), "%s", tmpl);
+    atexit(perla_priv_tmpdir_cleanup);
+    return g_perla_priv_tmpdir;
+}
+
 StradaValue *perla_eval_string(StradaValue *code_sv, const char *current_pkg) {
     if (!code_sv || STRADA_IS_TAGGED_INT(code_sv)) {
         return strada_new_undef();
@@ -14355,8 +14401,10 @@ StradaValue *perla_eval_string(StradaValue *code_sv, const char *current_pkg) {
     int eval_id = __sync_add_and_fetch(&g_eval_counter, 1);
     pid_t pid = getpid();
     char pm_path[256], so_path[256];
-    snprintf(pm_path, sizeof(pm_path), "/tmp/perla_eval_%d_%d.pm", (int)pid, eval_id);
-    snprintf(so_path, sizeof(so_path), "/tmp/perla_eval_%d_%d.pm.so", (int)pid, eval_id);
+    const char *evdir = perla_private_tmpdir();
+    if (!evdir) evdir = "/tmp";   /* fallback only if mkdtemp failed */
+    snprintf(pm_path, sizeof(pm_path), "%s/perla_eval_%d_%d.pm", evdir, (int)pid, eval_id);
+    snprintf(so_path, sizeof(so_path), "%s/perla_eval_%d_%d.pm.so", evdir, (int)pid, eval_id);
 
     /* Write the eval code to a temp .pm file */
     const char *pkg = current_pkg ? current_pkg : "main";
@@ -14671,8 +14719,8 @@ StradaValue *perla_eval_string(StradaValue *code_sv, const char *current_pkg) {
     if (!getenv("PERLA_EVAL_KEEP")) {
         unlink(pm_path);
         char o_path[256], deps_path[256];
-        snprintf(o_path, sizeof(o_path), "/tmp/perla_eval_%d_%d.pm.o", (int)pid, eval_id);
-        snprintf(deps_path, sizeof(deps_path), "/tmp/perla_eval_%d_%d.pm.deps", (int)pid, eval_id);
+        snprintf(o_path, sizeof(o_path), "%s/perla_eval_%d_%d.pm.o", evdir, (int)pid, eval_id);
+        snprintf(deps_path, sizeof(deps_path), "%s/perla_eval_%d_%d.pm.deps", evdir, (int)pid, eval_id);
         unlink(o_path);
         unlink(deps_path);
     }
@@ -23469,8 +23517,18 @@ StradaValue *perla_require_module(StradaValue *module_sv) {
                     else flat[fp++] = '_';
                 }
                 flat[fp] = 0;
-                snprintf(build_pm_path, sizeof(build_pm_path),
-                         "/tmp/%s%s.pm", __stage_prefix, flat);
+                /* Stage into the per-process private 0700 dir, not a
+                 * predictable world-writable /tmp path — an attacker can't
+                 * pre-plant a symlink or a malicious .pm/.pm.so there, closing
+                 * the staging symlink-overwrite + dlopen-hijack RCE (audit H3).
+                 * Fall back to the legacy /tmp name only if mkdtemp failed. */
+                const char *__std = perla_private_tmpdir();
+                if (__std)
+                    snprintf(build_pm_path, sizeof(build_pm_path),
+                             "%s/%s%s.pm", __std, __stage_prefix, flat);
+                else
+                    snprintf(build_pm_path, sizeof(build_pm_path),
+                             "/tmp/%s%s.pm", __stage_prefix, flat);
                 /* Copy source .pm to staging path. */
                 FILE *src_f = fopen(pm_path, "r");
                 FILE *dst_f = fopen(build_pm_path, "w");
