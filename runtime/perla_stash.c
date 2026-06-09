@@ -14309,7 +14309,10 @@ static void perla_priv_tmpdir_cleanup(void) {
     rmdir(g_perla_priv_tmpdir);
 }
 
-static const char *perla_private_tmpdir(void) {
+/* Exported (non-static) so the perla DRIVER (perla.strada) can route its own
+ * scratch files — REPL line builds, -e source, VM emit, symbol-localize temps
+ * — into the same per-process private 0700 dir (security audit L4). */
+const char *perla_private_tmpdir(void) {
     static int initialized = 0;
     if (initialized) return g_perla_priv_tmpdir[0] ? g_perla_priv_tmpdir : NULL;
     initialized = 1;

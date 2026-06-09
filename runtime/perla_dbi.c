@@ -417,6 +417,28 @@ static char *pg_xlate_placeholders(const char *sql) {
     return out;
 }
 
+/* Append " key='<value>'" with libpq conninfo single-quote quoting (each '\'
+ * and '\'' is backslash-escaped). Without this, a user/password value such as
+ * `x host=evil sslmode=disable` injected extra connection parameters — host
+ * redirection / TLS downgrade (security audit L1). Advances *wp; bounds-checked
+ * against `end`. */
+static void pg_append_kv(char **wp, char *end, const char *key, const char *val) {
+    char *w = *wp;
+    size_t klen = strlen(key);
+    if (w + klen + 5 >= end) return;
+    *w++ = ' ';
+    memcpy(w, key, klen); w += klen;
+    *w++ = '=';
+    *w++ = '\'';
+    for (const char *p = val; *p && w + 2 < end; p++) {
+        if (*p == '\'' || *p == '\\') *w++ = '\\';
+        *w++ = *p;
+    }
+    if (w < end - 1) *w++ = '\'';
+    *w = '\0';
+    *wp = w;
+}
+
 /* Build a libpq conninfo string from a "dbi:Pg:dbname=..;host=..;.." DSN
  * (';' -> ' ') plus user/password. Caller frees. */
 static char *pg_build_conninfo(const char *dsn, const char *user, const char *pass) {
@@ -424,13 +446,16 @@ static char *pg_build_conninfo(const char *dsn, const char *user, const char *pa
     if (strncasecmp(p, "dbi:", 4) == 0) p += 4;
     const char *c = strchr(p, ':');           /* skip the driver name */
     const char *rest = c ? c + 1 : p;
-    size_t cap = strlen(rest) + (user ? strlen(user) : 0) + (pass ? strlen(pass) : 0) + 64;
+    /* 2x for worst-case backslash-escaping of user/password. */
+    size_t cap = strlen(rest) + 2 * (user ? strlen(user) : 0) + 2 * (pass ? strlen(pass) : 0) + 64;
     char *out = malloc(cap);
+    if (!out) return NULL;
     char *w = out;
-    for (const char *q = rest; *q; q++) *w++ = (*q == ';') ? ' ' : *q;
+    char *end = out + cap;
+    for (const char *q = rest; *q && w < end - 1; q++) *w++ = (*q == ';') ? ' ' : *q;
     *w = '\0';
-    if (user && *user) { size_t o = strlen(out); snprintf(out + o, cap - o, " user=%s", user); }
-    if (pass && *pass) { size_t o = strlen(out); snprintf(out + o, cap - o, " password=%s", pass); }
+    if (user && *user) pg_append_kv(&w, end, "user", user);
+    if (pass && *pass) pg_append_kv(&w, end, "password", pass);
     return out;
 }
 

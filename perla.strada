@@ -107,6 +107,23 @@ func _shq_list(str $s) str {
     return $out;
 }
 
+# Build a path for a driver scratch file inside the per-process private 0700
+# temp dir, reusing the runtime's perla_private_tmpdir() (linked into perla) so
+# driver + runtime share one mkdtemp'd dir and its atexit cleanup. Defeats the
+# predictable-/tmp-name symlink race for REPL/-e/VM/symbol-localize temp files
+# (security audit L4). Falls back to /tmp/<name> only if mkdtemp failed.
+func _tmp_path(str $name) str {
+    my str $dir = "";
+    __C__ {
+        extern const char *perla_private_tmpdir(void);
+        const char *__p = perla_private_tmpdir();
+        strada_decref(dir);
+        dir = strada_new_str((__p && __p[0]) ? __p : "");
+    }
+    if (length($dir) == 0) { return "/tmp/" . $name; }
+    return $dir . "/" . $name;
+}
+
 func _find_xs_file(str $dir) str {
     my str $cmd = "ls " . _shq($dir) . "/*.xs 2>/dev/null";
     my str $ls_out = core::qx($cmd);
@@ -895,8 +912,8 @@ func _compile_c(str $c_file, str $exe, str $strada_dir, str $cc, str $extra_objs
                         $gi2++;
                     }
                     if (length($loc_list) > 0) {
-                        my str $loc_file = "/tmp/perla_loc_" . core::getpid() . "_" . $oi2 . ".syms";
-                        my str $tmp_o = "/tmp/perla_loc_" . core::getpid() . "_" . $oi2 . ".pm.o";
+                        my str $loc_file = _tmp_path("perla_loc_" . core::getpid() . "_" . $oi2 . ".syms");
+                        my str $tmp_o = _tmp_path("perla_loc_" . core::getpid() . "_" . $oi2 . ".pm.o");
                         core::spew($loc_file, $loc_list);
                         core::qx("objcopy --localize-symbols=" . _shq($loc_file) . " " . _shq($opath2) . " " . _shq($tmp_o) . " 2>&1");
                         if (core::file_exists($tmp_o) == 1) {
@@ -1156,11 +1173,11 @@ func _readline_prompt(str $prompt) str {
 }
 
 func _repl_compile_and_run(str $source, str $preamble, scalar $lib_paths, str $strada_dir, int $show_c, int $show_debug, int $memprof, str $cc) int {
-    my str $tmp = "/tmp/perla_repl_" . core::getpid() . ".pl";
+    my str $tmp = _tmp_path("perla_repl_" . core::getpid() . ".pl");
     my str $script = $preamble . $source;
     core::spew($tmp, $script);
 
-    my str $exe = "/tmp/perla_repl_" . core::getpid();
+    my str $exe = _tmp_path("perla_repl_" . core::getpid());
     my str $c_file = $exe . ".c";
 
     my str $code = _compile_with_xs_lib($script, $tmp, "", $c_file, $lib_paths);
@@ -1278,8 +1295,8 @@ func _jit_collect_decls(str $line, scalar $declared) void {
 func _jit_run_line(str $source, int $n, str $prepend, str $libenv, str $strada_dir, str $perla_bin) int {
     my int $pid = core::getpid();
     my str $mod = "plr_" . $pid . "_" . $n;
-    my str $pm = "/tmp/" . $mod . ".pm";
-    my str $so = "/tmp/" . $mod . ".pm.so";
+    my str $pm = _tmp_path($mod . ".pm");
+    my str $so = _tmp_path($mod . ".pm.so");
     # $prepend re-declares prior-line vars as `our` so they adopt their persisted
     # stash values in this line's module; the line's own assignments sync back.
     core::spew($pm, "package main;\n" . $prepend . $source . "\n1;\n");
@@ -1783,7 +1800,7 @@ func main() int {
 
     # -e 'code' - one-liner mode
     if (length($eval_code) > 0) {
-        my str $tmp = "/tmp/perla_e_" . core::getpid() . ".pl";
+        my str $tmp = _tmp_path("perla_e_" . core::getpid() . ".pl");
         core::spew($tmp, $eval_code . "\n");
         $input = $tmp;
         # Fall through to normal compilation path
@@ -2251,7 +2268,7 @@ func main() int {
         # VM mode: compile Strada code to native and run
         my str $strada_dir = _detect_strada_dir();
 
-        my str $tmp_base = "/tmp/perla_vm_" . core::getpid();
+        my str $tmp_base = _tmp_path("perla_vm_" . core::getpid());
         my str $tmp_strada = $tmp_base . ".strada";
         my str $tmp_c = $tmp_base . ".c";
         my str $tmp_exe = $tmp_base;

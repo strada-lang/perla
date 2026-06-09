@@ -198,9 +198,15 @@ func lex(str $source) array {
                     }
                     my int $eval = 0;
                     while ($ep < $len && substr($source, $ep, 1) ge "0" && substr($source, $ep, 1) le "9") {
-                        $eval = $eval * 10 + (char_at(substr($source, $ep, 1), 0) - 48);
+                        # Cap accumulation to avoid i64 overflow on a huge exponent.
+                        if ($eval <= 100000) { $eval = $eval * 10 + (char_at(substr($source, $ep, 1), 0) - 48); }
                         $ep = $ep + 1;
                     }
+                    # A binary exponent past ~1024 saturates a double to +Inf
+                    # (or the value to 0 for a negative exponent), so clamp the
+                    # doubling loop: a one-token literal like 0x1p1000000000
+                    # must not pin a CPU core for minutes (security audit L5).
+                    if ($eval > 1100) { $eval = 1100; }
                     my num $factor = 1.0;
                     my int $ei = 0;
                     while ($ei < $eval) { $factor = $factor * 2.0; $ei = $ei + 1; }
