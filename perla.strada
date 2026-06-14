@@ -840,6 +840,31 @@ func _run_cc(str $cmd) str {
     return $out;
 }
 
+# Detect whether the precompiled .pm.o artifacts we're about to link were
+# built NO_TLS (i.e. with -DSTRADA_NO_TLS, the convention warm/tcc builds use).
+# Such objects reference globals like `strada_try_depth` as plain OBJECT
+# symbols; the default gcc runtime (perla_runtime.a) defines them as TLS, so
+# ld errors "TLS attribute mismatch". When the artifacts are NO_TLS we must
+# link the NO_TLS runtime and compile the main NO_TLS to match. Inspect the
+# first .pm.o that references a known runtime global. Default to TLS (0) when
+# undeterminable — that keeps the normal gcc path for fresh/empty builds.
+func _objs_are_no_tls(str $objs) int {
+    my array @parts = split(" ", trim($objs));
+    my int $i = 0;
+    while ($i < scalar(@parts)) {
+        my str $o = trim($parts[$i]);
+        if (length($o) > 5 && substr($o, length($o) - 5, 5) eq ".pm.o"
+            && core::file_exists($o) == 1) {
+            my str $out = core::qx("readelf -sW " . _shq($o)
+                . " 2>/dev/null | grep -E 'strada_try_depth|strada_exception_value' | head -1");
+            if (index($out, " TLS ") >= 0) { return 0; }
+            if (index($out, "OBJECT") >= 0) { return 1; }
+        }
+        $i = $i + 1;
+    }
+    return 0;
+}
+
 # Compile C code to executable using the best available compiler
 func _compile_c(str $c_file, str $exe, str $strada_dir, str $cc, str $extra_objs) str {
     my str $runtime_dir = _strada_rt_dir();
@@ -999,6 +1024,29 @@ func _compile_c(str $c_file, str $exe, str $strada_dir, str $cc, str $extra_objs
             core::unlink($tcc_obj);
             return $link_out;
         }
+    }
+
+    # GCC linking NO_TLS artifacts: the warm .pm.o (built -DSTRADA_NO_TLS for
+    # tcc compatibility) can't link against the TLS perla_runtime.a — ld errors
+    # "TLS attribute mismatch: strada_try_depth …". Compile the main NO_TLS and
+    # link the NO_TLS runtime (non-PIC → -no-pie), mirroring the tcc link path.
+    # This makes a plain `perla app.pl` (gcc, run-mode) work against artifacts
+    # that were warmed for the tcc backend.
+    my str $tcc_runtime_a = $perla_rt_dir . "/perla_runtime_tcc.a";
+    if (length(trim($localized_objs)) > 0 && core::file_exists($tcc_runtime_a) == 1
+        && _objs_are_no_tls($localized_objs) == 1) {
+        my str $ntls_pcre2 = "";
+        my str $ntls_pcre2_def = "";
+        if (core::file_exists($pcre2_lib) == 1) {
+            $ntls_pcre2 = " " . $pcre2_lib;
+            $ntls_pcre2_def = " -DHAVE_PCRE2 -DPCRE2_STATIC -I" . $strada_base . "/vendor/pcre2/src";
+        }
+        my str $ntls_cmd = _cc_bin() . " -no-pie -Wl,-z,noexecstack -DSTRADA_NO_TLS "
+            . _cc_opt_flags_for($c_file) . _fast_link_flag() . " -o " . $exe . " "
+            . $c_file . $localized_objs . " " . $tcc_runtime_a . $ntls_pcre2
+            . " -I" . $runtime_dir . " -I" . $perla_rt_dir . $ntls_pcre2_def
+            . $link_flags . " 2>&1";
+        return _run_cc($ntls_cmd);
     }
 
     # GCC: use prebuilt .a if available, otherwise compile from source
