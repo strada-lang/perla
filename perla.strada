@@ -865,6 +865,23 @@ func _objs_are_no_tls(str $objs) int {
     return 0;
 }
 
+# Content key for the link cache: md5 over the generated C, the dep object
+# set, each dep object's mtime, the perla binary's mtime, and the cc/flags.
+# Any change to the program, a dependency artifact, or perla itself yields a
+# different key — so a cached binary is never stale. Returns "" if md5sum is
+# unavailable (caller then always links).
+func _link_cache_key(str $c_file, str $objs, str $cc_tag) str {
+    my str $cmd = "{ cat " . _shq($c_file) . " 2>/dev/null; printf '%s' " . _shq($objs . "|" . $cc_tag) . "; ";
+    if (length(trim($objs)) > 0) {
+        $cmd = $cmd . "stat -c '%n:%Y' " . $objs . " 2>/dev/null; ";
+    }
+    $cmd = $cmd . "stat -c '%Y' \"$(readlink /proc/self/exe)\" 2>/dev/null; } | md5sum 2>/dev/null | cut -d' ' -f1";
+    my str $k = trim(core::qx($cmd));
+    # md5 hex is 32 chars; anything else (md5sum missing) → no cache key.
+    if (length($k) == 32) { return $k; }
+    return "";
+}
+
 # Compile C code to executable using the best available compiler
 func _compile_c(str $c_file, str $exe, str $strada_dir, str $cc, str $extra_objs) str {
     my str $runtime_dir = _strada_rt_dir();
@@ -2681,9 +2698,43 @@ func main() int {
     # and exit 0 even though cc/ld had just errored out.
     if (core::file_exists($exe) == 1) { core::unlink($exe); }
 
-    my str $compile_out = _compile_c($c_file, $exe, $strada_dir, $cc, $xs_c_files . $precompiled_objs);
-    if (length($compile_out) > 0) {
-        say(STDERR, $compile_out);
+    # Link cache. Codegen is ~free (0.03s) but statically linking ~thousands
+    # of .pm.o into the binary dominates (~2s for add.pl's 92MB). Cache the
+    # linked binary keyed on a CONTENT hash of the generated C + the exact dep
+    # object set + their mtimes + the perla binary's mtime + cc/flags. Any
+    # change to the program, a dependency, or perla itself changes the key, so
+    # a cached binary can never be stale. On a hit we skip the link entirely.
+    # Escape hatch: PERLA_NO_LINK_CACHE=1.
+    my str $__lc_extra = $xs_c_files . $precompiled_objs;
+    my str $__lc_key = "";
+    my str $__lc_bin = "";
+    my int $__lc_hit = 0;
+    if (core::getenv("PERLA_NO_LINK_CACHE") ne "1" && $c_only == 0) {
+        $__lc_key = _link_cache_key($c_file, $__lc_extra, $cc . "|" . _cc_opt_flags_for($c_file));
+        if (length($__lc_key) > 0) {
+            $__lc_bin = core::getenv("HOME") . "/.cache/perla/linkcache/" . $__lc_key;
+            if (core::file_exists($__lc_bin) == 1) {
+                core::qx("cp -f " . _shq($__lc_bin) . " " . _shq($exe) . " 2>/dev/null && chmod +x " . _shq($exe));
+                if (core::file_exists($exe) == 1) {
+                    $__lc_hit = 1;
+                    if (core::getenv("PERLA_DEBUG") eq "1") { say(STDERR, "[perla] link-cache HIT " . $__lc_key); }
+                }
+            }
+        }
+    }
+
+    my str $compile_out = "";
+    if ($__lc_hit == 0) {
+        $compile_out = _compile_c($c_file, $exe, $strada_dir, $cc, $__lc_extra);
+        if (length($compile_out) > 0) {
+            say(STDERR, $compile_out);
+        }
+        # Populate the cache on a successful link.
+        if (length($__lc_key) > 0 && core::file_exists($exe) == 1) {
+            core::qx("mkdir -p " . _shq(core::getenv("HOME") . "/.cache/perla/linkcache")
+                . " 2>/dev/null && cp -f " . _shq($exe) . " " . _shq($__lc_bin) . ".tmp." . core::getpid()
+                . " 2>/dev/null && mv -f " . _shq($__lc_bin) . ".tmp." . core::getpid() . " " . _shq($__lc_bin) . " 2>/dev/null");
+        }
     }
 
     if (core::file_exists($exe) == 0) {
