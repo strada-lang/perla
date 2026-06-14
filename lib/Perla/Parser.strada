@@ -21,6 +21,27 @@ func reset_modules() void {
     # no-op - state is now in parser context
 }
 
+# Artifact candidate with shadow-dir fallback. perla -M writes .pm.o/.pm.so
+# next to the .pm source when the directory is writable, else under
+# ~/.cache/perla/artifacts/<abs source path> (see the driver's -M handler).
+# Given the .pm source path and an extension (".o"/".so"/".deps"), return
+# the source-adjacent candidate if it exists, else the shadow candidate if
+# THAT exists, else the source-adjacent path (callers treat a missing file
+# as "needs building").
+func _art_cand(str $full, str $ext) str {
+    my str $adj = $full . $ext;
+    if (core::file_exists($adj) == 1) { return $adj; }
+    my str $art_root = core::getenv("PERLA_ARTIFACT_DIR");
+    if (length($art_root) == 0) {
+        $art_root = core::getenv("HOME") . "/.cache/perla/artifacts";
+    }
+    my str $abs = "" . core::realpath($full);
+    if (length($abs) == 0) { $abs = $full; }
+    my str $sh = $art_root . $abs . $ext;
+    if (core::file_exists($sh) == 1) { return $sh; }
+    return $adj;
+}
+
 # --- Debug helper: writes to stderr when PERLA_DEBUG=1. Compile-time
 #     counterpart to the runtime perla_debug_mode() hooks in perla_stash.c. ---
 func _dbg(str $msg) void {
@@ -90,15 +111,58 @@ func parse_with_file_context_paths(array @tokens, scalar $init_lib_paths, scalar
         && core::getenv("PERLA_BUILDING_LIST") eq ""
         && core::getenv("PERLA_MARKERS_CLEARED") ne "1") {
         core::setenv("PERLA_MARKERS_CLEARED", "1");
-        if (defined($init_lib_paths)) {
-            my int $__mci = 0;
-            while ($__mci < scalar(@{$init_lib_paths})) {
-                my str $__mcp = $init_lib_paths->[$__mci];
-                if (length($__mcp) > 0) {
-                    core::qx("find " . $__mcp . " -name '*.pm.buildfail' -delete 2>/dev/null");
+        # The clear walks ALL 19 @INC trees with `find` — ~0.15s. Each
+        # module in a warm/batch build is a SEPARATE top-level `perla -M`
+        # process, so without a cross-process guard all ~2800 of them
+        # re-walk every tree (2800 × 19 finds dominated the build). The
+        # in-process PERLA_MARKERS_CLEARED env only suppresses re-clearing
+        # within ONE process. The clear is only actually needed ONCE per
+        # perla binary (its purpose is to retry .buildfail'd modules after
+        # a compiler fix), so persist a sentinel keyed on the perla
+        # binary's mtime: clear once when perla changes, skip every
+        # subsequent build. PERLA_FORCE_REBUILD=1 forces a re-clear.
+        my int $__do_clear = 1;
+        my int $__perla_mtime = 0;
+        __C__ {
+            char __pbuf[2048];
+            ssize_t __plen = readlink("/proc/self/exe", __pbuf, sizeof(__pbuf)-1);
+            if (__plen > 0) {
+                __pbuf[__plen] = '\0';
+                struct stat __pst;
+                if (stat(__pbuf, &__pst) == 0) {
+                    strada_decref(__perla_mtime);
+                    __perla_mtime = STRADA_MAKE_TAGGED_INT((int64_t)__pst.st_mtime);
                 }
-                $__mci = $__mci + 1;
             }
+        }
+        my str $__sentinel = core::getenv("HOME") . "/.cache/perla/.markers_cleared";
+        my str $__want = "" . $__perla_mtime;
+        if (core::getenv("PERLA_FORCE_REBUILD") ne "1" && $__perla_mtime != 0) {
+            my str $__have = "";
+            if (core::file_exists($__sentinel) == 1) { $__have = trim(core::slurp($__sentinel)); }
+            if ($__have eq $__want) { $__do_clear = 0; }
+        }
+        if ($__do_clear == 1) {
+            # Also clear markers parked in the shadow artifact dir (written
+            # there when the source tree is unwritable, e.g. /opt).
+            {
+                my str $__mcart = core::getenv("PERLA_ARTIFACT_DIR");
+                if (length($__mcart) == 0) { $__mcart = core::getenv("HOME") . "/.cache/perla/artifacts"; }
+                core::qx("find " . _shq($__mcart) . " -name '*.pm.buildfail' -delete 2>/dev/null");
+            }
+            if (defined($init_lib_paths)) {
+                my int $__mci = 0;
+                while ($__mci < scalar(@{$init_lib_paths})) {
+                    my str $__mcp = $init_lib_paths->[$__mci];
+                    if (length($__mcp) > 0) {
+                        core::qx("find " . $__mcp . " -name '*.pm.buildfail' -delete 2>/dev/null");
+                    }
+                    $__mci = $__mci + 1;
+                }
+            }
+            # Record that markers are cleared for THIS perla binary so the
+            # other ~2800 module builds in the same warm skip the walk.
+            if ($__perla_mtime != 0) { core::spew($__sentinel, $__want); }
         }
     }
     # Path-based dedup: seed with the current file so a sibling `use X`
@@ -381,6 +445,45 @@ func _parse_stmt(scalar $p) scalar {
             return _parse_sub($p);
         }
         return _parse_my($p);
+    }
+    # `Readonly my $X => EXPR;` (also our / Readonly::Scalar|Array|Hash and
+    # bare `Readonly $x => ...`). Readonly.pm's \$@ prototype makes Perl pass
+    # \$X implicitly; perla doesn't apply prototypes, so the real Readonly
+    # receives the value and croaks "First argument to Readonly must be a
+    # reference" (kills Amazon::S3::Constants init). Rewrite at parse time to
+    # a plain declaration + assignment — the first top-level FAT_ARROW before
+    # the `;` becomes `=`, the Readonly word is dropped, and the normal
+    # my/our/expr statement path parses the rest. Readonly enforcement is
+    # intentionally dropped.
+    if ($type eq "IDENT"
+        && ($val eq "Readonly" || $val eq "Readonly::Scalar"
+            || $val eq "Readonly::Array" || $val eq "Readonly::Hash")) {
+        my int $rp = $p->{"pos"} + 1;
+        if ($rp < $p->{"len"}) {
+            my str $rt = $p->{"tokens"}->[$rp]->{"type"};
+            if ($rt eq "MY" || $rt eq "OUR" || $rt eq "SCALAR_VAR"
+                || $rt eq "ARRAY_VAR" || $rt eq "HASH_VAR") {
+                my int $sp = $rp;
+                my int $rdepth = 0;
+                while ($sp < $p->{"len"}) {
+                    my str $st = $p->{"tokens"}->[$sp]->{"type"};
+                    if ($st eq "LPAREN" || $st eq "LBRACKET" || $st eq "LBRACE") {
+                        $rdepth = $rdepth + 1;
+                    } elsif ($st eq "RPAREN" || $st eq "RBRACKET" || $st eq "RBRACE") {
+                        $rdepth = $rdepth - 1;
+                    } elsif ($st eq "SEMI" && $rdepth <= 0) {
+                        last;
+                    } elsif ($st eq "FAT_ARROW" && $rdepth <= 0) {
+                        $p->{"tokens"}->[$sp]->{"type"} = "OP";
+                        $p->{"tokens"}->[$sp]->{"value"} = "=";
+                        last;
+                    }
+                    $sp = $sp + 1;
+                }
+                _advance($p);  # drop the Readonly word
+                return _parse_stmt($p);
+            }
+        }
     }
     # state $var - context-sensitive (state is also a valid sub name)
     if ($type eq "IDENT" && $val eq "state") {
@@ -679,7 +782,16 @@ func _parse_stmt(scalar $p) scalar {
         my int $slen = $p->{"len"};
         while ($sp < $slen) {
             my str $st = $p->{"tokens"}->[$sp]->{"type"};
-            if ($st eq "LBRACE" || $st eq "LPAREN" || $st eq "LBRACKET") {
+            # Sigil-brace deref tokens (`%{` `@{` `${`) open a brace that
+            # closes with a plain RBRACE. Without counting them, the
+            # stray RBRACE of e.g. `( %{$ref}, key => val )` dropped the
+            # scan to depth 0 inside the parens, the `=>` looked
+            # top-level, and the whole bare block was misparsed as an
+            # anon-hash — silently swallowing any `sub` defined after it
+            # (Specio::Constraint::* `_has_*` predicates vanished).
+            if ($st eq "LBRACE" || $st eq "LPAREN" || $st eq "LBRACKET"
+                || $st eq "DEREF_HASH_START" || $st eq "DEREF_ARRAY_START"
+                || $st eq "DEREF_SCALAR_START") {
                 $depth = $depth + 1;
             } elsif ($st eq "RBRACE" || $st eq "RPAREN" || $st eq "RBRACKET") {
                 if ($depth == 0) { last; }
@@ -1351,6 +1463,22 @@ func _parse_while(scalar $p) scalar {
         }
     } else {
         $node->{"cond"} = _parse_expr($p);
+        # Comma operator in the condition: `while ($content = &$collector,
+        # length $$content)` (LWP::Protocol's collect loop). Evaluate every
+        # element each iteration; the LAST one is the boolean. Package the
+        # sequence as a block-expression (same shape as a bare `do { }`),
+        # whose codegen statement-expression already yields the last
+        # statement's value.
+        if (_peek_type($p) eq "COMMA") {
+            my scalar $__cseq = Perla::AST::node(Perla::AST::N_BLOCK());
+            $__cseq->{"stmts"} = [$node->{"cond"}];
+            while (_peek_type($p) eq "COMMA") {
+                _advance($p);
+                if (_peek_type($p) eq "RPAREN" || _at_end($p)) { last; }
+                push(@{$__cseq->{"stmts"}}, _parse_expr($p));
+            }
+            $node->{"cond"} = $__cseq;
+        }
         # Perl: `while (<$fh>)` → `while (defined($_ = <$fh>))`. The
         # diamond op in while-cond auto-assigns to \$_ and the loop
         # continues until EOF (undef). Without this, perla's while
@@ -1604,11 +1732,21 @@ func _parse_do(scalar $p) scalar {
     if (_peek_type($p) eq "LBRACE") {
         my scalar $body = _parse_block($p);
         # Check for while/until after the block
+        # Postfix while/until after a do-block. The condition's parens are
+        # OPTIONAL (statement-modifier form): Convert::Base32 writes
+        # `do { ... } while $bin =~ s/...//;` and List::MoreUtils::PP
+        # `} until $i > $j;` — requiring LPAREN aborted both modules'
+        # compiles.
         if (_peek_type($p) eq "WHILE") {
             _advance($p);
-            _expect($p, "LPAREN");
-            my scalar $cond = _parse_expr($p);
-            _expect($p, "RPAREN");
+            my scalar $cond = undef;
+            if (_peek_type($p) eq "LPAREN") {
+                _advance($p);
+                $cond = _parse_expr($p);
+                _expect($p, "RPAREN");
+            } else {
+                $cond = _parse_expr($p);
+            }
             _match($p, "SEMI");
             my scalar $node = Perla::AST::node(Perla::AST::N_DO_WHILE());
             $node->{"body"} = $body;
@@ -1617,9 +1755,14 @@ func _parse_do(scalar $p) scalar {
         }
         if (_peek_type($p) eq "UNTIL") {
             _advance($p);
-            _expect($p, "LPAREN");
-            my scalar $cond = _parse_expr($p);
-            _expect($p, "RPAREN");
+            my scalar $cond = undef;
+            if (_peek_type($p) eq "LPAREN") {
+                _advance($p);
+                $cond = _parse_expr($p);
+                _expect($p, "RPAREN");
+            } else {
+                $cond = _parse_expr($p);
+            }
             _match($p, "SEMI");
             my scalar $node = Perla::AST::node(Perla::AST::N_DO_WHILE());
             $node->{"body"} = $body;
@@ -2033,6 +2176,27 @@ func _parse_use(scalar $p) scalar {
         return Perla::AST::node(Perla::AST::N_USE());
     }
 
+    # use Config — same class of problem as Errno: the real Config.pm's
+    # top-level sanity check (`Perl lib version (X.Y.Z) doesn't match
+    # executable '$^X' version (...)`) compares the perl-tree version
+    # against $^V and ALWAYS dies under perla (perla's $^V is a plain
+    # string, and perla isn't that perl anyway). Worse, when Config.pm
+    # gets inlined into another module's compile (any non-tree lib dir
+    # makes `use Config` inline the real source), that die aborts the
+    # ENCLOSING module's init midway — DBIx::Class::Bootstrap::Simple's
+    # @ISA pushes never ran because DBIx::Class::_Util's `use Config`
+    # died first, which broke method inheritance for every DBIC model.
+    # perla provides %Config natively (tied FETCH/EXISTS registered at
+    # perla_init), so skip the .pm; keep module="Config" so import
+    # marking still applies.
+    if ($module eq "Config") {
+        while (_peek_type($p) ne "SEMI" && _peek_type($p) ne "RBRACE" && !_at_end($p)) { _advance($p); }
+        _match($p, "SEMI");
+        my scalar $node = Perla::AST::node(Perla::AST::N_USE());
+        $node->{"module"} = "Config";
+        return $node;
+    }
+
     # use Carp — croak/carp/confess/cluck/longmess/shortmess are provided
     # natively (perla_init registers Carp::* plus @Carp::EXPORT/@EXPORT_OK).
     # The SYSTEM Carp.pm (/usr/lib/.../perl-base/Carp.pm) uses modern sub
@@ -2048,6 +2212,44 @@ func _parse_use(scalar $p) scalar {
         _match($p, "SEMI");
         my scalar $node = Perla::AST::node(Perla::AST::N_USE());
         $node->{"module"} = "Carp";
+        return $node;
+    }
+
+    # use English — its body aliases punctuation TYPEGLOBS (`*EVAL_ERROR
+    # = *@;`, `*RS = */;`, `*ORS = *\;`) that the lexer can't tokenize
+    # soundly (the bare `/` and `\` glob names read as regex/escape
+    # starts and swallow following lines, producing mangled C). The
+    # lexer instead remaps the long English names ($EVAL_ERROR,
+    # $OS_ERROR, ...) directly onto the native specials, so the .pm
+    # itself adds nothing — skip it.
+    if ($module eq "English") {
+        while (_peek_type($p) ne "SEMI" && _peek_type($p) ne "RBRACE" && !_at_end($p)) { _advance($p); }
+        _match($p, "SEMI");
+        return Perla::AST::node(Perla::AST::N_USE());
+    }
+
+    # use Encode — XS glue (its body calls XS-defined barewords like
+    # onBOOT, which dies "Bareword onBOOT not allowed" when inlined).
+    # perla registers encode/decode/find_encoding/encode_utf8/decode_utf8
+    # natively at init; the runtime require path short-circuits it too.
+    if ($module eq "Encode") {
+        while (_peek_type($p) ne "SEMI" && _peek_type($p) ne "RBRACE" && !_at_end($p)) { _advance($p); }
+        _match($p, "SEMI");
+        my scalar $node = Perla::AST::node(Perla::AST::N_USE());
+        $node->{"module"} = "Encode";
+        return $node;
+    }
+
+    # use Data::Dumper — perla registers Dumper/new and the OO method set
+    # natively (perla_dumper). The real Data::Dumper.pm is XS glue whose
+    # qr-serialization code (`$pat =~ s <...> {...}`) the parser only
+    # partially handles; inlining it into a module closure aborted the
+    # whole compile with a strict-vars error. Skip the .pm like Carp.
+    if ($module eq "Data::Dumper") {
+        while (_peek_type($p) ne "SEMI" && _peek_type($p) ne "RBRACE" && !_at_end($p)) { _advance($p); }
+        _match($p, "SEMI");
+        my scalar $node = Perla::AST::node(Perla::AST::N_USE());
+        $node->{"module"} = "Data::Dumper";
         return $node;
     }
 
@@ -2463,6 +2665,14 @@ func _push_module_stmts(scalar $p, scalar $prog_stmts, str $module) void {
         # sites: plain `use`, tree/glob inline, and use base/parent force.)
         my scalar $__prag_save = Perla::AST::node(Perla::AST::N_USE());
         $__prag_save->{"module"} = "__pragma_save__";
+        # Carry the inlined module's name so codegen can wrap the body in
+        # an `if (!perla_inc_loaded("X"))` guard: a runtime-compiled .pm.so
+        # that inlined X must NOT re-run X's top-level code when X already
+        # ran in this process (an earlier .so or the main binary). Type
+        # libraries are the canonical victim — re-running Types::Standard's
+        # body against the already-frozen library died "Type library is
+        # immutable" and killed the enclosing module's init.
+        $__prag_save->{"inline_module"} = $module;
         push(@{$prog_stmts}, $__prag_save);
         my int $count = scalar(@{$stmts});
         my int $i = 0;
@@ -2475,6 +2685,7 @@ func _push_module_stmts(scalar $p, scalar $prog_stmts, str $module) void {
         }
         my scalar $__prag_restore = Perla::AST::node(Perla::AST::N_USE());
         $__prag_restore->{"module"} = "__pragma_restore__";
+        $__prag_restore->{"inline_module"} = $module;
         push(@{$prog_stmts}, $__prag_restore);
         # Caller (use-stmt parser) reads this to decide whether to emit
         # perla_mark_loaded. Marking %INC for a deferred module makes
@@ -2553,6 +2764,22 @@ func _load_module(scalar $p, str $module) scalar {
         _dbg("use " . $module . " -> already loaded (skip)");
         return undef;
     }
+    # Modules whose API the RUNTIME backs natively (perla_init registers
+    # protected code slots) must never be inlined or referenced as
+    # compiled artifacts: an inlined copy's subs (esp. a custom `import`
+    # closing over file lexicals) registered first and shadowed the
+    # natives — Module::Runtime's stale import killed every later
+    # `use Module::Runtime qw(...)`. The runtime require short-circuits
+    # these (native_mods in perla_stash.c); compile-time resolution
+    # short-circuits here for the same set's load-bearing members.
+    if ($module eq "Module::Runtime" || $module eq "Package::Stash"
+        || $module eq "Package::Stash::XS" || $module eq "Package::Stash::PP"
+        || $module eq "Module::Implementation" || $module eq "DBI"
+        || $module eq "Module::Load" || $module eq "FileHandle") {
+        _mark_module_loaded_in($p, $module);
+        _dbg("use " . $module . " -> native (no inline)");
+        return undef;
+    }
     _mark_module_loaded_in($p, $module);
     _dbg("use " . $module);
 
@@ -2617,8 +2844,8 @@ func _load_module(scalar $p, str $module) scalar {
             # inlined into the consuming .pm.c, making Abe::App.pm.c 15MB).
             elsif ($precompile_deps == 1) { $is_tree = 1; }
             if ($is_tree == 1) {
-                my str $ocand = $full . ".o";
-                my str $socand = $full . ".so";
+                my str $ocand = _art_cand($full, ".o");
+                my str $socand = _art_cand($full, ".so");
                 my int $o_exists = core::file_exists($ocand);
                 my int $so_exists = core::file_exists($socand);
                 # Freshness check: discard stale artifacts older than the
@@ -2730,9 +2957,12 @@ func _load_module(scalar $p, str $module) scalar {
                         # in the recursion reference + auto-build its deps.
                         if ($precompile_deps == 1) { $__plib_env = $__plib_env . "PERLA_PRECOMPILE_DEPS=1 "; }
                         if ($prefer_shared == 1) { $__plib_env = $__plib_env . "PERLA_SHARED=1 "; }
-                        my str $cmd = $__plib_env . "PERLA_MODULE_NAME=" . _shq($module) . " PERLA_BUILDING_LIST=" . _shq($__new_bl) . " " . _shq($perla_bin) . " -M " . _shq($full) . " 2>&1";
+                        my str $__cc_arg = (core::getenv("PERLA_TARGET_TCC") eq "1") ? " --cc tcc" : "";
+                        my str $cmd = $__plib_env . "PERLA_MODULE_NAME=" . _shq($module) . " PERLA_BUILDING_LIST=" . _shq($__new_bl) . " " . _shq($perla_bin) . $__cc_arg . " -M " . _shq($full) . " 2>&1";
                         _dbg("    spawn: " . $cmd);
                         core::qx($cmd);
+                        $ocand = _art_cand($full, ".o");
+                        $socand = _art_cand($full, ".so");
                         $o_exists = core::file_exists($ocand);
                         $so_exists = core::file_exists($socand);
                     }
@@ -2832,7 +3062,8 @@ func _load_module(scalar $p, str $module) scalar {
                         # in the recursion reference + auto-build its deps.
                         if ($precompile_deps == 1) { $__plib_env = $__plib_env . "PERLA_PRECOMPILE_DEPS=1 "; }
                         if ($prefer_shared == 1) { $__plib_env = $__plib_env . "PERLA_SHARED=1 "; }
-                        my str $cmd = $__plib_env . "PERLA_MODULE_NAME=" . _shq($module) . " PERLA_BUILDING_LIST=" . _shq($__new_bl) . " " . _shq($perla_bin) . " -M " . _shq($full) . " 2>&1";
+                        my str $__cc_arg = (core::getenv("PERLA_TARGET_TCC") eq "1") ? " --cc tcc" : "";
+                        my str $cmd = $__plib_env . "PERLA_MODULE_NAME=" . _shq($module) . " PERLA_BUILDING_LIST=" . _shq($__new_bl) . " " . _shq($perla_bin) . $__cc_arg . " -M " . _shq($full) . " 2>&1";
                             _dbg("    spawn (precompile-deps sibling): " . $cmd);
                             core::qx($cmd);
                         }
@@ -2916,7 +3147,7 @@ func _load_module(scalar $p, str $module) scalar {
                 # runtime require. The marker is cleared by the top-level
                 # --precompile-deps run (see Parser init) so a fresh build — e.g.
                 # after a compiler fix — retries from scratch.
-                if ($should_build == 1 && core::file_exists($full . ".buildfail") == 1) {
+                if ($should_build == 1 && core::file_exists(_art_cand($full, ".buildfail")) == 1) {
                     _dbg("  " . $module . ": skip auto-build (cached prior failure) - runtime require");
                     $should_build = 0;
                 }
@@ -2979,9 +3210,12 @@ func _load_module(scalar $p, str $module) scalar {
                         # in the recursion reference + auto-build its deps.
                         if ($precompile_deps == 1) { $__plib_env = $__plib_env . "PERLA_PRECOMPILE_DEPS=1 "; }
                         if ($prefer_shared == 1) { $__plib_env = $__plib_env . "PERLA_SHARED=1 "; }
-                        my str $cmd = $__plib_env . "PERLA_MODULE_NAME=" . _shq($module) . " PERLA_BUILDING_LIST=" . _shq($__new_bl) . " " . _shq($perla_bin) . " -M " . _shq($full) . " 2>&1";
+                        my str $__cc_arg = (core::getenv("PERLA_TARGET_TCC") eq "1") ? " --cc tcc" : "";
+                        my str $cmd = $__plib_env . "PERLA_MODULE_NAME=" . _shq($module) . " PERLA_BUILDING_LIST=" . _shq($__new_bl) . " " . _shq($perla_bin) . $__cc_arg . " -M " . _shq($full) . " 2>&1";
                         _dbg("    spawn: " . $cmd);
                         core::qx($cmd);
+                        $ocand = _art_cand($full, ".o");
+                        $socand = _art_cand($full, ".so");
                         if (core::file_exists($ocand) == 1 || core::file_exists($socand) == 1) {
                             _dbg("  " . $module . ": auto-build OK");
                             $found_path = $full;
@@ -2991,7 +3225,31 @@ func _load_module(scalar $p, str $module) scalar {
                         # Record the failure so sibling consumers in this build
                         # don't re-attempt the same doomed `perla -M` (see the
                         # .buildfail check above).
-                        core::spew($full . ".buildfail", "");
+                        {
+                            # Write the marker next to the source when
+                            # writable, else into the shadow artifact dir
+                            # (unwritable trees like /opt previously got
+                            # NO marker, so every consumer re-attempted
+                            # the same doomed build — an infinite spawn
+                            # loop at convergence time).
+                            my str $__bf = $full . ".buildfail";
+                            my str $__bf_dir = $full;
+                            my int $__bsl = rindex($__bf_dir, "/");
+                            if ($__bsl >= 0) { $__bf_dir = substr($__bf_dir, 0, $__bsl); }
+                            my str $__bw = trim(core::qx("test -w " . _shq($__bf_dir) . " && echo 1"));
+                            if ($__bw ne "1") {
+                                my str $__bart = core::getenv("PERLA_ARTIFACT_DIR");
+                                if (length($__bart) == 0) { $__bart = core::getenv("HOME") . "/.cache/perla/artifacts"; }
+                                my str $__babs = "" . core::realpath($full);
+                                if (length($__babs) == 0) { $__babs = $full; }
+                                $__bf = $__bart . $__babs . ".buildfail";
+                                my str $__bfd = $__bf;
+                                my int $__bsl2 = rindex($__bfd, "/");
+                                if ($__bsl2 >= 0) { $__bfd = substr($__bfd, 0, $__bsl2); }
+                                core::qx("mkdir -p " . _shq($__bfd) . " 2>/dev/null");
+                            }
+                            core::spew($__bf, "");
+                        }
                     }
                 } else {
                     _dbg("  " . $module . ": cache MISS " . $full . " (no auto-build - narrow heuristic skipped)");
@@ -3075,8 +3333,8 @@ func _load_module(scalar $p, str $module) scalar {
             my int $ri2 = 0;
             while ($ri2 < scalar(@{$inc_cache})) {
                 my str $candidate = $inc_cache->[$ri2] . "/" . $rel_path;
-                my str $ocand = $candidate . ".o";
-                my str $socand = $candidate . ".so";
+                my str $ocand = _art_cand($candidate, ".o");
+                my str $socand = _art_cand($candidate, ".so");
                 my int $oc_o_exists = core::file_exists($ocand);
                 my int $oc_so_exists = core::file_exists($socand);
                 # Freshness check: discard stale artifact older than .pm
@@ -3088,6 +3346,7 @@ func _load_module(scalar $p, str $module) scalar {
                         my int $oi_src_mtime = 0;
                         my int $oi_o_mtime = 0;
                         my int $oi_so_mtime = 0;
+                        my int $oi_perla_mtime = 0;
                         __C__ {
                             struct stat __oi_st;
                             char *__oi_sp = strada_to_str(candidate);
@@ -3099,6 +3358,12 @@ func _load_module(scalar $p, str $module) scalar {
                             char *__oi_sop = strada_to_str(socand);
                             if (stat(__oi_sop, &__oi_st) == 0) { strada_decref(oi_so_mtime); oi_so_mtime = STRADA_MAKE_TAGGED_INT((int64_t)__oi_st.st_mtime); }
                             free(__oi_sop);
+                            char __oi_pp[2048];
+                            ssize_t __oi_pn = readlink("/proc/self/exe", __oi_pp, sizeof(__oi_pp)-1);
+                            if (__oi_pn > 0) {
+                                __oi_pp[__oi_pn] = '\0';
+                                if (stat(__oi_pp, &__oi_st) == 0) { strada_decref(oi_perla_mtime); oi_perla_mtime = STRADA_MAKE_TAGGED_INT((int64_t)__oi_st.st_mtime); }
+                            }
                         }
                         if ($oc_o_exists == 1 && $oi_o_mtime < $oi_src_mtime) {
                             _dbg("  " . $module . ": stale .pm.o (@INC path) — ignoring");
@@ -3106,6 +3371,22 @@ func _load_module(scalar $p, str $module) scalar {
                         }
                         if ($oc_so_exists == 1 && $oi_so_mtime < $oi_src_mtime) {
                             _dbg("  " . $module . ": stale .pm.so (@INC path) — ignoring");
+                            $oc_so_exists = 0;
+                        }
+                        # Also reject artifacts older than the running perla
+                        # binary (parity with the tree path's check). A .pm.o
+                        # compiled against an older runtime header can embed
+                        # inline runtime functions referencing symbols the
+                        # current runtime no longer exports — referencing it
+                        # in PERLA_LINK_OBJECTS fails the link, and the
+                        # driver-side stale-drop then leaves the emitted
+                        # perla_mod_init_X call dangling.
+                        if ($oc_o_exists == 1 && $oi_perla_mtime > 0 && $oi_o_mtime < $oi_perla_mtime) {
+                            _dbg("  " . $module . ": stale .pm.o (@INC path, older than perla) — ignoring");
+                            $oc_o_exists = 0;
+                        }
+                        if ($oc_so_exists == 1 && $oi_perla_mtime > 0 && $oi_so_mtime < $oi_perla_mtime) {
+                            _dbg("  " . $module . ": stale .pm.so (@INC path, older than perla) — ignoring");
                             $oc_so_exists = 0;
                         }
                     }
@@ -3163,8 +3444,8 @@ func _load_module(scalar $p, str $module) scalar {
     # .pm.so for dlopen under --shared). If either exists, emit a
     # N_PRECOMPILED_MOD node carrying both paths plus a use_shared
     # flag; CodeGen decides between direct-call+link vs dlopen+dlsym.
-    my str $o_path = $found_path . ".o";
-    my str $so_path = $found_path . ".so";
+    my str $o_path = _art_cand($found_path, ".o");
+    my str $so_path = _art_cand($found_path, ".so");
     my int $o_exists = core::file_exists($o_path);
     my int $so_exists = core::file_exists($so_path);
     # tcc target: ignore precompiled artifacts and inline the module instead.
@@ -3174,7 +3455,12 @@ func _load_module(scalar $p, str $module) scalar {
     # translation unit. The driver sets PERLA_TARGET_TCC when --cc tcc (or
     # run-mode PERLA_CC=tcc) is in effect. tcc compiles big TUs ~90x faster than
     # gcc, so the larger single unit is cheap.
-    if (core::getenv("PERLA_TARGET_TCC") eq "1") {
+    if (core::getenv("PERLA_TARGET_TCC") eq "1"
+        && core::getenv("PERLA_TCC_USE_ARTIFACTS") ne "1") {
+        # PERLA_TCC_USE_ARTIFACTS=1: in an all-tcc/NO_TLS environment the
+        # artifacts ARE link-compatible, and referencing them keeps huge
+        # Mo/Specio module bodies OUT of program TUs (the inlined /opt
+        # Mo-YAML overrode the planted shim and broke YAML::Load).
         $o_exists = 0;
         $so_exists = 0;
     }
@@ -3187,6 +3473,7 @@ func _load_module(scalar $p, str $module) scalar {
         my int $src_mtime = 0;
         my int $o_mtime = 0;
         my int $so_mtime = 0;
+        my int $fp_perla_mtime = 0;
         __C__ {
             struct stat __st;
             char *__sp = strada_to_str(found_path);
@@ -3198,6 +3485,12 @@ func _load_module(scalar $p, str $module) scalar {
             char *__sop = strada_to_str(so_path);
             if (stat(__sop, &__st) == 0) { strada_decref(so_mtime); so_mtime = STRADA_MAKE_TAGGED_INT((int64_t)__st.st_mtime); }
             free(__sop);
+            char __fp_pp[2048];
+            ssize_t __fp_pn = readlink("/proc/self/exe", __fp_pp, sizeof(__fp_pp)-1);
+            if (__fp_pn > 0) {
+                __fp_pp[__fp_pn] = '\0';
+                if (stat(__fp_pp, &__st) == 0) { strada_decref(fp_perla_mtime); fp_perla_mtime = STRADA_MAKE_TAGGED_INT((int64_t)__st.st_mtime); }
+            }
         }
         if ($o_exists == 1 && $o_mtime < $src_mtime) {
             _dbg("  " . $module . ": stale .pm.o (mtime " . $o_mtime . " < src " . $src_mtime . ") — ignoring");
@@ -3205,6 +3498,21 @@ func _load_module(scalar $p, str $module) scalar {
         }
         if ($so_exists == 1 && $so_mtime < $src_mtime) {
             _dbg("  " . $module . ": stale .pm.so (mtime " . $so_mtime . " < src " . $src_mtime . ") — ignoring");
+            $so_exists = 0;
+        }
+        # Also reject artifacts older than the running perla binary —
+        # parity with the tree-path and @INC-path checks. A .pm.o built
+        # against an older runtime header can reference symbols the
+        # current runtime no longer exports; referencing it in
+        # PERLA_LINK_OBJECTS leaves a dangling perla_mod_init_X after the
+        # driver-side stale-drop (seen with ~/perla/lib/DBI.pm.o after
+        # every perla rebuild).
+        if ($o_exists == 1 && $fp_perla_mtime > 0 && $o_mtime < $fp_perla_mtime) {
+            _dbg("  " . $module . ": stale .pm.o (older than perla) — ignoring");
+            $o_exists = 0;
+        }
+        if ($so_exists == 1 && $fp_perla_mtime > 0 && $so_mtime < $fp_perla_mtime) {
+            _dbg("  " . $module . ": stale .pm.so (older than perla) — ignoring");
             $so_exists = 0;
         }
     }
@@ -3640,7 +3948,25 @@ func _parse_add(scalar $p) scalar {
         if ($op eq "." && _peek_type($p) eq "IDENT") {
             my str $nt2 = "";
             if ($p->{"pos"} + 1 < $p->{"len"}) { $nt2 = $p->{"tokens"}->[$p->{"pos"} + 1]->{"type"}; }
-            if ($nt2 ne "LPAREN" && $nt2 ne "ARROW" && $nt2 ne "PKG_SEP" && $nt2 ne "FAT_ARROW") {
+            # A named-unary builtin followed by an operand is a CALL, not a
+            # bareword string: `"x: " . scalar @list . " y"` (Log4perl's
+            # debug prints) must call scalar(@list). The Mo idiom this
+            # heuristic serves ($M.import, $P.ISA) never has an operand
+            # token after the bareword.
+            my str $__bw_name = "" . _peek_val($p);
+            my int $__bw_unary_call = 0;
+            if ($nt2 eq "SCALAR_VAR" || $nt2 eq "ARRAY_VAR" || $nt2 eq "HASH_VAR") {
+                if ($__bw_name eq "scalar" || $__bw_name eq "keys" || $__bw_name eq "values" ||
+                    $__bw_name eq "defined" || $__bw_name eq "ref" || $__bw_name eq "length" ||
+                    $__bw_name eq "uc" || $__bw_name eq "lc" || $__bw_name eq "ucfirst" ||
+                    $__bw_name eq "lcfirst" || $__bw_name eq "int" || $__bw_name eq "abs" ||
+                    $__bw_name eq "sqrt" || $__bw_name eq "exists" || $__bw_name eq "chr" ||
+                    $__bw_name eq "ord" || $__bw_name eq "hex" || $__bw_name eq "oct" ||
+                    $__bw_name eq "quotemeta") {
+                    $__bw_unary_call = 1;
+                }
+            }
+            if ($__bw_unary_call == 0 && $nt2 ne "LPAREN" && $nt2 ne "ARROW" && $nt2 ne "PKG_SEP" && $nt2 ne "FAT_ARROW") {
                 my scalar $bw_tok = _advance($p);
                 my scalar $bw_str = Perla::AST::node(Perla::AST::N_STR_LIT());
                 $bw_str->{"value"} = $bw_tok->{"value"};
@@ -5895,6 +6221,12 @@ func _parse_primary(scalar $p) scalar {
                             && _peek_type($p) ne "COMMA" && !_at_end($p)) {
                             push(@{$node->{"args"}}, _parse_assign($p));
                             while (_match($p, "COMMA")) {
+                                # Trailing comma before a terminator
+                                # (`printf "...", $x, ;`) — stop instead of
+                                # parsing the terminator as an argument.
+                                if (_peek_type($p) eq "SEMI" || _peek_type($p) eq "RBRACE"
+                                    || _peek_type($p) eq "RPAREN" || _peek_type($p) eq "RBRACKET"
+                                    || _at_end($p)) { last; }
                                 push(@{$node->{"args"}}, _parse_assign($p));
                             }
                         }
@@ -5986,6 +6318,10 @@ func _parse_primary(scalar $p) scalar {
                         $node->{"fh_bareword"} = $fh_name;
                         push(@{$node->{"args"}}, _parse_assign($p));
                         while (_match($p, "COMMA")) {
+                            # Trailing comma before a terminator — see below.
+                            if (_peek_type($p) eq "SEMI" || _peek_type($p) eq "RBRACE"
+                                || _peek_type($p) eq "RPAREN" || _peek_type($p) eq "RBRACKET"
+                                || _at_end($p)) { last; }
                             push(@{$node->{"args"}}, _parse_assign($p));
                         }
                         return $node;
@@ -6027,6 +6363,15 @@ func _parse_primary(scalar $p) scalar {
                     push(@{$node->{"args"}}, _parse_assign($p));
                 }
                 while (_match($p, "COMMA")) {
+                    # Trailing comma directly before a statement terminator
+                    # (`printf "fmt", $a, $b, ;` — Time::Duration does this) —
+                    # stop instead of handing the terminator to _parse_assign,
+                    # which mis-parsed the next statement's `++$x` as an
+                    # increment of an empty operand and emitted
+                    # `strada_new_undef() = ...` (invalid C).
+                    if (_peek_type($p) eq "SEMI" || _peek_type($p) eq "RBRACE"
+                        || _peek_type($p) eq "RPAREN" || _peek_type($p) eq "RBRACKET"
+                        || _at_end($p)) { last; }
                     push(@{$node->{"args"}}, _parse_assign($p));
                 }
             }
@@ -6203,6 +6548,15 @@ func _parse_primary(scalar $p) scalar {
         if ($nt eq "SCALAR_VAR" || $nt eq "ARRAY_VAR" || $nt eq "HASH_VAR" ||
             $nt eq "STRING" || $nt eq "DQSTRING" || $nt eq "INT" || $nt eq "FLOAT" ||
             $nt eq "ARRAY_DEREF" ||
+            # Deref-expression first args: `pairs %{$headers}` /
+            # `func @{$list}` / `func %$h` / `func @$a`. Without these,
+            # the call parsed as 0-arg and the enclosing expression
+            # errored "expected RPAREN, got DEREF_HASH_START" — hit by
+            # Amazon::S3's `pairs %{$headers}` loops (List::Util::pairs),
+            # which broke the whole Abe S3/accessor chain.
+            $nt eq "DEREF_HASH_START" || $nt eq "DEREF_ARRAY_START" ||
+            $nt eq "DEREF_ARRAY_SIGIL" || $nt eq "DEREF_HASH_SIGIL" ||
+            $nt eq "KEYS" || $nt eq "VALUES" ||
             $nt eq "SHIFT" || $nt eq "POP" || $nt eq "UNDEF" ||
             $nt eq "LBRACKET" || $nt eq "BACKSLASH" || $nt eq "IDENT" ||
             # Named list operators (map/grep/sort/reverse) can appear as args

@@ -831,6 +831,7 @@ func gen_stmt(scalar $cg, scalar $node) void {
     }
     if ($type == Perla::AST::N_PACKAGE()) {
         $cg->{"pkg"} = $node->{"name"};
+        Perla::CodeGen::c_var_set_pkg("" . $node->{"name"});
         Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "/* package " . $node->{"name"} . " */\n");
         Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "perla_stash_get_or_create(\"" . $node->{"name"} . "\");\n");
         # Update call stack frame's package so `caller()`, perla_moose_import,
@@ -857,6 +858,35 @@ func gen_stmt(scalar $cg, scalar $node) void {
             $__psnap{"use_integer"} = defined($cg->{"use_integer"}) ? $cg->{"use_integer"} : 0;
             $__psnap{"use_utf8"} = defined($cg->{"use_utf8"}) ? $cg->{"use_utf8"} : 0;
             push(@{$cg->{"pragma_stack"}}, \%__psnap);
+            # Re-run guard: skip the inlined module's top-level code when
+            # the module already ran in this process (loaded earlier by
+            # the main binary or another dlopen'd .pm.so). Re-running it
+            # is at best wasted work and at worst fatal — Types::Standard
+            # re-ran its add_type calls against an already-immutable
+            # Type::Library and aborted the enclosing init. Sub bodies
+            # are separate C functions (unaffected); only the module's
+            # init-time statements are guarded. perla_mark_loaded inside
+            # the guard closes the loop for the first run.
+            if (defined($node->{"inline_module"}) && length("" . $node->{"inline_module"}) > 0) {
+                Perla::CodeGen::c_var_push_imod("" . $node->{"inline_module"});
+                Perla::CodeGen::ind($cg);
+                Perla::CodeGen::emit($cg, "if (!perla_inc_loaded(\""
+                    . Perla::CodeGen::Escape::escape_c_str("" . $node->{"inline_module"}) . "\")) {\n");
+                # Push a call frame attributed to the INLINED module so
+                # `caller` inside code it invokes during its body (e.g.
+                # Module::Implementation::build_loader_sub deriving its
+                # target package from caller()) sees the inlined module's
+                # package, not the enclosing TU's. Without this,
+                # Package::Stash inlined into DBIx::Class::_Util's TU made
+                # M::I try to load "DBIx::Class::_Util::XS".
+                my str $__br_file = replace_all("" . $node->{"inline_module"}, "::", "/") . ".pm";
+                Perla::CodeGen::ind($cg);
+                Perla::CodeGen::emit($cg, "perla_call_push(\""
+                    . Perla::CodeGen::Escape::escape_c_str("" . $node->{"inline_module"})
+                    . "\", \"(init)\", \""
+                    . Perla::CodeGen::Escape::escape_c_str($__br_file)
+                    . "\", 0);\n");
+            }
             return;
         }
         if (defined($mod) && $mod eq "__pragma_restore__") {
@@ -868,6 +898,12 @@ func gen_stmt(scalar $cg, scalar $node) void {
                 $cg->{"use_warnings"} = $__psnap->{"use_warnings"};
                 $cg->{"use_integer"} = $__psnap->{"use_integer"};
                 $cg->{"use_utf8"} = $__psnap->{"use_utf8"};
+            }
+            if (defined($node->{"inline_module"}) && length("" . $node->{"inline_module"}) > 0) {
+                Perla::CodeGen::c_var_pop_imod();
+                Perla::CodeGen::ind($cg);
+                Perla::CodeGen::emit($cg, "perla_call_pop(); perla_mark_loaded(\""
+                    . Perla::CodeGen::Escape::escape_c_str("" . $node->{"inline_module"}) . "\"); }\n");
             }
             return;
         }
@@ -1671,11 +1707,11 @@ func gen_stmt(scalar $cg, scalar $node) void {
         Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "perla_call_pop();  /* goto &: drop current frame so caller() reports invoker */\n");
         Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "StradaValue *__gt_ret = perla_call_code(__gt_fn, perla_at_);\n");
         # Drain ONLY this frame's cleanup entries (those pushed since entry).
-        # A bare strada_cleanup_drain() drains the WHOLE stack to 0, which
+        # A bare PERLA_CU_DRAIN_TO(0) drains the WHOLE stack to 0, which
         # decrefs the CALLER's still-live locals — e.g. `$self` in a method
         # that tail-calls `goto &other` (Path::Tiny::_path -> goto &_pathify
         # over-decref'd the invocant, freeing it out from under the caller).
-        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "strada_cleanup_drain_to(__perla_cleanup_mark);\n");
+        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "PERLA_CU_DRAIN_TO(__perla_cleanup_mark);\n");
         Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "return __gt_ret;\n");
         $cg->{"indent"} = $cg->{"indent"} - 1;
         Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "}\n");
@@ -1834,7 +1870,7 @@ func gen_stmt(scalar $cg, scalar $node) void {
                 $li++;
             }
             Perla::CodeGen::ind($cg);
-            Perla::CodeGen::emit($cg, "strada_cleanup_drain_to(__perla_cleanup_mark); ");
+            Perla::CodeGen::emit($cg, "PERLA_CU_DRAIN_TO(__perla_cleanup_mark); ");
             # Sub-local scalar `my` cleanup at explicit return — fires
             # DESTROY for blessed objs that would otherwise persist in
             # the file-scope C static across calls. List is collected
@@ -1900,7 +1936,7 @@ func gen_stmt(scalar $cg, scalar $node) void {
             # Scalar-context return of HASH → entry count (see comment
             # in the local-vars branch above).
             Perla::CodeGen::emit($cg, " if (!__perla_caller_want_list && __ret_val && !STRADA_IS_TAGGED_INT(__ret_val) && __ret_val->type == STRADA_HASH) { StradaHash *__rrhv = strada_deref_hash(__ret_val); int64_t __rrhn = __rrhv ? (int64_t)__rrhv->num_entries : 0; strada_decref(__ret_val); __ret_val = STRADA_MAKE_TAGGED_INT(__rrhn); }");
-            Perla::CodeGen::emit($cg, " strada_cleanup_drain_to(__perla_cleanup_mark);");
+            Perla::CodeGen::emit($cg, " PERLA_CU_DRAIN_TO(__perla_cleanup_mark);");
             # Sub-local scalar cleanup (no-local-vars branch — see
             # parallel branch above).
             if (defined($cg->{"sub_local_scalars"})) {

@@ -635,19 +635,24 @@ func _gen_method_call(scalar $cg, scalar $node) void {
         # Last resort: use runtime method dispatch instead of static fallback
         # Static fallback can cause infinite recursion when the same method name
         # exists in both parent and child classes (e.g., search -> rs -> search)
+        #
+        # Per-call-site monomorphic cache: static slots latch the resolved
+        # code for the invocant's class; repeat calls with the same class
+        # skip the stash lookup + MRO walk entirely (invalidated by the
+        # global code/ISA generation counter).
         if ($use_stack_args == 1) {
-            Perla::CodeGen::emit($cg, "if (!__dispatched) { __result = perla_method_dispatch(__obj, \"" . $dispatch_method . "\", &__sa.sv); __dispatched = 1; } ");
+            Perla::CodeGen::emit($cg, "if (!__dispatched) { static char *__msc_p = NULL; static long __msc_g = -1; static StradaValue *__msc_c = NULL; __result = perla_method_dispatch_cached(__obj, \"" . $dispatch_method . "\", &__sa.sv, &__msc_p, &__msc_g, &__msc_c); __dispatched = 1; } ");
         } else {
-            Perla::CodeGen::emit($cg, "if (!__dispatched) { __result = perla_method_dispatch(__obj, \"" . $dispatch_method . "\", __a); __dispatched = 1; } ");
+            Perla::CodeGen::emit($cg, "if (!__dispatched) { static char *__msc_p = NULL; static long __msc_g = -1; static StradaValue *__msc_c = NULL; __result = perla_method_dispatch_cached(__obj, \"" . $dispatch_method . "\", __a, &__msc_p, &__msc_g, &__msc_c); __dispatched = 1; } ");
         }
     }
     # Runtime method dispatch fallback: check the stash for methods not known at compile time
     # (e.g., from precompiled modules loaded via .o files)
     if ($found == 0) {
         if ($use_stack_args == 1) {
-            Perla::CodeGen::emit($cg, "if (!__dispatched) { __result = perla_method_dispatch(__obj, \"" . $dispatch_method . "\", &__sa.sv); __dispatched = 1; } ");
+            Perla::CodeGen::emit($cg, "if (!__dispatched) { static char *__msc_p = NULL; static long __msc_g = -1; static StradaValue *__msc_c = NULL; __result = perla_method_dispatch_cached(__obj, \"" . $dispatch_method . "\", &__sa.sv, &__msc_p, &__msc_g, &__msc_c); __dispatched = 1; } ");
         } else {
-            Perla::CodeGen::emit($cg, "if (!__dispatched) { __result = perla_method_dispatch(__obj, \"" . $dispatch_method . "\", __a); __dispatched = 1; } ");
+            Perla::CodeGen::emit($cg, "if (!__dispatched) { static char *__msc_p = NULL; static long __msc_g = -1; static StradaValue *__msc_c = NULL; __result = perla_method_dispatch_cached(__obj, \"" . $dispatch_method . "\", __a, &__msc_p, &__msc_g, &__msc_c); __dispatched = 1; } ");
         }
     }
     # AUTOLOAD fallback: if no method was dispatched, try AUTOLOAD

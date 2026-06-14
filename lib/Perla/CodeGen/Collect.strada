@@ -102,6 +102,20 @@ func collect_subs_from_stmts(scalar $cg, scalar $stmts, str $pkg) str {
             if ($s->{"type"} == Perla::AST::N_PACKAGE()) {
                 $pkg = $s->{"name"};
             }
+            # Inline-bracket context for subs: a sub defined inside an
+            # inlined module's section must mangle COLLIDED file lexicals
+            # with that module's suffix (see _record_filelex_ctx).
+            if ($s->{"type"} == Perla::AST::N_USE() && defined($s->{"module"})) {
+                my str $__sm = "" . $s->{"module"};
+                if ($__sm eq "__pragma_save__") {
+                    if (!defined($cg->{"subs_modstack"})) { $cg->{"subs_modstack"} = []; }
+                    push(@{$cg->{"subs_modstack"}}, defined($s->{"inline_module"}) ? "" . $s->{"inline_module"} : "?");
+                } elsif ($__sm eq "__pragma_restore__") {
+                    if (defined($cg->{"subs_modstack"}) && scalar(@{$cg->{"subs_modstack"}}) > 0) {
+                        pop(@{$cg->{"subs_modstack"}});
+                    }
+                }
+            }
             if ($s->{"type"} == Perla::AST::N_SUB() && defined($s->{"name"})) {
                 # `sub Pkg::name { ... }` — register in Pkg, not in the
                 # currently-active package. Without this, `sub Foo::greet`
@@ -125,6 +139,10 @@ func collect_subs_from_stmts(scalar $cg, scalar $stmts, str $pkg) str {
                 }
                 my str $qname = $eff_pkg . "::" . $eff_short;
                 $cg->{"subs"}->{$qname} = 1;
+                if (defined($cg->{"subs_modstack"}) && scalar(@{$cg->{"subs_modstack"}}) > 0) {
+                    if (!defined($cg->{"sub_imod"})) { $cg->{"sub_imod"} = {}; }
+                    $cg->{"sub_imod"}->{$qname} = "" . $cg->{"subs_modstack"}->[scalar(@{$cg->{"subs_modstack"}}) - 1];
+                }
                 $s->{"package"} = $eff_pkg;
                 # Stash prototype string (if any) for runtime
                 # prototype("Pkg::name") lookup. perla_set_prototype
@@ -565,14 +583,36 @@ func collect_our_vars(scalar $cg, scalar $ast) void {
     collect_our_vars_from_stmts($cg, $ast->{"stmts"});
 }
 
+func _our_decl_pkg(scalar $cg, str $name) void {
+    # Record which package declared this `our` name. Names declared by 2+
+    # packages in one TU get COLLIDED status: the per-name C static is
+    # shared and drifts to whichever package registered last (seen as
+    # Module::Runtime's import reading another module's @EXPORT_OK), so
+    # reads of collided names are emitted as stash lookups instead.
+    my str $pkg = "main";
+    if (defined($cg->{"collect_pkg"})) { $pkg = "" . $cg->{"collect_pkg"}; }
+    if (!defined($cg->{"our_decl_pkgs"})) { $cg->{"our_decl_pkgs"} = {}; }
+    if (!defined($cg->{"our_decl_pkgs"}->{$name})) { $cg->{"our_decl_pkgs"}->{$name} = {}; }
+    $cg->{"our_decl_pkgs"}->{$name}->{$pkg} = 1;
+    my array @__odp = keys($cg->{"our_decl_pkgs"}->{$name});
+    if (scalar(@__odp) > 1) {
+        if (!defined($cg->{"our_collide"})) { $cg->{"our_collide"} = {}; }
+        $cg->{"our_collide"}->{$name} = 1;
+    }
+}
+
 func collect_our_vars_from_stmts(scalar $cg, scalar $stmts) void {
     my int $i = 0;
     while ($i < scalar(@{$stmts})) {
         my scalar $s = $stmts->[$i];
         if (defined($s)) {
+            if ($s->{"type"} == Perla::AST::N_PACKAGE()) {
+                $cg->{"collect_pkg"} = $s->{"name"};
+            }
             if ($s->{"type"} == Perla::AST::N_OUR()) {
                 if (defined($s->{"var"})) {
                     $cg->{"our_vars"}->{$s->{"var"}->{"value"}} = $s->{"var"}->{"type"};
+                    _our_decl_pkg($cg, "" . $s->{"var"}->{"value"});
                 }
                 # `our (%X, $Y, @Z)` parses as a vars list, not a single var.
                 # Without this both Date::Manip::Lang::index's `our (%Lang)`
@@ -582,6 +622,7 @@ func collect_our_vars_from_stmts(scalar $cg, scalar $stmts) void {
                     my int $vi = 0;
                     while ($vi < scalar(@{$s->{"vars"}})) {
                         $cg->{"our_vars"}->{$s->{"vars"}->[$vi]->{"value"}} = $s->{"vars"}->[$vi]->{"type"};
+                        _our_decl_pkg($cg, "" . $s->{"vars"}->[$vi]->{"value"});
                         $vi++;
                     }
                 }
@@ -748,11 +789,30 @@ func _record_file_scope_my(scalar $cg, scalar $node) void {
             my int $vi = 0;
             while ($vi < scalar(@{$n->{"vars"}})) {
                 $cg->{"file_scope_vars"}->{$n->{"vars"}->[$vi]->{"value"}} = $n->{"vars"}->[$vi]->{"type"};
+                _record_filelex_ctx($cg, "" . $n->{"vars"}->[$vi]->{"value"});
                 $vi++;
             }
         } elsif (defined($n->{"var"})) {
             $cg->{"file_scope_vars"}->{$n->{"var"}->{"value"}} = $n->{"var"}->{"type"};
+            _record_filelex_ctx($cg, "" . $n->{"var"}->{"value"});
         }
+    }
+}
+
+# Record (name, inline-module-context) for a file-scope lexical and flag
+# names declared in 2+ distinct module contexts as COLLIDED.
+func _record_filelex_ctx(scalar $cg, str $name) void {
+    my str $ctx = "";
+    if (defined($cg->{"filelex_modstack"}) && scalar(@{$cg->{"filelex_modstack"}}) > 0) {
+        $ctx = "" . $cg->{"filelex_modstack"}->[scalar(@{$cg->{"filelex_modstack"}}) - 1];
+    }
+    if (!defined($cg->{"filelex_ctx"})) { $cg->{"filelex_ctx"} = {}; }
+    if (!defined($cg->{"filelex_ctx"}->{$name})) { $cg->{"filelex_ctx"}->{$name} = {}; }
+    $cg->{"filelex_ctx"}->{$name}->{$ctx} = 1;
+    my array @__fc = keys($cg->{"filelex_ctx"}->{$name});
+    if (scalar(@__fc) > 1) {
+        if (!defined($cg->{"filelex_collide"})) { $cg->{"filelex_collide"} = {}; }
+        $cg->{"filelex_collide"}->{$name} = 1;
     }
 }
 
@@ -782,6 +842,24 @@ func collect_file_scope_vars_from_stmts(scalar $cg, scalar $stmts) void {
     my int $i = 0;
     while ($i < scalar(@{$stmts})) {
         my scalar $s = $stmts->[$i];
+        # Track which INLINED MODULE's section we're in (pragma brackets):
+        # file-scope `my` lexicals from different inlined modules used to
+        # share one C static per name — Specio::OO's `my %TypeChecks`,
+        # Module::Runtime's `my %export_ok` etc. were silently clobbered
+        # by ANY same-named file lexical elsewhere in the TU. Names seen
+        # in 2+ module contexts get per-module mangling at codegen.
+        if (defined($s) && $s->{"type"} == Perla::AST::N_USE() && defined($s->{"module"})) {
+            my str $__fm = "" . $s->{"module"};
+            if ($__fm eq "__pragma_save__") {
+                if (!defined($cg->{"filelex_modstack"})) { $cg->{"filelex_modstack"} = []; }
+                my str $__im = defined($s->{"inline_module"}) ? "" . $s->{"inline_module"} : "?";
+                push(@{$cg->{"filelex_modstack"}}, $__im);
+            } elsif ($__fm eq "__pragma_restore__") {
+                if (defined($cg->{"filelex_modstack"}) && scalar(@{$cg->{"filelex_modstack"}}) > 0) {
+                    pop(@{$cg->{"filelex_modstack"}});
+                }
+            }
+        }
         if (defined($s) && ($s->{"type"} == Perla::AST::N_MY() || $s->{"type"} == Perla::AST::N_BINOP())) {
             _record_file_scope_my($cg, $s);
         }

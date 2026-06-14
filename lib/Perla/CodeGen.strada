@@ -34,6 +34,7 @@ func generate(scalar $ast) str {
     $cg{"sb"} = $sb;
     $cg{"indent"} = 0;
     $cg{"pkg"} = "main";
+    c_var_set_pkg("main");
     $cg{"filename"} = defined($ast->{"filename"}) ? $ast->{"filename"} : "(eval)";
     # -g (PERLA_LINE_DIRECTIVES): emit `#line N "file.pl"` before each statement
     # so gdb's DWARF maps the generated C back to the original Perl source.
@@ -70,7 +71,9 @@ func generate(scalar $ast) str {
     Perla::CodeGen::Collect::collect_subs(\%cg, $ast);
     Perla::CodeGen::Collect::register_builtin_protos(\%cg);
     Perla::CodeGen::Collect::collect_our_vars(\%cg, $ast);
+    c_var_set_collide($cg{"our_collide"});
     Perla::CodeGen::Collect::collect_file_scope_vars(\%cg, $ast);
+    c_var_set_filelex($cg{"filelex_collide"});
     _perla_reset_mangle_collisions();
     _collect_sigil_collisions(\%cg, $ast);
     _perla_snapshot_file_collisions();
@@ -240,7 +243,7 @@ func generate(scalar $ast) str {
                     my str $__pad_pkg = "" . $cg{"pkg"};
                     emit(\%cg, "#define " . $cname . " (*perla_scalar_lvalue(\"" . $__pad_pkg . "\", \"" . $on . "\"))\n");
                 } else {
-                    emit(\%cg, "static StradaValue *" . $cname . " = NULL;\n");
+                    if (index($cname, "perla_our_slot") < 0) { emit(\%cg, "static StradaValue *" . $cname . " = NULL;\n"); }
                 }
                 $__our_emitted{$cname} = 1;
             }
@@ -255,15 +258,15 @@ func generate(scalar $ast) str {
                 my str $an = c_var_for_vtype("ARRAY_VAR", $on);
                 my str $hn = c_var_for_vtype("HASH_VAR", $on);
                 if (!defined($__our_emitted{$sn})) {
-                    emit(\%cg, "static StradaValue *" . $sn . " = NULL;\n");
+                    if (index($sn, "perla_our_slot") < 0) { emit(\%cg, "static StradaValue *" . $sn . " = NULL;\n"); }
                     $__our_emitted{$sn} = 1;
                 }
                 if (!defined($__our_emitted{$an})) {
-                    emit(\%cg, "static StradaValue *" . $an . " = NULL;\n");
+                    if (index($an, "perla_our_slot") < 0) { emit(\%cg, "static StradaValue *" . $an . " = NULL;\n"); }
                     $__our_emitted{$an} = 1;
                 }
                 if (!defined($__our_emitted{$hn})) {
-                    emit(\%cg, "static StradaValue *" . $hn . " = NULL;\n");
+                    if (index($hn, "perla_our_slot") < 0) { emit(\%cg, "static StradaValue *" . $hn . " = NULL;\n"); }
                     $__our_emitted{$hn} = 1;
                 }
             }
@@ -286,9 +289,15 @@ func generate(scalar $ast) str {
         # skip the static emit here so we don't collide with the extern decl.
         if (!exists($our_vars->{$fsn}) && $fsn ne "a" && $fsn ne "b" && $fsn ne "_" && $fsn ne "ISA" && $fsn ne "SIG" && $fsn ne "ARGV" && $fsn ne "ENV" && $fsn ne "INC" && $fsn ne "STDOUT" && $fsn ne "STDIN" && $fsn ne "STDERR" && $fsn ne "/") {
             my str $fst = "" . $fs_vars->{$fsn};
+            if (defined($cg{"filelex_collide"}) && defined($cg{"filelex_collide"}->{$fsn})) {
+                if (!defined($__fs_emitted{"__fl_" . $fsn})) {
+                    _emit_filelex_variants(\%cg, $fsn, $fst);
+                    $__fs_emitted{"__fl_" . $fsn} = 1;
+                }
+            }
             my str $cname = c_var_for_vtype($fst, $fsn);
             if (!defined($__fs_emitted{$cname})) {
-                emit(\%cg, "static StradaValue *" . $cname . " = NULL;\n");
+                if (index($cname, "perla_our_slot") < 0) { emit(\%cg, "static StradaValue *" . $cname . " = NULL;\n"); }
                 $__fs_emitted{$cname} = 1;
             }
             # If the name has multiple sigils at file scope, declare the
@@ -300,15 +309,15 @@ func generate(scalar $ast) str {
                 my str $an = c_var_for_vtype("ARRAY_VAR", $fsn);
                 my str $hn = c_var_for_vtype("HASH_VAR", $fsn);
                 if (!defined($__fs_emitted{$sn})) {
-                    emit(\%cg, "static StradaValue *" . $sn . " = NULL;\n");
+                    if (index($sn, "perla_our_slot") < 0) { emit(\%cg, "static StradaValue *" . $sn . " = NULL;\n"); }
                     $__fs_emitted{$sn} = 1;
                 }
                 if (!defined($__fs_emitted{$an})) {
-                    emit(\%cg, "static StradaValue *" . $an . " = NULL;\n");
+                    if (index($an, "perla_our_slot") < 0) { emit(\%cg, "static StradaValue *" . $an . " = NULL;\n"); }
                     $__fs_emitted{$an} = 1;
                 }
                 if (!defined($__fs_emitted{$hn})) {
-                    emit(\%cg, "static StradaValue *" . $hn . " = NULL;\n");
+                    if (index($hn, "perla_our_slot") < 0) { emit(\%cg, "static StradaValue *" . $hn . " = NULL;\n"); }
                     $__fs_emitted{$hn} = 1;
                 }
             }
@@ -725,9 +734,21 @@ func generate(scalar $ast) str {
     # program start (it compiles ahead of time), but the relative order still
     # matters — `BEGIN{}INIT{}` must print B then I. `use`/`no` are wrapped in
     # phase-less BEGINs and stay in the BEGIN pass.
-    # Pass 1 — BEGIN blocks, source order.
+    # Pass 1 — BEGIN blocks, source order. Track the inline-bracket
+    # markers (without emitting) so BEGIN bodies inside an inlined
+    # module's section mangle COLLIDED file lexicals with that module's
+    # suffix — BL2-style `BEGIN { $T{seeded} = 42 }` otherwise wrote the
+    # PLAIN static while the module's other code used the suffixed one.
     while ($i < scalar(@{$stmts})) {
         my scalar $stmt = $stmts->[$i];
+        if (defined($stmt) && $stmt->{"type"} == Perla::AST::N_USE() && defined($stmt->{"module"})) {
+            my str $__bm = "" . $stmt->{"module"};
+            if ($__bm eq "__pragma_save__" && defined($stmt->{"inline_module"})) {
+                c_var_push_imod("" . $stmt->{"inline_module"});
+            } elsif ($__bm eq "__pragma_restore__" && defined($stmt->{"inline_module"})) {
+                c_var_pop_imod();
+            }
+        }
         if (defined($stmt) && $stmt->{"type"} == Perla::AST::N_BEGIN()
             && (!defined($stmt->{"phase"}) || $stmt->{"phase"} eq "BEGIN")) {
             Perla::CodeGen::Stmt::gen_stmt(\%cg, $stmt);
@@ -1220,6 +1241,7 @@ func generate_module(scalar $ast, str $mod_name) str {
     $cg{"sb"} = $sb;
     $cg{"indent"} = 0;
     $cg{"pkg"} = $mod_name;
+    c_var_set_pkg($mod_name);
     $cg{"subs"} = {};
     $cg{"anon_subs"} = [];
     $cg{"our_vars"} = {};
@@ -1235,12 +1257,18 @@ func generate_module(scalar $ast, str $mod_name) str {
     $cg{"main_vars"} = [];
     $cg{"file_scope_vars"} = {};
     $cg{"module_mode"} = 1;
+    # The module this compile is FOR — strict-vars failures inside other
+    # (inlined dependency) packages are demoted to warnings instead of
+    # aborting the whole compile; see _strict_check_var.
+    $cg{"primary_pkg"} = $mod_name;
 
     # Collect all sub declarations and our variables
     Perla::CodeGen::Collect::collect_subs(\%cg, $ast);
     Perla::CodeGen::Collect::register_builtin_protos(\%cg);
     Perla::CodeGen::Collect::collect_our_vars(\%cg, $ast);
+    c_var_set_collide($cg{"our_collide"});
     Perla::CodeGen::Collect::collect_file_scope_vars(\%cg, $ast);
+    c_var_set_filelex($cg{"filelex_collide"});
     _perla_reset_mangle_collisions();
     _collect_sigil_collisions(\%cg, $ast);
     _perla_snapshot_file_collisions();
@@ -1303,6 +1331,11 @@ func generate_module(scalar $ast, str $mod_name) str {
     emit(\%cg, "extern StradaValue *perla_dollar_equals;\n");
     emit(\%cg, "extern StradaValue *perla_dollar_minus;\n");
     emit(\%cg, "extern StradaValue *perla_dollar_caret_L;\n");
+    # $% (page number) and $^A (formline accumulator) — the program prelude
+    # declares all four format vars; module mode only had $^ and $^L, so a
+    # module touching $% or $^A (File::Temp does) failed to compile.
+    emit(\%cg, "extern StradaValue *perla_dollar_percent;\n");
+    emit(\%cg, "extern StradaValue *perla_dollar_caret_A;\n");
     emit(\%cg, "extern int __perla_autoflush;\n");
     emit(\%cg, "extern int __perla_want_list;\n");
     emit(\%cg, "extern StradaValue *v_ARGV;\n");
@@ -1341,6 +1374,33 @@ func generate_module(scalar $ast, str $mod_name) str {
     emit(\%cg, "extern long perla_code_override_gen;\n");
     emit(\%cg, "extern StradaValue **__perla_sort_ctx[16];\n");
     emit(\%cg, "extern StradaValue **__perla_cell[64];\n");
+    # Named-comparator / coderef sort thunks: the main-program prelude
+    # defines these as statics, so a module .c can't extern them — emit
+    # per-TU copies (they're self-contained; v_a/v_b are extern above).
+    # Without these, any module using `sort SUBNAME LIST` or
+    # `sort $coderef LIST` failed to compile with
+    # "__perla_sort_named_target undeclared" (surfaced by Date::Manip::DM6
+    # in the bizowie runtime-require chain).
+    emit(\%cg, "static StradaValue *(*__perla_sort_named_target)(StradaValue*) = NULL;\n");
+    emit(\%cg, "static StradaValue *__perla_sort_named_thunk(StradaValue *args) {\n");
+    emit(\%cg, "    StradaValue *__sa = v_a; StradaValue *__sb = v_b;\n");
+    emit(\%cg, "    StradaArray *__av = strada_deref_array(args);\n");
+    emit(\%cg, "    v_a = (__av && __av->size > 0) ? __av->elements[__av->head + 0] : NULL;\n");
+    emit(\%cg, "    v_b = (__av && __av->size > 1) ? __av->elements[__av->head + 1] : NULL;\n");
+    emit(\%cg, "    if (v_a) perla_scalar_set(\"main\", \"a\", v_a); if (v_b) perla_scalar_set(\"main\", \"b\", v_b);\n");
+    emit(\%cg, "    StradaValue *__r = __perla_sort_named_target ? __perla_sort_named_target(args) : NULL;\n");
+    emit(\%cg, "    v_a = __sa; v_b = __sb; return __r;\n");
+    emit(\%cg, "}\n");
+    emit(\%cg, "static StradaValue *__perla_sort_coderef_target = NULL;\n");
+    emit(\%cg, "static StradaValue *__perla_sort_coderef_thunk(StradaValue *args) {\n");
+    emit(\%cg, "    StradaValue *__sa = v_a; StradaValue *__sb = v_b;\n");
+    emit(\%cg, "    StradaArray *__av = strada_deref_array(args);\n");
+    emit(\%cg, "    v_a = (__av && __av->size > 0) ? __av->elements[__av->head + 0] : NULL;\n");
+    emit(\%cg, "    v_b = (__av && __av->size > 1) ? __av->elements[__av->head + 1] : NULL;\n");
+    emit(\%cg, "    if (v_a) perla_scalar_set(\"main\", \"a\", v_a); if (v_b) perla_scalar_set(\"main\", \"b\", v_b);\n");
+    emit(\%cg, "    StradaValue *__r = __perla_sort_coderef_target ? perla_call_code(__perla_sort_coderef_target, args) : NULL;\n");
+    emit(\%cg, "    v_a = __sa; v_b = __sb; return __r;\n");
+    emit(\%cg, "}\n");
     # local() save variables (used by modules that do local $SIG{...} etc.)
     emit(\%cg, "extern StradaValue *__local_save_SIG;\n");
     emit(\%cg, "extern StradaValue *__local_save_Data;\n");
@@ -1371,7 +1431,10 @@ func generate_module(scalar $ast, str $mod_name) str {
         my str $onm = $our_names[$oi];
         if (!exists($default_vars{$onm})) {
             my str $ot2 = "" . $our_vars->{$onm};
-            emit(\%cg, "static StradaValue *" . c_var_for_vtype($ot2, $onm) . " = NULL;\n");
+            my str $__od_cname = c_var_for_vtype($ot2, $onm);
+            if (index($__od_cname, "perla_our_slot") < 0) {
+                emit(\%cg, "static StradaValue *" . $__od_cname . " = NULL;\n");
+            }
         }
         $oi++;
     }
@@ -1382,7 +1445,13 @@ func generate_module(scalar $ast, str $mod_name) str {
         my str $fsn = $fs_names[$fi];
         if (!exists($our_vars->{$fsn}) && !exists($default_vars{$fsn})) {
             my str $fst2 = "" . $fs_vars->{$fsn};
-            emit(\%cg, "static StradaValue *" . c_var_for_vtype($fst2, $fsn) . " = NULL;\n");
+            if (defined($cg{"filelex_collide"}) && defined($cg{"filelex_collide"}->{$fsn})) {
+                _emit_filelex_variants(\%cg, $fsn, $fst2);
+            }
+            my str $__fd_cname = c_var_for_vtype($fst2, $fsn);
+            if (index($__fd_cname, "perla_our_slot") < 0) {
+                emit(\%cg, "static StradaValue *" . $__fd_cname . " = NULL;\n");
+            }
         }
         $fi++;
     }
@@ -1493,7 +1562,21 @@ func generate_module(scalar $ast, str $mod_name) str {
         # Skip registration for subs that have native C runtime implementations
         # (see main codegen above for rationale).
         if (!($pkg eq "Exporter" && $short eq "import")) {
-            ind(\%cg); emit(\%cg, "perla_code_set(\"" . $pkg . "\", \"" . $short . "\", strada_new_str(\"" . $fname . "\"));\n");
+            # An INLINED dependency's subs must not re-register when that
+            # module already ran in this process: the fresh copies close
+            # over THIS TU's file lexicals, which the inc-guard skips
+            # initializing — Module::Runtime's import then read an empty
+            # %export_ok and died with "not exported". Only the primary
+            # module's own packages register unconditionally.
+            my int $__cs_guard = 1;
+            if ($pkg eq $mod_name) { $__cs_guard = 0; }
+            if (length($mod_name) > length($pkg) && substr($mod_name, 0, length($pkg) + 2) eq ($pkg . "::")) { $__cs_guard = 0; }
+            if (length($pkg) > length($mod_name) && substr($pkg, 0, length($mod_name) + 2) eq ($mod_name . "::")) { $__cs_guard = 0; }
+            if ($__cs_guard == 1) {
+                ind(\%cg); emit(\%cg, "if (!perla_inc_loaded(\"" . $pkg . "\")) perla_code_set(\"" . $pkg . "\", \"" . $short . "\", strada_new_str(\"" . $fname . "\"));\n");
+            } else {
+                ind(\%cg); emit(\%cg, "perla_code_set(\"" . $pkg . "\", \"" . $short . "\", strada_new_str(\"" . $fname . "\"));\n");
+            }
         }
         $si++;
     }
@@ -1996,9 +2079,11 @@ func _gen_our(scalar $cg, scalar $node) void {
                 # Mirror into the stash so `%Pkg::NAME` reads see the value.
                 # Without this, `our %h = (a => 1)` populates only v_h; the
                 # stash HASH slot stays empty and `%Pkg::h` reads return undef.
-                ind($cg); emit($cg, "{ PerlGlob *__og = perla_glob_get_or_create(perla_stash_get_or_create(\"" . $cg->{"pkg"} . "\"), \"" . $vname . "\"); ");
-                emit($cg, "if (__og->slots[PERLA_SLOT_HASH]) strada_decref(__og->slots[PERLA_SLOT_HASH]); ");
-                emit($cg, "__og->slots[PERLA_SLOT_HASH] = " . c_var_h($vname) . "; if (" . c_var_h($vname) . ") strada_incref(" . c_var_h($vname) . "); }\n");
+                if (index(c_var_h($vname), "perla_our_slot") < 0) {
+                    ind($cg); emit($cg, "{ PerlGlob *__og = perla_glob_get_or_create(perla_stash_get_or_create(\"" . $cg->{"pkg"} . "\"), \"" . $vname . "\"); ");
+                    emit($cg, "if (__og->slots[PERLA_SLOT_HASH]) strada_decref(__og->slots[PERLA_SLOT_HASH]); ");
+                    emit($cg, "__og->slots[PERLA_SLOT_HASH] = " . c_var_h($vname) . "; if (" . c_var_h($vname) . ") strada_incref(" . c_var_h($vname) . "); }\n");
+                }
             } elsif (defined($node->{"init"})) {
                 # Init from non-anon-array expr (map, function call, @list,
                 # explicit hashref, etc.). When the RHS is a flat key/value
@@ -2013,21 +2098,27 @@ func _gen_our(scalar $cg, scalar $node) void {
                 # the chained `our %h = our %g = (...)` gives independent hashes).
                 emit($cg, "(__hi && !STRADA_IS_TAGGED_INT(__hi) && __hi->type == STRADA_HASH) ? ({ StradaValue *__ohcp = strada_new_hash(); StradaHash *__ohdst = strada_deref_hash(__ohcp); StradaHash *__ohsrc = strada_deref_hash(__hi); StradaArray *__ohk = __ohsrc ? strada_hash_keys(__ohsrc) : (StradaArray*)NULL; if (__ohk) { for (size_t __ohi = 0; __ohi < __ohk->size; __ohi++) { StradaValue *__ohkk = __ohk->elements[__ohk->head + __ohi]; char *__ohks = strada_to_str(__ohkk); StradaValue *__ohv = strada_hash_get(__ohsrc, __ohks); if (__ohv) strada_incref(__ohv); strada_hash_set_take(__ohdst, __ohks, __ohv); free(__ohks); } strada_free_array(__ohk); } __ohcp; }) : strada_hash_from_flat_array(__hi); });\n");
                 # Mirror into the stash so `%Pkg::NAME` reads see the value.
-                ind($cg); emit($cg, "{ PerlGlob *__og = perla_glob_get_or_create(perla_stash_get_or_create(\"" . $cg->{"pkg"} . "\"), \"" . $vname . "\"); ");
-                emit($cg, "if (__og->slots[PERLA_SLOT_HASH]) strada_decref(__og->slots[PERLA_SLOT_HASH]); ");
-                emit($cg, "__og->slots[PERLA_SLOT_HASH] = " . c_var_h($vname) . "; if (" . c_var_h($vname) . ") strada_incref(" . c_var_h($vname) . "); }\n");
+                # (Skipped for slot-routed collided names: the "static" IS the
+                # stash slot, and the mirror's decref freed the new value.)
+                if (index(c_var_h($vname), "perla_our_slot") < 0) {
+                    ind($cg); emit($cg, "{ PerlGlob *__og = perla_glob_get_or_create(perla_stash_get_or_create(\"" . $cg->{"pkg"} . "\"), \"" . $vname . "\"); ");
+                    emit($cg, "if (__og->slots[PERLA_SLOT_HASH]) strada_decref(__og->slots[PERLA_SLOT_HASH]); ");
+                    emit($cg, "__og->slots[PERLA_SLOT_HASH] = " . c_var_h($vname) . "; if (" . c_var_h($vname) . ") strada_incref(" . c_var_h($vname) . "); }\n");
+                }
             } else {
                 # `our %h;` with no init — adopt any value already in the
                 # HASH slot (e.g. set by BEGIN), or create a fresh one.
-                ind($cg); emit($cg, "{ PerlGlob *__og = perla_glob_get_or_create(perla_stash_get_or_create(\"" . $cg->{"pkg"} . "\"), \"" . $vname . "\"); ");
-                emit($cg, "if (__og->slots[PERLA_SLOT_HASH]) { ");
-                emit($cg, "  if (" . c_var_h($vname) . ") strada_decref(" . c_var_h($vname) . "); ");
-                emit($cg, "  " . c_var_h($vname) . " = __og->slots[PERLA_SLOT_HASH]; ");
-                emit($cg, "  strada_incref(" . c_var_h($vname) . "); ");
-                emit($cg, "} else { ");
-                emit($cg, "  if (!" . c_var_h($vname) . ") " . c_var_h($vname) . " = strada_new_hash(); ");
-                emit($cg, "  __og->slots[PERLA_SLOT_HASH] = " . c_var_h($vname) . "; strada_incref(" . c_var_h($vname) . "); ");
-                emit($cg, "} }\n");
+                if (index(c_var_h($vname), "perla_our_slot") < 0) {
+                    ind($cg); emit($cg, "{ PerlGlob *__og = perla_glob_get_or_create(perla_stash_get_or_create(\"" . $cg->{"pkg"} . "\"), \"" . $vname . "\"); ");
+                    emit($cg, "if (__og->slots[PERLA_SLOT_HASH]) { ");
+                    emit($cg, "  if (" . c_var_h($vname) . ") strada_decref(" . c_var_h($vname) . "); ");
+                    emit($cg, "  " . c_var_h($vname) . " = __og->slots[PERLA_SLOT_HASH]; ");
+                    emit($cg, "  strada_incref(" . c_var_h($vname) . "); ");
+                    emit($cg, "} else { ");
+                    emit($cg, "  if (!" . c_var_h($vname) . ") " . c_var_h($vname) . " = strada_new_hash(); ");
+                    emit($cg, "  __og->slots[PERLA_SLOT_HASH] = " . c_var_h($vname) . "; strada_incref(" . c_var_h($vname) . "); ");
+                    emit($cg, "} }\n");
+                }
             }
         } elsif ($vtype eq "ARRAY_VAR") {
             # Array vars: always init as array
@@ -2073,28 +2164,34 @@ func _gen_our(scalar $cg, scalar $node) void {
                 # Without this, `use YAML qw(Load)` → Exporter::import → reads
                 # @YAML::EXPORT from the stash and finds it empty, so `Load`
                 # never gets exported into main.
-                ind($cg); emit($cg, "{ PerlGlob *__og = perla_glob_get_or_create(perla_stash_get_or_create(\"" . $cg->{"pkg"} . "\"), \"" . $vname . "\"); ");
-                emit($cg, "if (__og->slots[PERLA_SLOT_ARRAY]) strada_decref(__og->slots[PERLA_SLOT_ARRAY]); ");
-                emit($cg, "__og->slots[PERLA_SLOT_ARRAY] = " . c_var_a($vname) . "; if (" . c_var_a($vname) . ") strada_incref(" . c_var_a($vname) . "); }\n");
+                if (index(c_var_a($vname), "perla_our_slot") < 0) {
+                    ind($cg); emit($cg, "{ PerlGlob *__og = perla_glob_get_or_create(perla_stash_get_or_create(\"" . $cg->{"pkg"} . "\"), \"" . $vname . "\"); ");
+                    emit($cg, "if (__og->slots[PERLA_SLOT_ARRAY]) strada_decref(__og->slots[PERLA_SLOT_ARRAY]); ");
+                    emit($cg, "__og->slots[PERLA_SLOT_ARRAY] = " . c_var_a($vname) . "; if (" . c_var_a($vname) . ") strada_incref(" . c_var_a($vname) . "); }\n");
+                }
             } else {
                 # `our @a;` with no init — adopt any value already in the
                 # ARRAY slot (e.g. set by BEGIN), or create a fresh one.
-                ind($cg); emit($cg, "{ PerlGlob *__og = perla_glob_get_or_create(perla_stash_get_or_create(\"" . $cg->{"pkg"} . "\"), \"" . $vname . "\"); ");
-                emit($cg, "if (__og->slots[PERLA_SLOT_ARRAY]) { ");
-                emit($cg, "  if (" . c_var_a($vname) . ") strada_decref(" . c_var_a($vname) . "); ");
-                emit($cg, "  " . c_var_a($vname) . " = __og->slots[PERLA_SLOT_ARRAY]; ");
-                emit($cg, "  strada_incref(" . c_var_a($vname) . "); ");
-                emit($cg, "} else { ");
-                emit($cg, "  if (!" . c_var_a($vname) . ") " . c_var_a($vname) . " = strada_new_array(); ");
-                emit($cg, "  __og->slots[PERLA_SLOT_ARRAY] = " . c_var_a($vname) . "; strada_incref(" . c_var_a($vname) . "); ");
-                emit($cg, "} }\n");
+                if (index(c_var_a($vname), "perla_our_slot") < 0) {
+                    ind($cg); emit($cg, "{ PerlGlob *__og = perla_glob_get_or_create(perla_stash_get_or_create(\"" . $cg->{"pkg"} . "\"), \"" . $vname . "\"); ");
+                    emit($cg, "if (__og->slots[PERLA_SLOT_ARRAY]) { ");
+                    emit($cg, "  if (" . c_var_a($vname) . ") strada_decref(" . c_var_a($vname) . "); ");
+                    emit($cg, "  " . c_var_a($vname) . " = __og->slots[PERLA_SLOT_ARRAY]; ");
+                    emit($cg, "  strada_incref(" . c_var_a($vname) . "); ");
+                    emit($cg, "} else { ");
+                    emit($cg, "  if (!" . c_var_a($vname) . ") " . c_var_a($vname) . " = strada_new_array(); ");
+                    emit($cg, "  __og->slots[PERLA_SLOT_ARRAY] = " . c_var_a($vname) . "; strada_incref(" . c_var_a($vname) . "); ");
+                    emit($cg, "} }\n");
+                }
             }
             # Register the array file-static so typeglob array-slot writes
             # (`*alias = \@source`) propagate into the v_X mirror. Without
             # this, `our @alias_for; *alias_for = \@source` updates the
             # stash slot but compiled reads of `@alias_for` (via v_alias_for)
             # see the empty array from declaration time.
-            ind($cg); emit($cg, "perla_register_our_local_array(\"" . $cg->{"pkg"} . "\", \"" . $vname . "\", &" . c_var_a($vname) . ");\n");
+            if (index(c_var_a($vname), "perla_our_slot") < 0) {
+                ind($cg); emit($cg, "perla_register_our_local_array(\"" . $cg->{"pkg"} . "\", \"" . $vname . "\", &" . c_var_a($vname) . ");\n");
+            }
         } else {
             if (defined($node->{"init"})) {
                 ind($cg); emit($cg, c_var($vname) . " = ");
@@ -2153,15 +2250,19 @@ func _gen_our(scalar $cg, scalar $node) void {
             my str $mvname = $mv->{"value"};
             my str $mvtype = $mv->{"type"};
             if ($mvtype eq "HASH_VAR") {
-                ind($cg); emit($cg, "if (!" . c_var_h($mvname) . ") " . c_var_h($mvname) . " = strada_new_hash();\n");
-                ind($cg); emit($cg, "{ PerlGlob *__og = perla_glob_get_or_create(perla_stash_get_or_create(\"" . $cg->{"pkg"} . "\"), \"" . $mvname . "\"); ");
-                emit($cg, "if (__og->slots[PERLA_SLOT_HASH]) strada_decref(__og->slots[PERLA_SLOT_HASH]); ");
-                emit($cg, "__og->slots[PERLA_SLOT_HASH] = " . c_var_h($mvname) . "; if (" . c_var_h($mvname) . ") strada_incref(" . c_var_h($mvname) . "); }\n");
+                if (index(c_var_h($mvname), "perla_our_slot") < 0) {
+                    ind($cg); emit($cg, "if (!" . c_var_h($mvname) . ") " . c_var_h($mvname) . " = strada_new_hash();\n");
+                    ind($cg); emit($cg, "{ PerlGlob *__og = perla_glob_get_or_create(perla_stash_get_or_create(\"" . $cg->{"pkg"} . "\"), \"" . $mvname . "\"); ");
+                    emit($cg, "if (__og->slots[PERLA_SLOT_HASH]) strada_decref(__og->slots[PERLA_SLOT_HASH]); ");
+                    emit($cg, "__og->slots[PERLA_SLOT_HASH] = " . c_var_h($mvname) . "; if (" . c_var_h($mvname) . ") strada_incref(" . c_var_h($mvname) . "); }\n");
+                }
             } elsif ($mvtype eq "ARRAY_VAR") {
-                ind($cg); emit($cg, "if (!" . c_var_a($mvname) . ") " . c_var_a($mvname) . " = strada_new_array();\n");
-                ind($cg); emit($cg, "{ PerlGlob *__og = perla_glob_get_or_create(perla_stash_get_or_create(\"" . $cg->{"pkg"} . "\"), \"" . $mvname . "\"); ");
-                emit($cg, "if (__og->slots[PERLA_SLOT_ARRAY]) strada_decref(__og->slots[PERLA_SLOT_ARRAY]); ");
-                emit($cg, "__og->slots[PERLA_SLOT_ARRAY] = " . c_var_a($mvname) . "; if (" . c_var_a($mvname) . ") strada_incref(" . c_var_a($mvname) . "); }\n");
+                if (index(c_var_a($mvname), "perla_our_slot") < 0) {
+                    ind($cg); emit($cg, "if (!" . c_var_a($mvname) . ") " . c_var_a($mvname) . " = strada_new_array();\n");
+                    ind($cg); emit($cg, "{ PerlGlob *__og = perla_glob_get_or_create(perla_stash_get_or_create(\"" . $cg->{"pkg"} . "\"), \"" . $mvname . "\"); ");
+                    emit($cg, "if (__og->slots[PERLA_SLOT_ARRAY]) strada_decref(__og->slots[PERLA_SLOT_ARRAY]); ");
+                    emit($cg, "__og->slots[PERLA_SLOT_ARRAY] = " . c_var_a($mvname) . "; if (" . c_var_a($mvname) . ") strada_incref(" . c_var_a($mvname) . "); }\n");
+                }
             } else {
                 ind($cg); emit($cg, "if (!" . c_var($mvname) . ") " . c_var($mvname) . " = strada_new_undef();\n");
                 ind($cg); emit($cg, "{ PerlGlob *__og = perla_glob_get_or_create(perla_stash_get_or_create(\"" . $cg->{"pkg"} . "\"), \"" . $mvname . "\"); ");
@@ -2414,10 +2515,42 @@ func _strict_check_var(scalar $cg, str $sigil, str $name, int $line) void {
     # `local $x = expr;` auto-declares the package var in real Perl, but
     # only under strict if it was already declared. We don't track that
     # specifically — defer to file/our scope.
-    # Not declared — emit the canonical Perl strict error.
-    my str $__sc_loc = "";
-    if ($line > 0) {
-        $__sc_loc = " at " . $cg->{"src_file"} . " line " . $line . ".";
+    # Not declared — emit the canonical Perl strict error. Always include
+    # whatever location context we have: with dozens of modules inlined
+    # into one compile, a bare message is undiagnosable (the current
+    # PACKAGE pinpoints the offending module even when the node carries
+    # no line number).
+    my str $__sc_file = "";
+    if (defined($cg->{"src_file"})) { $__sc_file = "" . $cg->{"src_file"}; }
+    my str $__sc_pkg = "";
+    if (defined($cg->{"pkg"})) { $__sc_pkg = "" . $cg->{"pkg"}; }
+    my str $__sc_loc = " at " . $__sc_file . " line " . $line . " (package " . $__sc_pkg . ").";
+    # In module mode (`perla -M Foo`), a strict failure inside an INLINED
+    # DEPENDENCY package must not abort the whole compile: one
+    # parse-error-recovered CPAN dep (which loses a `my` declaration)
+    # would otherwise take down every consumer in its closure — a busted
+    # LWP::UserAgent sub aborted Amazon::S3, which broke the entire Abe
+    # S3/accessor chain. Demote to a warning and fall through to the
+    # non-strict package-var access; only the PRIMARY module's own code
+    # keeps Perl's fatal strictness.
+    # ... and the same for the PRIMARY package: an undeclared var there is
+    # commonly an Exporter-imported alias from a PRECOMPILED (referenced,
+    # not parsed) dep — e.g. `use Amazon::S3::Constants qw(:all)` importing
+    # `Readonly our $DEFAULT_TIMEOUT`. The import installs the alias into
+    # this package's stash at runtime, so package-var access is the right
+    # codegen; real strictness still applies when compiling programs.
+    if (defined($cg->{"module_mode"}) && $cg->{"module_mode"} == 1) {
+        say(STDERR, "[perla] Global symbol \"" . $sigil . $name . "\" undeclared in module compile (treating as package var)" . $__sc_loc);
+        return;
+    }
+    # Program compiles inline dependency modules too (always under the tcc
+    # target, which ignores precompiled artifacts). A strict failure inside
+    # an inlined dep (package != main) is perla's visibility gap, not the
+    # user's bug — the same CGI.pm that runs fine under perl must not
+    # abort the build. The main script's own code stays fatal.
+    if ($__sc_pkg ne "main" && $__sc_pkg ne "") {
+        say(STDERR, "[perla] Global symbol \"" . $sigil . $name . "\" undeclared in inlined dep (treating as package var)" . $__sc_loc);
+        return;
     }
     die("Global symbol \"" . $sigil . $name . "\" requires explicit package name (did you forget to declare \"my " . $sigil . $name . "\"?)" . $__sc_loc);
 }
@@ -2792,7 +2925,8 @@ func _gen_autoviv_hash(scalar $cg, scalar $node) void {
             && $aobj_type == Perla::AST::N_SCALAR_VAR()
             && defined($aobj->{"name"}) && length($aobj->{"name"}) > 0
             && index($aobj->{"name"}, "::") < 0 && $aobj->{"name"} ne "_"
-            && exists($__perla_mangle_collisions{$aobj->{"name"}})) {
+            && (exists($__perla_mangle_collisions{$aobj->{"name"}})
+                || exists($__perla_our_collide{$aobj->{"name"}}))) {
             $aobj_route_h = 1;
         }
         # Autoviv the outer scalar var when used like `$ret->{a}{b}{c} = X`:
@@ -2903,11 +3037,13 @@ func _gen_autoviv_outer_hash(scalar $cg, scalar $node, int $hash_context) void {
         && defined($node->{"name"}) && length($node->{"name"}) > 0
         && index($node->{"name"}, "::") < 0 && $node->{"name"} ne "_") {
         my str $vc;
-        if ($hash_context == 1 && exists($__perla_mangle_collisions{$node->{"name"}})) {
+        if ($hash_context == 1 && (exists($__perla_mangle_collisions{$node->{"name"}})
+                                   || exists($__perla_our_collide{$node->{"name"}}))) {
             # `%foo` access where `@foo` or `$foo` also exists — the hash
             # lives in `v_foo__h`, NOT the scalar `v_foo`. Writing to v_foo
             # would diverge: the autoviv-created hashref lives in a slot
-            # nobody reads from.
+            # nobody reads from. our-collided names route the same way:
+            # c_var_h returns their stash-slot accessor.
             $vc = c_var_h($node->{"name"});
         } else {
             $vc = c_var($node->{"name"});
@@ -3674,6 +3810,10 @@ func gen_expr(scalar $cg, scalar $node) void {
         emit($cg, "perla_call_push(\"" . Perla::CodeGen::Escape::escape_c_str($__ev_pkg_expr) . "\", \"(eval)\", \"" . Perla::CodeGen::Escape::escape_c_str("" . $cg->{"filename"}) . "\", 0); ");
         emit($cg, "if (perla_eval_error) strada_decref(perla_eval_error); ");
         emit($cg, "perla_eval_error = strada_new_str(\"\"); ");
+        # Save the perla cleanup-stack mark so the catch path can drain
+        # entries pushed by frames the longjmp skipped over (their own
+        # drains never ran).
+        emit($cg, "int __ev_cu_mark = PERLA_CU_MARK(); ");
         emit($cg, "jmp_buf *__ev_jb = STRADA_TRY_PUSH(); ");
         emit($cg, "if (__ev_jb && setjmp(*__ev_jb) == 0) { do { ");
         # Track depth so a `return` inside the body emits a `break`
@@ -3756,6 +3896,8 @@ func gen_expr(scalar $cg, scalar $node) void {
         # so the void-context (-1) set around a dying call leaks out otherwise.
         # __perla_caller_want_list was saved from __perla_want_list above (line ~4376).
         emit($cg, "__perla_want_list = __perla_caller_want_list; ");
+        # Drain perla-cleanup entries from the frames the longjmp skipped.
+        emit($cg, "PERLA_CU_DRAIN_TO(__ev_cu_mark); ");
         emit($cg, "while (perla_call_depth > __eval_sav_depth) perla_call_pop(); ");
         emit($cg, "if (__perla_local_chain != __perla_local_chain_mark) { perla_local_chain_restore_to(__perla_local_chain, __perla_local_chain_mark); __perla_local_chain = __perla_local_chain_mark; } ");
         emit($cg, "STRADA_TRY_POP(); ");
@@ -5521,7 +5663,7 @@ func gen_expr(scalar $cg, scalar $node) void {
         # Without strict refs, the string lookup via perla_scalar_via_qname
         # remains as the no-strict-refs symref idiom.
         if ($__ds_strict == 1) {
-            emit($cg, "(__dr->type == STRADA_STR && __dr->value.pv) ? ({ char __sm[512]; snprintf(__sm, sizeof(__sm), \"Can't use string (\\\"%s\\\") as a SCALAR ref while \\\"strict refs\\\" in use\", __dr->value.pv); strada_die(__sm); strada_new_undef(); }) : ");
+            emit($cg, "(__dr->type == STRADA_STR && __dr->value.pv) ? (strstr(__dr->value.pv, \"::\") ? perla_scalar_via_qname(__dr->value.pv) : ({ char __sm[512]; snprintf(__sm, sizeof(__sm), \"Can't use string (\\\"%s\\\") as a SCALAR ref while \\\"strict refs\\\" in use\", __dr->value.pv); strada_die(__sm); strada_new_undef(); })) : ");
         } else {
             emit($cg, "(__dr->type == STRADA_STR && __dr->value.pv) ? perla_scalar_via_qname(__dr->value.pv) : ");
         }
@@ -5559,7 +5701,7 @@ func gen_expr(scalar $cg, scalar $node) void {
         emit($cg, "(!__dr || STRADA_IS_TAGGED_INT(__dr)) ? strada_new_array() : ");
         emit($cg, "(__dr->type == STRADA_REF && __dr->value.rv) ? __dr->value.rv : ");
         if ($__da_strict == 1) {
-            emit($cg, "(__dr->type == STRADA_STR && __dr->value.pv) ? ({ char __sm[512]; snprintf(__sm, sizeof(__sm), \"Can't use string (\\\"%s\\\") as an ARRAY ref while \\\"strict refs\\\" in use\", __dr->value.pv); strada_die(__sm); strada_new_array(); }) : ");
+            emit($cg, "(__dr->type == STRADA_STR && __dr->value.pv) ? (strstr(__dr->value.pv, \"::\") ? perla_array_via_qname(__dr->value.pv) : ({ char __sm[512]; snprintf(__sm, sizeof(__sm), \"Can't use string (\\\"%s\\\") as an ARRAY ref while \\\"strict refs\\\" in use\", __dr->value.pv); strada_die(__sm); strada_new_array(); })) : ");
         } else {
             emit($cg, "(__dr->type == STRADA_STR && __dr->value.pv) ? perla_array_via_qname(__dr->value.pv) : ");
         }
@@ -5586,7 +5728,7 @@ func gen_expr(scalar $cg, scalar $node) void {
         emit($cg, "(!__dr || STRADA_IS_TAGGED_INT(__dr)) ? strada_new_hash() : ");
         emit($cg, "(__dr->type == STRADA_REF && __dr->value.rv) ? __dr->value.rv : ");
         if ($__dh_strict == 1) {
-            emit($cg, "(__dr->type == STRADA_STR && __dr->value.pv) ? ({ char __sm[512]; snprintf(__sm, sizeof(__sm), \"Can't use string (\\\"%s\\\") as a HASH ref while \\\"strict refs\\\" in use\", __dr->value.pv); strada_die(__sm); strada_new_hash(); }) : ");
+            emit($cg, "(__dr->type == STRADA_STR && __dr->value.pv) ? (strstr(__dr->value.pv, \"::\") ? perla_hash_via_qname(__dr->value.pv) : ({ char __sm[512]; snprintf(__sm, sizeof(__sm), \"Can't use string (\\\"%s\\\") as a HASH ref while \\\"strict refs\\\" in use\", __dr->value.pv); strada_die(__sm); strada_new_hash(); })) : ");
         } else {
             emit($cg, "(__dr->type == STRADA_STR && __dr->value.pv) ? perla_hash_via_qname(__dr->value.pv) : ");
         }
@@ -5691,6 +5833,9 @@ func gen_expr(scalar $cg, scalar $node) void {
         # save/restore, so void-context (-1) would leak into catch and beyond.
         emit($cg, "int __try_sav_wl = __perla_want_list; ");
         emit($cg, "int __try_idx = strada_try_depth++; int __try_popped = 0; ");
+        # Save the perla cleanup-stack mark for the catch path (drains
+        # entries from frames the longjmp skipped).
+        emit($cg, "int __try_cu_mark = PERLA_CU_MARK(); ");
         emit($cg, "strada_try_stack[__try_idx].active = 1; ");
         emit($cg, "if (setjmp(strada_try_stack[__try_idx].buf) == 0) { do { ");
         # Activate eval-block-expr semantics so `return EXPR` inside
@@ -5736,6 +5881,7 @@ func gen_expr(scalar $cg, scalar $node) void {
         emit($cg, " } else { ");
         # Restore want_list (see save above) — die's longjmp skipped inner restores.
         emit($cg, "__perla_want_list = __try_sav_wl; ");
+        emit($cg, "PERLA_CU_DRAIN_TO(__try_cu_mark); ");
         # Pop the inner try slot BEFORE running catch — so any die
         # inside catch propagates to the OUTER try (or terminates).
         # Without this, `die "X"` inside catch would longjmp back to
@@ -7465,7 +7611,7 @@ func gen_expr_safe(scalar $cg, scalar $node) void {
             emit($cg, " if (!__perla_caller_want_list && __ret_val && !STRADA_IS_TAGGED_INT(__ret_val) && __ret_val->type == STRADA_ARRAY) { StradaArray *__rrav = strada_deref_array(__ret_val); int64_t __rrsz = __rrav ? (int64_t)__rrav->size : 0; strada_decref(__ret_val); __ret_val = STRADA_MAKE_TAGGED_INT(__rrsz); }");
         }
         emit($cg, " if (!__perla_caller_want_list && __ret_val && !STRADA_IS_TAGGED_INT(__ret_val) && __ret_val->type == STRADA_HASH) { StradaHash *__rrhv = strada_deref_hash(__ret_val); int64_t __rrhn = __rrhv ? (int64_t)__rrhv->num_entries : 0; strada_decref(__ret_val); __ret_val = STRADA_MAKE_TAGGED_INT(__rrhn); }");
-        emit($cg, " strada_incref(__ret_val); strada_cleanup_drain_to(__perla_cleanup_mark); ");
+        emit($cg, " strada_incref(__ret_val); PERLA_CU_DRAIN_TO(__perla_cleanup_mark); ");
         emit($cg, "if (__perla_local_chain != __perla_local_chain_mark) { perla_local_chain_restore_to(__perla_local_chain, __perla_local_chain_mark); __perla_local_chain = __perla_local_chain_mark; } perla_call_pop(); ");
         emit($cg, "return __ret_val; (StradaValue*)NULL; })");
         return;
@@ -8196,7 +8342,30 @@ func safe_ident(str $name) str {
     return $safe;
 }
 
+
+# Emit static decls for a COLLIDED file-scope lexical: one per inline-module
+# context recorded at collect ("" = the main file / primary module itself).
+func _emit_filelex_variants(scalar $cg, str $fsn, str $fst) void {
+    my scalar $ctxs = $cg->{"filelex_ctx"}->{$fsn};
+    if (!defined($ctxs)) { return; }
+    my array @__cl = keys($ctxs);
+    my int $__ci = 0;
+    while ($__ci < scalar(@__cl)) {
+        my str $ctx = $__cl[$__ci];
+        my str $vn = "v_" . safe_ident($fsn);
+        if (length($ctx) > 0) { $vn = $vn . "__fl" . safe_ident($ctx); }
+        emit($cg, "static StradaValue *" . $vn . " = NULL;\n");
+        $__ci++;
+    }
+}
+
 func c_var(str $name) str {
+    if (exists($__perla_filelex_collide{$name})) {
+        my str $__im = _cvar_cur_imod();
+        if (length($__im) > 0) {
+            return "v_" . safe_ident($name) . "__fl" . safe_ident($__im);
+        }
+    }
     return "v_" . safe_ident($name);
 }
 
@@ -8223,6 +8392,9 @@ my hash %__perla_sub_collisions = ();
 my hash %__perla_file_collisions_snapshot = ();
 
 func c_var_h(str $name) str {
+    if (exists($__perla_our_collide{$name})) {
+        return "(*perla_our_slot_hash(\"" . _cvar_cur_pkg() . "\", \"" . $name . "\"))";
+    }
     if (exists($__perla_mangle_collisions{$name})) {
         return "v_" . safe_ident($name) . "__h";
     }
@@ -8237,7 +8409,73 @@ func c_var_h(str $name) str {
     return c_var($name);
 }
 
+# COLLIDED `our` names (declared by 2+ packages in this TU, e.g.
+# @EXPORT_OK across many inlined Exporter users): a single shared static
+# drifts to the last-registering package, so array/hash accesses emit an
+# LVALUE stash-slot accessor (*perla_our_slot_array("Pkg","NAME")) that
+# resolves the CURRENT package's glob slot — one source of truth, valid
+# in both read and write positions. %__perla_our_collide and the current
+# package are synced from cg at generate()/generate_module() entry and at
+# every cg->{"pkg"} assignment (gen_stmt N_PACKAGE, sub emission).
+my hash %__perla_our_collide = ();
+my hash %__perla_cvar_state = ();
+# File-scope `my` lexicals declared by 2+ inlined modules in one TU
+# collide on the shared per-name static (Specio::OO's %TypeChecks etc.).
+# Collided names get a per-module suffix; the CURRENT inline-module is a
+# stack synced from the pragma brackets in gen_stmt.
+my hash %__perla_filelex_collide = ();
+my array @__perla_imod_stack = ();
+
+func c_var_set_filelex(scalar $collide) void {
+    %__perla_filelex_collide = ();
+    @__perla_imod_stack = ();
+    if (defined($collide)) {
+        my array @__fc = keys($collide);
+        my int $__fi = 0;
+        while ($__fi < scalar(@__fc)) {
+            $__perla_filelex_collide{$__fc[$__fi]} = 1;
+            $__fi++;
+        }
+    }
+}
+
+func c_var_push_imod(str $m) void { push(@__perla_imod_stack, $m); }
+func c_var_pop_imod() void {
+    if (scalar(@__perla_imod_stack) > 0) { pop(@__perla_imod_stack); }
+}
+func _cvar_cur_imod() str {
+    if (scalar(@__perla_imod_stack) > 0) { return "" . $__perla_imod_stack[scalar(@__perla_imod_stack) - 1]; }
+    return "";
+}
+
+func c_var_set_pkg(str $pkg) void {
+    $__perla_cvar_state{"pkg"} = $pkg;
+}
+
+func c_var_set_collide(scalar $collide) void {
+    %__perla_our_collide = ();
+    if (defined($collide)) {
+        my array @__cc = keys($collide);
+        my int $__ci = 0;
+        while ($__ci < scalar(@__cc)) {
+            my str $__cn = $__cc[$__ci];
+            if ($__cn ne "ISA" && $__cn ne "INC") {
+                $__perla_our_collide{$__cn} = 1;
+            }
+            $__ci++;
+        }
+    }
+}
+
+func _cvar_cur_pkg() str {
+    if (exists($__perla_cvar_state{"pkg"})) { return "" . $__perla_cvar_state{"pkg"}; }
+    return "main";
+}
+
 func c_var_a(str $name) str {
+    if (exists($__perla_our_collide{$name})) {
+        return "(*perla_our_slot_array(\"" . _cvar_cur_pkg() . "\", \"" . $name . "\"))";
+    }
     if (exists($__perla_mangle_collisions{$name})) {
         return "v_" . safe_ident($name) . "__a";
     }
@@ -8263,6 +8501,11 @@ func _perla_reset_mangle_collisions() void {
 # Accessor for the module-private mangle-collision table, so extracted
 # sub-modules (e.g. Perla::CodeGen::Call) can query it without direct
 # access to the package-level `%__perla_mangle_collisions` global.
+func _perla_has_our_collide(str $name) int {
+    if (exists($__perla_our_collide{$name})) { return 1; }
+    return 0;
+}
+
 func _perla_has_mangle_collision(str $name) int {
     return exists($__perla_mangle_collisions{$name}) ? 1 : 0;
 }

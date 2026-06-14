@@ -94,11 +94,11 @@ func emit_eval_string_with_caps(scalar $cg, scalar $node, int $is_expr) void {
             # was incorrect — it let a prior eval's $@ leak through and
             # mask the current die's message.
             Perla::CodeGen::emit($cg, "({ if (perla_eval_error) strada_decref(perla_eval_error); perla_eval_error = strada_new_str(\"\"); ");
-            Perla::CodeGen::emit($cg, "StradaValue *__esr = NULL; int __es_sav_wl = __perla_want_list; int __es_sav_cd = perla_call_depth; int __es_sav_rcd = perla_real_call_depth; jmp_buf *__esjb = STRADA_TRY_PUSH(); ");
+            Perla::CodeGen::emit($cg, "StradaValue *__esr = NULL; int __es_sav_wl = __perla_want_list; int __es_sav_cd = perla_call_depth; int __es_sav_rcd = perla_real_call_depth; int __es_cu_mark = PERLA_CU_MARK(); jmp_buf *__esjb = STRADA_TRY_PUSH(); ");
             Perla::CodeGen::emit($cg, "if (__esjb && setjmp(*__esjb) == 0) { __esr = perla_eval_string_with_args(");
             Perla::CodeGen::gen_expr($cg, $node->{"expr"});
             Perla::CodeGen::emit($cg, ", \"" . $cg->{"pkg"} . "\", perla_at_); STRADA_TRY_POP(); } ");
-            Perla::CodeGen::emit($cg, "else { STRADA_TRY_POP(); __perla_want_list = __es_sav_wl; ");
+            Perla::CodeGen::emit($cg, "else { STRADA_TRY_POP(); __perla_want_list = __es_sav_wl; PERLA_CU_DRAIN_TO(__es_cu_mark); ");
             Perla::CodeGen::emit($cg, "if (perla_call_depth > __es_sav_cd) perla_call_depth = __es_sav_cd; ");
             Perla::CodeGen::emit($cg, "if (perla_real_call_depth > __es_sav_rcd) perla_real_call_depth = __es_sav_rcd; ");
             # Always overwrite $@ from the current exception. perl semantic.
@@ -107,11 +107,11 @@ func emit_eval_string_with_caps(scalar $cg, scalar $node, int $is_expr) void {
             Perla::CodeGen::emit($cg, "else { perla_eval_error = strada_exception_msg ? strada_new_str(strada_exception_msg) : strada_new_str(\"Unknown error\"); } ");
             Perla::CodeGen::emit($cg, "__esr = strada_new_undef(); } __esr; })");
         } else {
-            Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "{ if (perla_eval_error) strada_decref(perla_eval_error); perla_eval_error = strada_new_str(\"\"); int __es_sav_wl = __perla_want_list; int __es_sav_cd = perla_call_depth; int __es_sav_rcd = perla_real_call_depth; jmp_buf *__esjb = STRADA_TRY_PUSH(); ");
+            Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "{ if (perla_eval_error) strada_decref(perla_eval_error); perla_eval_error = strada_new_str(\"\"); int __es_sav_wl = __perla_want_list; int __es_sav_cd = perla_call_depth; int __es_sav_rcd = perla_real_call_depth; int __es_cu_mark = PERLA_CU_MARK(); jmp_buf *__esjb = STRADA_TRY_PUSH(); ");
             Perla::CodeGen::emit($cg, "if (__esjb && setjmp(*__esjb) == 0) { perla_eval_string_with_args(");
             Perla::CodeGen::gen_expr($cg, $node->{"expr"});
             Perla::CodeGen::emit($cg, ", \"" . $cg->{"pkg"} . "\", perla_at_); STRADA_TRY_POP(); } ");
-            Perla::CodeGen::emit($cg, "else { STRADA_TRY_POP(); __perla_want_list = __es_sav_wl; ");
+            Perla::CodeGen::emit($cg, "else { STRADA_TRY_POP(); __perla_want_list = __es_sav_wl; PERLA_CU_DRAIN_TO(__es_cu_mark); ");
             Perla::CodeGen::emit($cg, "if (perla_call_depth > __es_sav_cd) perla_call_depth = __es_sav_cd; ");
             Perla::CodeGen::emit($cg, "if (perla_real_call_depth > __es_sav_rcd) perla_real_call_depth = __es_sav_rcd; ");
             Perla::CodeGen::emit($cg, "if (perla_eval_error) strada_decref(perla_eval_error); ");
@@ -168,11 +168,11 @@ func emit_eval_string_with_caps(scalar $cg, scalar $node, int $is_expr) void {
     # current exception in the catch — see Eval.strada's expr/stmt
     # branches above for the rationale.
     Perla::CodeGen::emit($cg, "if (perla_eval_error) strada_decref(perla_eval_error); perla_eval_error = strada_new_str(\"\"); ");
-    Perla::CodeGen::emit($cg, "StradaValue *__eval_rv = NULL; int __es_sav_wl = __perla_want_list; int __es_sav_cd = perla_call_depth; int __es_sav_rcd = perla_real_call_depth; jmp_buf *__esjb = STRADA_TRY_PUSH(); ");
+    Perla::CodeGen::emit($cg, "StradaValue *__eval_rv = NULL; int __es_sav_wl = __perla_want_list; int __es_sav_cd = perla_call_depth; int __es_sav_rcd = perla_real_call_depth; int __es_cu_mark = PERLA_CU_MARK(); jmp_buf *__esjb = STRADA_TRY_PUSH(); ");
     Perla::CodeGen::emit($cg, "if (__esjb && setjmp(*__esjb) == 0) { __eval_rv = perla_eval_string_with_lexicals(");
     Perla::CodeGen::gen_expr($cg, $node->{"expr"});
     Perla::CodeGen::emit($cg, ", \"" . $cg->{"pkg"} . "\", perla_at_, __caps_h); STRADA_TRY_POP(); } ");
-    Perla::CodeGen::emit($cg, "else { STRADA_TRY_POP(); __perla_want_list = __es_sav_wl; ");
+    Perla::CodeGen::emit($cg, "else { STRADA_TRY_POP(); __perla_want_list = __es_sav_wl; PERLA_CU_DRAIN_TO(__es_cu_mark); ");
     Perla::CodeGen::emit($cg, "if (perla_call_depth > __es_sav_cd) perla_call_depth = __es_sav_cd; ");
     Perla::CodeGen::emit($cg, "if (perla_real_call_depth > __es_sav_rcd) perla_real_call_depth = __es_sav_rcd; ");
     Perla::CodeGen::emit($cg, "if (perla_eval_error) strada_decref(perla_eval_error); ");

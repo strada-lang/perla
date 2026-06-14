@@ -3375,6 +3375,34 @@ func _gen_call(scalar $cg, scalar $node) void {
             # substring with REPL AND returns the original substring.
             # Was falling through to 3-arg (no replacement) and silently
             # dropping REPL.
+            # 4-arg substr through a DEREF target (`substr($$yaml,0,1,'')`,
+            # YAML::PP::Lexer): gen_expr of $$x is a statement-expression,
+            # not an lvalue — taking &(...) of it failed to compile. Deref
+            # the REF once and write back through its rv slot.
+            if (defined($args->[0]) && ref($args->[0]) eq "HASH"
+                && $args->[0]->{"type"} == Perla::AST::N_DEREF_SCALAR()
+                && defined($args->[0]->{"ref"})) {
+                Perla::CodeGen::emit($cg, "({ StradaValue *__sub_tref = ");
+                Perla::CodeGen::gen_expr($cg, $args->[0]->{"ref"});
+                Perla::CodeGen::emit($cg, "; StradaValue *__sub_old = strada_new_str(\"\"); ");
+                Perla::CodeGen::emit($cg, "if (__sub_tref && !STRADA_IS_TAGGED_INT(__sub_tref) && __sub_tref->type == STRADA_REF && __sub_tref->value.rv) { ");
+                Perla::CodeGen::emit($cg, "  strada_decref(__sub_old); ");
+                Perla::CodeGen::emit($cg, "  __sub_old = strada_substr(__sub_tref->value.rv, (int)strada_to_num(");
+                Perla::CodeGen::gen_expr($cg, $args->[1]);
+                Perla::CodeGen::emit($cg, "), (int)strada_to_num(");
+                Perla::CodeGen::gen_expr($cg, $args->[2]);
+                Perla::CodeGen::emit($cg, ")); ");
+                Perla::CodeGen::emit($cg, "  char *__sub_repl = strada_to_str(");
+                Perla::CodeGen::gen_expr($cg, $args->[3]);
+                Perla::CodeGen::emit($cg, "); ");
+                Perla::CodeGen::emit($cg, "  strada_substr_assign(&(__sub_tref->value.rv), (int64_t)strada_to_num(");
+                Perla::CodeGen::gen_expr($cg, $args->[1]);
+                Perla::CodeGen::emit($cg, "), (int64_t)strada_to_num(");
+                Perla::CodeGen::gen_expr($cg, $args->[2]);
+                Perla::CodeGen::emit($cg, "), __sub_repl); free(__sub_repl); ");
+                Perla::CodeGen::emit($cg, "} __sub_old; })");
+                return;
+            }
             Perla::CodeGen::emit($cg, "({ ");
             Perla::CodeGen::emit($cg, "StradaValue *__sub_old = strada_substr(");
             Perla::CodeGen::gen_expr($cg, $args->[0]);

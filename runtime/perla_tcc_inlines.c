@@ -21,10 +21,14 @@ typedef struct StradaHash StradaHash;
 #define STRADA_HASH 6
 #define STRADA_REF 7
 
-/* Extern access to runtime internals */
-#define STRADA_MAX_PENDING_CLEANUP 256
-extern StradaValue *strada_pending_cleanup[STRADA_MAX_PENDING_CLEANUP];
-extern int strada_pending_cleanup_count;
+/* Extern access to runtime internals. The old strada cleanup-stack
+ * globals (strada_pending_cleanup*) went private/TLS in the strada
+ * runtime; generated code now uses perla's OWN cleanup stack (see
+ * perla_stash.h), whose globals are plain and exported. */
+extern StradaValue **perla_cu_stack;
+extern int perla_cu_count;
+extern int perla_cu_cap;
+extern void perla_cu_push_slow(StradaValue *sv);
 
 /* Functions from strada_runtime.c we can call */
 extern void strada_incref_impl(StradaValue *sv);
@@ -60,17 +64,11 @@ struct StradaValue {
     StradaMeta *meta;
 };
 
-/* ===== Cleanup stack ===== */
-void strada_cleanup_push(StradaValue *sv) {
-    if (!sv || STRADA_IS_TAGGED_INT(sv)) return;
-    if (strada_pending_cleanup_count < STRADA_MAX_PENDING_CLEANUP) {
-        strada_pending_cleanup[strada_pending_cleanup_count++] = sv;
-    }
-}
-
-void strada_cleanup_pop(void) {
-    if (strada_pending_cleanup_count > 0) strada_pending_cleanup_count--;
-}
+/* ===== Cleanup stack =====
+ * No twins needed anymore: generated code uses the PERLA_CU_* macros
+ * (plain exported globals, declared above), and the NO_TLS strada
+ * runtime exports real strada_cleanup_push/pop functions itself —
+ * defining them here was a duplicate-symbol link error. */
 
 /* ===== Hash inline wrappers ===== */
 StradaValue* strada_hv_fetch(StradaValue *sv, const char *key) {

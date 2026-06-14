@@ -63,6 +63,29 @@ endif
 TCC_RUNTIME ?= 0
 
 CC = gcc
+# Route the runtime .c compiles (perla_stash.c etc.) through ccache when
+# available, matching what stradac already does for the perla.strada->C->gcc
+# build. Without this the runtime objects always recompiled from scratch; with
+# it, an unchanged perla_stash.c (e.g. on a parser/codegen-only rebuild) is a
+# cache hit instead of a fresh -O2 compile of ~24k lines.
+#
+# Controlled by USE_CCACHE (set by ./configure into config.mk):
+#   auto (default) — use ccache if it is on PATH, else plain gcc
+#   yes            — same as auto (configure already verified it exists)
+#   no             — never use ccache
+# Also honors the standard CCACHE_DISABLE=1 env and skips if CC already names
+# ccache. When ccache is absent the build falls back to plain gcc cleanly.
+USE_CCACHE ?= auto
+ifneq ($(USE_CCACHE),no)
+ifeq ($(CCACHE_DISABLE),)
+ifeq ($(findstring ccache,$(CC)),)
+CCACHE_BIN := $(shell command -v ccache 2>/dev/null)
+ifneq ($(CCACHE_BIN),)
+CC := ccache $(CC)
+endif
+endif
+endif
+endif
 CFLAGS = -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable $(PERLA_OPT) -I$(RUNTIME_DIR)
 LDFLAGS = -rdynamic -ldl -lm -lpthread -lssl -lcrypto -lz -lsqlite3
 

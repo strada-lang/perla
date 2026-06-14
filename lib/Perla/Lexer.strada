@@ -496,6 +496,34 @@ func lex(str $source) array {
             }
             my str $tok = _read_sigil_var(\%lx, "$");
             if (length($tok) > 0) {
+                # English.pm name → punctuation-variable remap. English's
+                # own source aliases these via punctuation TYPEGLOBS
+                # (`*EVAL_ERROR = *@;`), which perla can't soundly inline
+                # (the `*@` / `*\` glob forms break the lexer); the parser
+                # skips English.pm, so bind the de-facto-standard names
+                # directly to the native specials here. Unconditional:
+                # these names are the established English bindings — code
+                # using $EVAL_ERROR as an unrelated variable doesn't
+                # meaningfully exist.
+                # Long names only — short aliases like $PID/$RS/$UID are
+                # plausible user variable names (`my $PID = fork`) and
+                # must not be hijacked.
+                if ($tok eq "EVAL_ERROR") { $tok = "@"; }
+                elsif ($tok eq "OS_ERROR") { $tok = "!"; }
+                elsif ($tok eq "PROCESS_ID") { $tok = "$"; }
+                elsif ($tok eq "PROGRAM_NAME") { $tok = "0"; }
+                elsif ($tok eq "OSNAME") { $tok = "^O"; }
+                elsif ($tok eq "INPUT_RECORD_SEPARATOR") { $tok = "/"; }
+                elsif ($tok eq "OUTPUT_RECORD_SEPARATOR") { $tok = "\\"; }
+                elsif ($tok eq "OUTPUT_FIELD_SEPARATOR") { $tok = ","; }
+                elsif ($tok eq "LIST_SEPARATOR") { $tok = "\""; }
+                elsif ($tok eq "SUBSCRIPT_SEPARATOR") { $tok = ";"; }
+                elsif ($tok eq "INPUT_LINE_NUMBER") { $tok = "."; }
+                elsif ($tok eq "REAL_USER_ID") { $tok = "<"; }
+                elsif ($tok eq "EFFECTIVE_USER_ID") { $tok = ">"; }
+                elsif ($tok eq "CHILD_ERROR") { $tok = "?"; }
+                elsif ($tok eq "PERL_VERSION") { $tok = "^V"; }
+                elsif ($tok eq "EXECUTABLE_NAME") { $tok = "^X"; }
                 push(@tokens, _tok("SCALAR_VAR", $tok, $lx{"line"}));
                 next;
             }
@@ -858,7 +886,31 @@ func lex(str $source) array {
                 next;
             }
 
-            # s{pat}{repl}flags or s|pat|repl|flags — s with non-/ delimiters
+            # s{pat}{repl}flags or s|pat|repl|flags — s with non-/ delimiters.
+            # Perl also allows whitespace (incl. newlines) between `s` and a
+            # PAIRED opening delimiter: Data::Dumper's qr-serialization uses
+            # `$pat =~ s <multi-line pattern> {replacement}gex`. Look ahead
+            # past whitespace; if the first non-ws char is a paired opener,
+            # treat it as the delimiter (bare `s < $x` comparisons don't
+            # exist — `s` is not a value).
+            if ($__after_arrow_s == 0 && $word eq "s") {
+                my int $__sw = $lx{"pos"};
+                while ($__sw < $len && (substr($source, $__sw, 1) eq " " || substr($source, $__sw, 1) eq "\t" || substr($source, $__sw, 1) eq "\n" || substr($source, $__sw, 1) eq "\r")) {
+                    $__sw = $__sw + 1;
+                }
+                if ($__sw > $lx{"pos"} && $__sw < $len) {
+                    my str $__swc = substr($source, $__sw, 1);
+                    if ($__swc eq "{" || $__swc eq "(" || $__swc eq "[" || $__swc eq "<") {
+                        # Count newlines we skip so line numbers stay right.
+                        my int $__swl = $lx{"pos"};
+                        while ($__swl < $__sw) {
+                            if (substr($source, $__swl, 1) eq "\n") { $lx{"line"} = $lx{"line"} + 1; }
+                            $__swl = $__swl + 1;
+                        }
+                        $lx{"pos"} = $__sw;
+                    }
+                }
+            }
             if ($__after_arrow_s == 0 && $word eq "s" && $lx{"pos"} < $len && substr($source, $lx{"pos"}, 1) ne "/" && substr($source, $lx{"pos"}, 1) ne " " && substr($source, $lx{"pos"}, 1) ne "\t") {
                 my str $s_delim = substr($source, $lx{"pos"}, 1);
                 my str $s_close = $s_delim;
@@ -890,13 +942,28 @@ func lex(str $source) array {
                         $lx{"pos"} = $lx{"pos"} + 1;
                     }
                 }
-                # For paired delimiters, skip whitespace and read replacement in new pair
+                # For paired delimiters, skip whitespace and read replacement
+                # in a new pair. The replacement may use a DIFFERENT pair than
+                # the pattern: `s <pat> {repl}gex` (Data::Dumper's qr
+                # serializer does exactly this). Reading it with the
+                # PATTERN's closer hunted for `>` through the rest of the
+                # file and silently swallowed everything to the next one.
+                my str $sr_open = $s_delim;
+                my str $sr_close = $s_close;
                 if ($s_paired == 1) {
                     while ($lx{"pos"} < $len && (substr($source, $lx{"pos"}, 1) eq " " || substr($source, $lx{"pos"}, 1) eq "\t" || substr($source, $lx{"pos"}, 1) eq "\n")) {
                         if (substr($source, $lx{"pos"}, 1) eq "\n") { $lx{"line"} = $lx{"line"} + 1; }
                         $lx{"pos"} = $lx{"pos"} + 1;
                     }
-                    if ($lx{"pos"} < $len) { $lx{"pos"} = $lx{"pos"} + 1; }
+                    if ($lx{"pos"} < $len) {
+                        $sr_open = substr($source, $lx{"pos"}, 1);
+                        $sr_close = $sr_open;
+                        if ($sr_open eq "(") { $sr_close = ")"; }
+                        if ($sr_open eq "[") { $sr_close = "]"; }
+                        if ($sr_open eq "{") { $sr_close = "}"; }
+                        if ($sr_open eq "<") { $sr_close = ">"; }
+                        $lx{"pos"} = $lx{"pos"} + 1;
+                    }
                 }
                 # Read replacement
                 my str $srepl = "";
@@ -907,11 +974,11 @@ func lex(str $source) array {
                     if ($sc2 eq "\\" && $lx{"pos"} + 1 < $len) {
                         $srepl = $srepl . $sc2 . substr($source, $lx{"pos"} + 1, 1);
                         $lx{"pos"} = $lx{"pos"} + 2;
-                    } elsif ($s_paired == 1 && $sc2 eq $s_delim) {
+                    } elsif ($sr_open ne $sr_close && $sc2 eq $sr_open) {
                         $sdepth2 = $sdepth2 + 1;
                         $srepl = $srepl . $sc2;
                         $lx{"pos"} = $lx{"pos"} + 1;
-                    } elsif ($sc2 eq $s_close) {
+                    } elsif ($sc2 eq $sr_close) {
                         $sdepth2 = $sdepth2 - 1;
                         if ($sdepth2 > 0) { $srepl = $srepl . $sc2; }
                         $lx{"pos"} = $lx{"pos"} + 1;
@@ -1132,7 +1199,10 @@ func lex(str $source) array {
                 # a regex delimiter. HTTP::Message uses `m,^message/,` (comma
                 # delimiter) which previously fell through to bareword `m`
                 # parsing and the file failed to compile.
-                if ($m_delim eq "/" || $m_delim eq "{" || $m_delim eq "[" || $m_delim eq "(" || $m_delim eq "<" || $m_delim eq "|" || $m_delim eq "!" || $m_delim eq "#" || $m_delim eq "," || $m_delim eq ":" || $m_delim eq ";" || $m_delim eq "~" || $m_delim eq "%" || $m_delim eq "^" || $m_delim eq "&" || $m_delim eq "*") {
+                # `@` and `.` added for Net::Amazon::Signature::V4's
+                # `m@([^?]*)\?(.*)$@` URL matching (and the analogous
+                # `m.…。` style); both are valid Perl delimiters.
+                if ($m_delim eq "/" || $m_delim eq "{" || $m_delim eq "[" || $m_delim eq "(" || $m_delim eq "<" || $m_delim eq "|" || $m_delim eq "!" || $m_delim eq "#" || $m_delim eq "," || $m_delim eq ":" || $m_delim eq ";" || $m_delim eq "~" || $m_delim eq "%" || $m_delim eq "^" || $m_delim eq "&" || $m_delim eq "*" || $m_delim eq "@" || $m_delim eq ".") {
                     my str $m_close = $m_delim;
                     if ($m_delim eq "(") { $m_close = ")"; }
                     if ($m_delim eq "[") { $m_close = "]"; }
@@ -1544,6 +1614,18 @@ func lex(str $source) array {
         # (so // is regex-empty not defined-or when in regex context)
         if ($ch eq "/" && scalar(@tokens) > 0) {
             my str $prev_type = $tokens[scalar(@tokens) - 1]->{"type"};
+            # `*/` — typeglob of the $/ special (English.pm's
+            # `*INPUT_RECORD_SEPARATOR = */;` / `*RS = */;`). After a `*`
+            # operator token a `/` can never start a regex or a division
+            # (Perl has no operand there), so emit it as the glob NAME
+            # token instead. Without this, the "regex" swallowed
+            # `;\n *RS = *` up to the next slash and the generated C
+            # contained mangled identifiers and unterminated strings.
+            if ($prev_type eq "OP" && $tokens[scalar(@tokens) - 1]->{"value"} eq "*") {
+                $lx{"pos"} = $pos + 1;
+                push(@tokens, _tok("IDENT", "/", $lx{"line"}));
+                next;
+            }
             if ($prev_type eq "LPAREN" || $prev_type eq "COMMA" || $prev_type eq "SEMI" ||
                 $prev_type eq "OP" || $prev_type eq "FAT_ARROW" || $prev_type eq "LBRACKET" ||
                 $prev_type eq "LBRACE" || $prev_type eq "RETURN" || $prev_type eq "NOT" ||

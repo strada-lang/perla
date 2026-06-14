@@ -164,6 +164,9 @@ void perla_hash_clear(StradaValue *hv_sv);
 void perla_array_clear(StradaValue *av_sv);
 void perla_scalar_set(const char *pkg, const char *name, StradaValue *val);
 StradaValue *perla_array_get(const char *pkg, const char *name);
+/* Lvalue stash-slot accessors for collided `our` names (see perla_stash.c). */
+StradaValue **perla_our_slot_array(const char *pkg, const char *name);
+StradaValue **perla_our_slot_hash(const char *pkg, const char *name);
 StradaValue *perla_scalar_via_qname(const char *qname);
 void perla_scalar_set_via_qname(const char *qname, StradaValue *val);
 StradaValue *perla_array_via_qname(const char *qname);
@@ -200,6 +203,38 @@ StradaValue *perla_undef_coderef_named(const char *name);
 StradaValue *perla_hash_kv_list(StradaValue *hv);
 
 void perla_mark_loaded(const char *module);
+int  perla_inc_loaded(const char *module);
+
+/* ===== perla-owned cleanup stack =====
+ *
+ * Generated code used strada_cleanup_push/mark/drain_to — three runtime
+ * CALLS per sub invocation (now TLS-indirect in strada, and not
+ * inlineable since the backing globals went private). Measured on the
+ * fib benchmark this machinery alone cost ~2x total runtime. perla owns
+ * its own stack with exported plain globals so the generated C inlines
+ * every operation (an array store / a read / a tight loop).
+ *
+ * Die-unwind safety: perla's emitted eval-BLOCK catch paths drain to
+ * the mark they saved at try entry. A die caught by a TRY inside the
+ * strada runtime (e.g. a sort comparator dying) can skip intermediate
+ * perla frames' drains — their entries are then released by the next
+ * enclosing perla drain, since drains are depth-based (drain everything
+ * above MY mark). Entries can be released late, never double-freed. */
+extern StradaValue **perla_cu_stack;
+extern int perla_cu_count;
+extern int perla_cu_cap;
+void perla_cu_push_slow(StradaValue *sv);   /* grows the stack, then pushes */
+#define PERLA_CU_PUSH(sv) do { \
+        if (perla_cu_count < perla_cu_cap) perla_cu_stack[perla_cu_count++] = (sv); \
+        else perla_cu_push_slow(sv); \
+    } while (0)
+#define PERLA_CU_MARK() (perla_cu_count)
+#define PERLA_CU_DRAIN_TO(mark) do { \
+        while (perla_cu_count > (mark)) { \
+            StradaValue *__cu_v = perla_cu_stack[--perla_cu_count]; \
+            if (__cu_v) strada_decref(__cu_v); \
+        } \
+    } while (0)
 void perla_set_mro(const char *pkg, const char *algo);
 int  perla_try_require(const char *module);
 int  perla_try_load_precompiled(const char *module);
@@ -234,6 +269,11 @@ void perla_set_autoload_var_sv(StradaValue *val);
 StradaValue *perla_try_autoload(const char *pkg, const char *method,
                                  StradaValue *obj, StradaValue *args);
 StradaValue *perla_method_dispatch(StradaValue *obj, const char *method, StradaValue *args);
+/* Call-site monomorphic-cache variant: codegen passes per-site static
+ * slots (pkg string / generation / cached code SV). Falls back to the
+ * full dispatch (which fills the slots) on miss or invalidation. */
+StradaValue *perla_method_dispatch_cached(StradaValue *obj, const char *method, StradaValue *args,
+                                          char **cs_pkg, long *cs_gen, StradaValue **cs_code);
 StradaValue *perla_exporter_import_pub(StradaValue *args);  /* promote requested names from a no-import module's stash into the caller */
 
 /* ===== @ISA Management ===== */

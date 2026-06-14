@@ -113,6 +113,18 @@ func emit_subst_writeback(scalar $cg, scalar $target, str $src_c) void {
                 Perla::CodeGen::emit($cg, "perla_set_autoload_var_sv(" . $src_c . "); ");
                 return;
             }
+            # $@ — gen_expr reads it via a guarded statement-expression that
+            # auto-vivifies perla_eval_error, which is not a C lvalue, so the
+            # generic `gen_expr(target) = src` path below emitted
+            # `({ ... perla_eval_error; }) = __nv` — invalid C ("lvalue
+            # required"). Assign the global directly, mirroring the
+            # decref-old / extra-incref convention of its other setters.
+            # Surfaced by `$@ =~ s/ at .+ line \d+.*//` (Encode,
+            # DBIx::Class::Relationship::* and friends all scrub $@ this way).
+            if ($tvname eq "@") {
+                Perla::CodeGen::emit($cg, "{ if (perla_eval_error) strada_decref(perla_eval_error); perla_eval_error = " . $src_c . "; strada_incref(perla_eval_error); } ");
+                return;
+            }
             # Package-qualified scalar ($Pkg::NAME): gen_expr emits
             # perla_scalar_get(pkg, short) — a function call, not a C lvalue —
             # so `gen_expr(target) = src` fails to compile ("lvalue required").
@@ -159,7 +171,7 @@ func emit_subst_writeback(scalar $cg, scalar $target, str $src_c) void {
             # push the new value to the cleanup stack and let drain decref
             # it; leave the old entry alone (drain will handle that too).
             if (defined($cg->{"param_vars"}) && defined($cg->{"param_vars"}->{$tvname})) {
-                Perla::CodeGen::emit($cg, "strada_cleanup_push(" . $src_c . "); ");
+                Perla::CodeGen::emit($cg, "PERLA_CU_PUSH(" . $src_c . "); ");
                 Perla::CodeGen::gen_expr($cg, $target);
                 Perla::CodeGen::emit($cg, " = " . $src_c . "; ");
                 return;

@@ -496,9 +496,17 @@ func gen_sub_def(scalar $cg, scalar $node) void {
     if (!defined($pkg)) { $pkg = $cg->{"pkg"}; }
     my str $old_pkg = $cg->{"pkg"};
     $cg->{"pkg"} = $pkg;  # Set current package for SUPER:: resolution
+    Perla::CodeGen::c_var_set_pkg("" . $pkg);
     # Clear label map for new function scope (prevents stale label references)
     $cg->{"label_map"} = {};
     my str $qname = $pkg . "::" . $name;
+    # File-lexical mangle context: a sub defined inside an inlined module
+    # must address that module's copies of COLLIDED file lexicals.
+    my int $__imod_pushed = 0;
+    if (defined($cg->{"sub_imod"}) && defined($cg->{"sub_imod"}->{$qname})) {
+        Perla::CodeGen::c_var_push_imod("" . $cg->{"sub_imod"}->{$qname});
+        $__imod_pushed = 1;
+    }
     my str $fname = Perla::CodeGen::sub_cname_q($qname);
     # Track current sub's C function name for __SUB__ self-reference
     # in anon (and named) sub bodies. Restored at exit so nested subs
@@ -611,27 +619,27 @@ func gen_sub_def(scalar $cg, scalar $node) void {
             }
             Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "}\n");
             if ($needs_at == 1) {
-                Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "strada_cleanup_push(perla_at_);\n");
+                Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "PERLA_CU_PUSH(perla_at_);\n");
             } else {
                 # Conditional cleanup: only push when perla_args_full was
                 # provided (so we'd hold a ref); skip otherwise (NULL).
-                Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "if (perla_at_) strada_cleanup_push(perla_at_);\n");
+                Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "if (perla_at_) PERLA_CU_PUSH(perla_at_);\n");
             }
             $pi = 0;
         }
 
         # Save cleanup-stack baseline so an early `return` only drains
         # cleanups pushed by THIS function, not the caller's. Without
-        # this, `strada_cleanup_drain()` inside a `return EXPR` decrefs
+        # this, `PERLA_CU_DRAIN_TO(0)` inside a `return EXPR` decrefs
         # outer function's params (e.g. blessed `$self`) — they get
         # freed mid-call, the StradaValue pool reuses the address for
         # something else, and the bless silently disappears. Concrete
         # case: DBIx::Class::ResultSet::_normalize_selection holds
         # `$self` in its cleanup stack. Then it calls Hash::Merge::new,
-        # which has `return …` that emits `strada_cleanup_drain()` and
+        # which has `return …` that emits `PERLA_CU_DRAIN_TO(0)` and
         # decrefs `$self` to 0 — ResultSet::new then returns an
         # unblessed value, schema lookups all return undef.
-        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "int __perla_cleanup_mark = strada_cleanup_mark();\n");
+        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "int __perla_cleanup_mark = PERLA_CU_MARK();\n");
         # Snapshot caller's wantarray context — internal `my @x = ()` assigns
         # toggle __perla_want_list during the body, so the global doesn't
         # reflect the caller's intent by the time we hit `return`. Use this
@@ -671,7 +679,7 @@ func gen_sub_def(scalar $cg, scalar $node) void {
             # Subst-writeback stays correct: it tracks param_vars at compile
             # time and pushes the NEW value on `$param =~ s///`, identical in
             # both cases; only the (refcount-free) original is no longer pushed.
-            Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "if (!STRADA_IS_TAGGED_INT(" . $pn . ")) { strada_incref(" . $pn . "); strada_cleanup_push(" . $pn . "); }\n");
+            Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "if (!STRADA_IS_TAGGED_INT(" . $pn . ")) { strada_incref(" . $pn . "); PERLA_CU_PUSH(" . $pn . "); }\n");
             $cg->{"param_vars"}->{$pnames->[$pi]} = 1;
             $pi++;
         }
@@ -840,7 +848,7 @@ func gen_sub_def(scalar $cg, scalar $node) void {
                         # only statement is `@{$self}[...] = ...`, freed $p out
                         # from under its caller). drain_to matches the explicit
                         # `return` path.
-                        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "strada_cleanup_drain_to(__perla_cleanup_mark);\n");
+                        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "PERLA_CU_DRAIN_TO(__perla_cleanup_mark);\n");
                         Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "if (__perla_local_chain != __perla_local_chain_mark) { perla_local_chain_restore_to(__perla_local_chain, __perla_local_chain_mark); __perla_local_chain = __perla_local_chain_mark; }\n");
                         Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "perla_call_pop();\n");
                         Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "return __ret_val ? __ret_val : strada_undef_static();\n");
@@ -947,7 +955,7 @@ func gen_sub_def(scalar $cg, scalar $node) void {
                         # only statement is `@{$self}[...] = ...`, freed $p out
                         # from under its caller). drain_to matches the explicit
                         # `return` path.
-                        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "strada_cleanup_drain_to(__perla_cleanup_mark);\n");
+                        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "PERLA_CU_DRAIN_TO(__perla_cleanup_mark);\n");
                         # Sub-local scalar `my` cleanup — fire DESTROY at sub exit.
                         my int $__slc_i = 0;
                         while ($__slc_i < scalar(@__sub_local_scalars)) {
@@ -1000,7 +1008,7 @@ func gen_sub_def(scalar $cg, scalar $node) void {
         # strada_cleanup_pop()+decref mis-paired entries when the body pushed
         # its own temps, stranding param cleanup entries for the caller to
         # double-decref. drain_to matches the explicit `return` path.
-        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "strada_cleanup_drain_to(__perla_cleanup_mark);\n");
+        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "PERLA_CU_DRAIN_TO(__perla_cleanup_mark);\n");
         # Sub-local scalar `my` cleanup — fall-off-end path (see comment
         # at last-expr-implicit-return path above).
         my int $__sl2_i = 0;
@@ -1051,6 +1059,8 @@ func gen_sub_def(scalar $cg, scalar $node) void {
         Perla::CodeGen::emit($cg, "perla_at_");
         Perla::CodeGen::emit($cg, ");\n}\n\n");
         $cg->{"pkg"} = $old_pkg;
+        Perla::CodeGen::c_var_set_pkg("" . $old_pkg);
+        if ($__imod_pushed == 1) { Perla::CodeGen::c_var_pop_imod(); }
         return;
     }
 
@@ -1088,7 +1098,7 @@ func gen_sub_def(scalar $cg, scalar $node) void {
     Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "perla_call_push(\"" . Perla::CodeGen::Escape::escape_c_str($pkg) . "\", \"" . Perla::CodeGen::Escape::escape_c_str($name) . "\", \"" . Perla::CodeGen::Escape::escape_c_str($fn_file) . "\", 0);\n");
 
     # Save cleanup-stack baseline (see comment on the __direct path).
-    Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "int __perla_cleanup_mark = strada_cleanup_mark();\n");
+    Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "int __perla_cleanup_mark = PERLA_CU_MARK();\n");
     # @_ lifetime: when called with no args, perla_args is NULL and we created
     # a fresh @_ above (strada_new_array) — it must be freed at exit or every
     # no-arg call to this sub leaks one array. When perla_args is non-NULL we
@@ -1096,7 +1106,7 @@ func gen_sub_def(scalar $cg, scalar $node) void {
     # the caller's ownership is preserved. Pushed AFTER the mark so the
     # drain_to(mark) at every exit path reclaims it (matches the __direct path,
     # which increfs-if-borrowed + cleanup_pushes perla_at_).
-    Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "if (perla_args) strada_incref(perla_at_); strada_cleanup_push(perla_at_);\n");
+    Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "if (perla_args) strada_incref(perla_at_); PERLA_CU_PUSH(perla_at_);\n");
     # Snapshot caller's wantarray context (see __direct path comment).
     Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "int __perla_caller_want_list = __perla_want_list;\n");
     # Per-call mark for `local` save records (chain itself is a runtime global).
@@ -1318,7 +1328,7 @@ func gen_sub_def(scalar $cg, scalar $node) void {
                 } else {
                     Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "if (!" . $cn . ") { " . $cn . " = strada_new_undef(); }\n");
                 }
-                Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "strada_incref(" . $cn . "); strada_cleanup_push(" . $cn . ");\n");
+                Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "strada_incref(" . $cn . "); PERLA_CU_PUSH(" . $cn . ");\n");
                 $cg->{"declared_vars"}->{$cn} = 1;
                 my scalar $sple = {};
                 $sple->{"name"} = $pname;
@@ -1329,13 +1339,13 @@ func gen_sub_def(scalar $cg, scalar $node) void {
                 my str $cn_a = Perla::CodeGen::c_var_a($pname);
                 Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "StradaValue *" . $cn_a . " = strada_new_array();\n");
                 Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "{ StradaArray *__slv = strada_deref_array(" . $cn_a . "); for (size_t __si = " . $spi . "; __si < __sig_n; __si++) { StradaValue *__se = strada_array_get(__sig_av, __si); if (__se) { strada_incref(__se); strada_array_push_take(__slv, __se); } } }\n");
-                Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "strada_cleanup_push(" . $cn_a . ");\n");
+                Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "PERLA_CU_PUSH(" . $cn_a . ");\n");
                 $cg->{"declared_vars"}->{$cn_a} = 1;
             } elsif ($sigil eq "HASH_VAR") {
                 my str $cn_h = Perla::CodeGen::c_var_h($pname);
                 Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "StradaValue *" . $cn_h . " = strada_new_hash();\n");
                 Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "{ StradaHash *__slh = strada_deref_hash(" . $cn_h . "); for (size_t __si = " . $spi . "; __si + 1 < __sig_n; __si += 2) { StradaValue *__sk = strada_array_get(__sig_av, __si); StradaValue *__sv = strada_array_get(__sig_av, __si + 1); if (__sk && __sv) { char *__skc = strada_to_str(__sk); strada_incref(__sv); strada_hash_set_take(__slh, __skc, __sv); free(__skc); } } }\n");
-                Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "strada_cleanup_push(" . $cn_h . ");\n");
+                Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "PERLA_CU_PUSH(" . $cn_h . ");\n");
                 $cg->{"declared_vars"}->{$cn_h} = 1;
             }
             $spi++;
@@ -1405,7 +1415,7 @@ func gen_sub_def(scalar $cg, scalar $node) void {
                         # Implicit-return-from-if (see gen_if_capture_return).
                         Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "{ StradaValue *__ret_val = NULL;\n");
                         Perla::CodeGen::Stmt::gen_if_capture_return($cg, $last_stmt, "__ret_val");
-                        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "if (__ret_val) strada_incref(__ret_val); strada_cleanup_drain_to(__perla_cleanup_mark); ");
+                        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "if (__ret_val) strada_incref(__ret_val); PERLA_CU_DRAIN_TO(__perla_cleanup_mark); ");
                         # Sub-local scalar cleanup (see __direct branch).
                         my int $__nl1_i = 0;
                         while ($__nl1_i < scalar(@__nd_sub_local_scalars)) {
@@ -1487,7 +1497,7 @@ func gen_sub_def(scalar $cg, scalar $node) void {
                         if ($__nslr_needs_incref == 1) {
                             Perla::CodeGen::emit($cg, "strada_incref(__ret_val); ");
                         }
-                        Perla::CodeGen::emit($cg, "strada_cleanup_drain_to(__perla_cleanup_mark); ");
+                        Perla::CodeGen::emit($cg, "PERLA_CU_DRAIN_TO(__perla_cleanup_mark); ");
                         # Sub-local scalar cleanup at implicit-return-expr path.
                         my int $__nl2_i = 0;
                         while ($__nl2_i < scalar(@__nd_sub_local_scalars)) {
@@ -1551,6 +1561,20 @@ func gen_sub_def(scalar $cg, scalar $node) void {
             $ci++;
         }
     }
+    # Undef sort-comparator capture macros (#define v_X (*__perla_sort_ctx[N])
+    # emitted at function entry). Without these, a leaked v_min/v_max macro
+    # rewrote every later function's `StradaValue *v_min = NULL;` into an
+    # invalid initializer — DateTime::SpanSet's sort comparator broke the
+    # entire TU downstream of it.
+    if (defined($node->{"is_sort_cmp"}) && $node->{"is_sort_cmp"} == 1
+        && defined($node->{"sort_captures"})) {
+        my scalar $__sc_undef = $node->{"sort_captures"};
+        my int $__su = 0;
+        while ($__su < scalar(@{$__sc_undef}) && $__su < 16) {
+            Perla::CodeGen::emit($cg, "#undef " . Perla::CodeGen::c_var($__sc_undef->[$__su]) . "\n");
+            $__su++;
+        }
+    }
     Perla::CodeGen::emit($cg, "\n");
     $cg->{"indent"} = 0;
     $cg->{"local_vars"} = $old_local_vars;
@@ -1563,6 +1587,8 @@ func gen_sub_def(scalar $cg, scalar $node) void {
     $cg->{"main_vars"} = $old_main_vars;
     $cg->{"in_sub"} = $old_in_sub2;
     $cg->{"pkg"} = $old_pkg;
+    Perla::CodeGen::c_var_set_pkg("" . $old_pkg);
+    if ($__imod_pushed == 1) { Perla::CodeGen::c_var_pop_imod(); }
     $cg->{"sub_local_scalars"} = $__nd_sub_locals_saved;
     $cg->{"sub_local_aggregates"} = $__nd_sub_aggs_saved;
     # Restore file-scope collision view

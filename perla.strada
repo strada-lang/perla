@@ -870,7 +870,7 @@ func _compile_c(str $c_file, str $exe, str $strada_dir, str $cc, str $extra_objs
     # .pm.o's correct sub bodies, returning undef for hash params or
     # silently calling the wrong code.
     my str $localized_objs = $extra_objs;
-    if (length($extra_objs) > 0 && $cc ne "tcc") {
+    if (length($extra_objs) > 0) {
         my array @obj_list = split(" ", trim($extra_objs));
         my int $oi = 0;
         my hash %owners = ();
@@ -938,8 +938,10 @@ func _compile_c(str $c_file, str $exe, str $strada_dir, str $cc, str $extra_objs
     # collide: GNU ld keeps the first, discards the rest. tcc doesn't
     # have this issue in the first place - its duplicate-symbol
     # handling is more permissive by default.
-    my str $multi_def = "";
-    if ($cc ne "tcc") { $multi_def = " -Wl,--allow-multiple-definition"; }
+    my str $multi_def = " -Wl,--allow-multiple-definition";
+    # (Applies to the tcc HYBRID too: tcc only compiles the TU; the final
+    # link always runs through gcc/GNU-ld, which without this flag dies
+    # on the benign inline+artifact duplicate perla_sub_* symbols.)
     my str $link_flags = $multi_def . " -ldl -lm -lpthread -lmysqlclient -lssl -lcrypto -lz -lsqlite3 -rdynamic";
     my str $pcre2_flags = "";
     my str $pcre2_lib = $strada_base . "/vendor/pcre2/libpcre2-8.a";
@@ -2003,7 +2005,13 @@ func main() int {
                 if ($tail eq $rel_from_mod) {
                     my str $inc_root = substr($input, 0, $inp_len - $tail_len - 1);
                     if (length($inc_root) > 0) {
-                        unshift(@{$lib_paths}, $inc_root);
+                        # APPEND (not unshift): the derived tree root is a
+                        # FALLBACK for siblings the configured paths lack,
+                        # not an override. Prepending poisoned whole dep
+                        # chains rooted in /opt — every sibling (and every
+                        # planted compat shim in an earlier configured
+                        # path) resolved from /opt's unpatchable copies.
+                        push(@{$lib_paths}, $inc_root);
                     }
                 }
             }
@@ -2018,9 +2026,23 @@ func main() int {
         my scalar $preloaded = {};
         $preloaded->{$mod_name} = 1;
         # Compile module to C (inline the pipeline since Strada's use doesn't pick up new funcs)
+        my int $phase_time = (core::getenv("PERLA_PHASE_TIME") eq "1") ? 1 : 0;
+        my float $pt0 = 0.0;
+        if ($phase_time == 1) { $pt0 = sys::hires_time(); }
         my array @mod_tokens = Perla::Lexer::lex($source);
+        my float $pt1 = 0.0;
+        if ($phase_time == 1) { $pt1 = sys::hires_time(); }
         my scalar $mod_ast = Perla::Parser::parse_with_file_context(@mod_tokens, $lib_paths, $preloaded, $input);
+        my float $pt2 = 0.0;
+        if ($phase_time == 1) { $pt2 = sys::hires_time(); }
         my str $code = Perla::CodeGen::generate_module($mod_ast, $mod_name);
+        if ($phase_time == 1) {
+            my float $pt3 = sys::hires_time();
+            say(STDERR, "[phase] " . $mod_name . " lex=" . sprintf("%.3f", $pt1 - $pt0)
+                . " parse=" . sprintf("%.3f", $pt2 - $pt1)
+                . " codegen=" . sprintf("%.3f", $pt3 - $pt2)
+                . " src_len=" . length($source) . " c_len=" . length($code));
+        }
 
         # Localization of transitively-inlined symbols happens at link
         # time via `objcopy --localize-symbol` (see _compile_c). When
@@ -2080,6 +2102,36 @@ func main() int {
         my str $base = $input;
         if (index($base, ".pm") >= 0) {
             $base = substr($base, 0, length($base) - 3);
+        }
+        # Shadow artifact dir: when the module's directory isn't writable
+        # (system trees like /opt/bzperl), write .pm.o/.pm.so/.pm.deps/
+        # .pm.export under ~/.cache/perla/artifacts/<abs path> instead of
+        # failing silently. The lookup sides (Parser tree probe, runtime
+        # require) check the shadow location too. Override the root with
+        # PERLA_ARTIFACT_DIR.
+        {
+            my str $in_dir = ".";
+            my int $sl = rindex($input, "/");
+            if ($sl >= 0) { $in_dir = substr($input, 0, $sl); }
+            my str $wtest = trim(core::qx("test -w " . _shq($in_dir) . " && echo 1"));
+            if ($wtest ne "1") {
+                my str $art_root = core::getenv("PERLA_ARTIFACT_DIR");
+                if (length($art_root) == 0) {
+                    $art_root = core::getenv("HOME") . "/.cache/perla/artifacts";
+                }
+                my str $abs_in = "" . core::realpath($input);
+                if (length($abs_in) == 0) { $abs_in = $input; }
+                my str $sh_base = $art_root . $abs_in;
+                if (index($sh_base, ".pm") >= 0) {
+                    $sh_base = substr($sh_base, 0, length($sh_base) - 3);
+                }
+                my str $sh_dir = $sh_base;
+                my int $sl2 = rindex($sh_dir, "/");
+                if ($sl2 >= 0) { $sh_dir = substr($sh_dir, 0, $sl2); }
+                core::qx("mkdir -p " . _shq($sh_dir) . " 2>/dev/null");
+                say(STDERR, "[perla] unwritable module dir " . $in_dir . " — artifacts to " . $sh_base . ".pm.*");
+                $base = $sh_base;
+            }
         }
         my str $c_file = $base . ".pm.c";
         my str $o_file = $base . ".pm.o";
@@ -2172,9 +2224,20 @@ func main() int {
         my str $eval_cc = core::getenv("PERLA_EVAL_CC");
 
         # Build .o (for static linking in compiled mode) — skipped in
-        # so-only mode.
+        # so-only mode. Under --cc tcc the .pm.o is also built with tcc
+        # (NO_TLS, matching the tcc-built main binary that will link it);
+        # this was the hidden gcc invocation that made "tcc" module
+        # builds cost gcc time anyway.
         if ($so_only == 0) {
-            my str $cmd_o = _cc_bin() . " " . _cc_opt_flags_for($c_file) . " -c -o " . $o_file . " " . $c_file . $inc_flags . " 2>&1";
+            my str $o_cc = _cc_bin();
+            my str $o_flags = _cc_opt_flags_for($c_file);
+            my str $o_extra = "";
+            if ($cc_override eq "tcc") {
+                $o_cc = "tcc";
+                $o_flags = "-w";
+                $o_extra = " -DSTRADA_NO_TLS";
+            }
+            my str $cmd_o = $o_cc . " " . $o_flags . " -c -o " . $o_file . " " . $c_file . $inc_flags . $o_extra . " 2>&1";
             my str $gcc_out = _run_cc($cmd_o);
             if (length($gcc_out) > 0) {
                 say(STDERR, $gcc_out);
@@ -2197,6 +2260,7 @@ func main() int {
             my str $so_cc = _cc_bin();
             my str $so_flags = _cc_opt_flags_for($c_file);
             my str $so_extra = "";
+            if (length($eval_cc) == 0 && $cc_override eq "tcc") { $eval_cc = "tcc"; }
             if (length($eval_cc) > 0) {
                 $so_cc = $eval_cc;
                 # tcc doesn't grok all of gcc's -O/-march flags; keep
@@ -2504,12 +2568,47 @@ func main() int {
             }
             $qi++;
         }
-        # Rebuild the full .o list
+        # Rebuild the full .o list, dropping any .pm.o older than the
+        # running perla binary. A .pm.o compiled against an older runtime
+        # header embeds inline runtime functions that can reference symbols
+        # the current runtime no longer exports (seen with
+        # strada_pending_cleanup_count after a strada runtime swap), which
+        # fails the link. The parser freshness-checks artifacts it resolves
+        # itself, but .pm.deps entries arrive here unchecked — gate them
+        # all at this single choke point. A dropped module simply loads on
+        # demand at runtime (perla -M rebuilds it fresh).
+        my int $perla_mtime = 0;
+        __C__ {
+            char __fp[2048];
+            ssize_t __fn = readlink("/proc/self/exe", __fp, sizeof(__fp)-1);
+            if (__fn > 0) {
+                __fp[__fn] = '\0';
+                struct stat __fst;
+                if (stat(__fp, &__fst) == 0) { strada_decref(perla_mtime); perla_mtime = STRADA_MAKE_TAGGED_INT((int64_t)__fst.st_mtime); }
+            }
+        }
         $precompiled_objs = "";
         my array @final_objs = keys(%seen_objs);
         my int $fi2 = 0;
         while ($fi2 < scalar(@final_objs)) {
-            $precompiled_objs = $precompiled_objs . " " . $final_objs[$fi2];
+            my str $fo = $final_objs[$fi2];
+            my int $fo_stale = 0;
+            if ($perla_mtime > 0 && length($fo) > 5 && substr($fo, length($fo) - 5, 5) eq ".pm.o") {
+                my int $fo_mtime = 0;
+                __C__ {
+                    struct stat __fost;
+                    char *__fos = strada_to_str(fo);
+                    if (stat(__fos, &__fost) == 0) { strada_decref(fo_mtime); fo_mtime = STRADA_MAKE_TAGGED_INT((int64_t)__fost.st_mtime); }
+                    free(__fos);
+                }
+                if ($fo_mtime > 0 && $fo_mtime < $perla_mtime) { $fo_stale = 1; }
+            }
+            if ($fo_stale == 1) {
+                say(STDERR, "[perla] dropping stale " . $fo . " (older than perla; runtime require rebuilds on demand)");
+                $fi2++;
+                next;
+            }
+            $precompiled_objs = $precompiled_objs . " " . $fo;
             $fi2++;
         }
     }
@@ -2528,9 +2627,25 @@ func main() int {
     # perla_tcc.h instead breaks OOP under tcc, so we leave strada_runtime.h
     # in place.
 
+    # Remove any stale executable first so the success check below can't
+    # be fooled by a leftover binary from an earlier build: a failed link
+    # leaves the old file untouched, and perla used to print "Compiled"
+    # and exit 0 even though cc/ld had just errored out.
+    if (core::file_exists($exe) == 1) { core::unlink($exe); }
+
     my str $compile_out = _compile_c($c_file, $exe, $strada_dir, $cc, $xs_c_files . $precompiled_objs);
     if (length($compile_out) > 0) {
         say(STDERR, $compile_out);
+    }
+
+    if (core::file_exists($exe) == 0) {
+        say(STDERR, "perla: C compilation/link failed — no executable produced (" . $exe . ")");
+        if ($keep_c == 1) {
+            say(STDERR, "[perla] kept C file: " . $c_file);
+        } else {
+            core::unlink($c_file);
+        }
+        return 1;
     }
 
     # Clean up generated C file - unless --keep was passed (or we're in -c

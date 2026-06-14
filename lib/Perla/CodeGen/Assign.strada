@@ -305,6 +305,39 @@ func _gen_assign(scalar $cg, scalar $node) void {
                     Perla::CodeGen::emit($cg, "  if (strada_is_slot_ref(__dsref)) { strada_deref_set(__dsref, __ld_v); } ");
                     Perla::CodeGen::emit($cg, "  else if (__dsref->value.rv) { strada_overwrite_in_place(__dsref->value.rv, __ld_v); } ");
                     Perla::CodeGen::emit($cg, "} }");
+                } elsif ($ltype == Perla::AST::N_GLOB_ACCESS()) {
+                    # `(*$ga, *$gb) = (\1, \2)` / `local (*A, *B) = @_` —
+                    # typeglob targets in a list assignment
+                    # (List::MoreUtils::pairwise and the DBIC Relationship
+                    # helpers localise *a/*b exactly this way). The fallback
+                    # below would emit the rvalue glob-fetch
+                    # statement-expression and assign to it — invalid C
+                    # ("lvalue required as left operand of assignment").
+                    # Route through the same runtime assigns the scalar
+                    # `*{EXPR} = value` / `*Name = value` forms use.
+                    my scalar $lgexpr = $lelem->{"expr"};
+                    if (defined($lgexpr)) {
+                        Perla::CodeGen::emit($cg, "{ StradaValue *__gan = ");
+                        Perla::CodeGen::gen_expr($cg, $lgexpr);
+                        Perla::CodeGen::emit($cg, "; perla_glob_assign_dynamic_pkg(__gan, __ld_v, \"" . $cg->{"pkg"} . "\"); }");
+                    } else {
+                        my str $lgname = "" . $lelem->{"name"};
+                        my int $lgsep = -1;
+                        my int $lgi = length($lgname) - 1;
+                        while ($lgi >= 0) {
+                            if ($lgi > 0 && substr($lgname, $lgi - 1, 2) eq "::") { $lgsep = $lgi - 1; last; }
+                            $lgi--;
+                        }
+                        my str $lgpkg = $cg->{"pkg"};
+                        my str $lgshort = $lgname;
+                        if ($lgsep >= 0) {
+                            $lgpkg = substr($lgname, 0, $lgsep);
+                            $lgshort = substr($lgname, $lgsep + 2, length($lgname) - $lgsep - 2);
+                        }
+                        Perla::CodeGen::emit($cg, "perla_glob_assign(perla_glob_get_or_create(perla_stash_get_or_create(\""
+                            . Perla::CodeGen::Escape::escape_c_str($lgpkg) . "\"), \""
+                            . Perla::CodeGen::Escape::escape_c_str($lgshort) . "\"), __ld_v); ");
+                    }
                 } else {
                     # Fallback: try plain assignment (may fail for unsupported lvalues).
                     Perla::CodeGen::gen_expr($cg, $lelem);
@@ -548,7 +581,7 @@ func _gen_assign(scalar $cg, scalar $node) void {
             Perla::CodeGen::emit($cg, "strada_overwrite_in_place(__dref->value.rv, __nv); } ");
             Perla::CodeGen::emit($cg, "else if (__dref && !STRADA_IS_TAGGED_INT(__dref) && __dref->type == STRADA_STR && __dref->value.pv) { ");
             if (defined($cg->{"strict_refs"}) && $cg->{"strict_refs"} == 1) {
-                Perla::CodeGen::emit($cg, "{ char __sm[512]; snprintf(__sm, sizeof(__sm), \"Can't use string (\\\"%s\\\") as a SCALAR ref while \\\"strict refs\\\" in use\", __dref->value.pv); strada_die(__sm); } ");
+                Perla::CodeGen::emit($cg, "if (strstr(__dref->value.pv, \"::\")) { strada_incref(__nv); perla_scalar_set_via_qname(__dref->value.pv, __nv); } else { char __sm[512]; snprintf(__sm, sizeof(__sm), \"Can't use string (\\\"%s\\\") as a SCALAR ref while \\\"strict refs\\\" in use\", __dref->value.pv); strada_die(__sm); } ");
             } else {
                 Perla::CodeGen::emit($cg, "strada_incref(__nv); perla_scalar_set_via_qname(__dref->value.pv, __nv); ");
             }
@@ -1003,8 +1036,12 @@ func _gen_assign(scalar $cg, scalar $node) void {
             } elsif ($inner_type == Perla::AST::N_SCALAR_VAR()
                 && defined($inner_hash->{"name"}) && length($inner_hash->{"name"}) > 0
                 && index($inner_hash->{"name"}, "::") < 0 && $inner_hash->{"name"} ne "_"
-                && Perla::CodeGen::_perla_has_mangle_collision($inner_hash->{"name"})) {
-                # $foo{k} assignment where foo collides — store into %foo slot.
+                && (Perla::CodeGen::_perla_has_mangle_collision($inner_hash->{"name"})
+                    || Perla::CodeGen::_perla_has_our_collide($inner_hash->{"name"}))) {
+                # $foo{k} assignment where foo collides (sigil-mangled OR
+                # our-collided across packages) — store into the %foo slot
+                # via c_var_h, which routes collided names through the
+                # stash-slot accessor.
                 Perla::CodeGen::emit($cg, Perla::CodeGen::c_var_h($inner_hash->{"name"}));
             } else {
                 Perla::CodeGen::gen_expr($cg, $inner_hash);
@@ -1233,7 +1270,7 @@ func _gen_assign(scalar $cg, scalar $node) void {
             Perla::CodeGen::gen_expr($cg, $node->{"value"});
             Perla::CodeGen::emit($cg, "; __perla_want_list = __sav_wl_dh; ");
             if ($__lh_strict == 1) {
-                Perla::CodeGen::emit($cg, "if (__dh_ref && !STRADA_IS_TAGGED_INT(__dh_ref) && __dh_ref->type == STRADA_STR && __dh_ref->value.pv) { char __sm[512]; snprintf(__sm, sizeof(__sm), \"Can't use string (\\\"%s\\\") as a HASH ref while \\\"strict refs\\\" in use\", __dh_ref->value.pv); strada_die(__sm); } ");
+                Perla::CodeGen::emit($cg, "if (__dh_ref && !STRADA_IS_TAGGED_INT(__dh_ref) && __dh_ref->type == STRADA_STR && __dh_ref->value.pv && !strstr(__dh_ref->value.pv, \"::\")) { char __sm[512]; snprintf(__sm, sizeof(__sm), \"Can't use string (\\\"%s\\\") as a HASH ref while \\\"strict refs\\\" in use\", __dh_ref->value.pv); strada_die(__sm); } ");
             }
             Perla::CodeGen::emit($cg, "perla_deref_hash_assign(__dh_ref, __dh_val); __dh_val; })");
             return;
@@ -1262,7 +1299,7 @@ func _gen_assign(scalar $cg, scalar $node) void {
                 # strict 'refs': symbolic-ref assignment dies. perla_deref_
                 # array_assign falls back to symbolic handling for strings,
                 # which under strict refs is exactly the error case.
-                Perla::CodeGen::emit($cg, "if (__da_ref && !STRADA_IS_TAGGED_INT(__da_ref) && __da_ref->type == STRADA_STR && __da_ref->value.pv) { char __sm[512]; snprintf(__sm, sizeof(__sm), \"Can't use string (\\\"%s\\\") as an ARRAY ref while \\\"strict refs\\\" in use\", __da_ref->value.pv); strada_die(__sm); } ");
+                Perla::CodeGen::emit($cg, "if (__da_ref && !STRADA_IS_TAGGED_INT(__da_ref) && __da_ref->type == STRADA_STR && __da_ref->value.pv && !strstr(__da_ref->value.pv, \"::\")) { char __sm[512]; snprintf(__sm, sizeof(__sm), \"Can't use string (\\\"%s\\\") as an ARRAY ref while \\\"strict refs\\\" in use\", __da_ref->value.pv); strada_die(__sm); } ");
             }
             Perla::CodeGen::emit($cg, "perla_deref_array_assign(__da_ref, __da_val); __da_val; })");
             return;

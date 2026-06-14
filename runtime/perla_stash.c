@@ -105,6 +105,69 @@ static StradaValue *perla_mro_get_mro(StradaValue *args);
 static StradaValue *perla_universal_can(StradaValue *args);
 static StradaValue *perla_universal_version(StradaValue *args);
 static StradaValue *perla_exporter_import(StradaValue *args);
+/* Native Module::Implementation (defined near perla_require_module). */
+static StradaValue *perla_io_handle_ungetc(StradaValue *args);
+static StradaValue *perla_moose_setup_import_methods(StradaValue *args);
+static StradaValue *perla_crz_Z_NO_FLUSH(StradaValue *args);
+static StradaValue *perla_crz_Z_PARTIAL_FLUSH(StradaValue *args);
+static StradaValue *perla_crz_Z_SYNC_FLUSH(StradaValue *args);
+static StradaValue *perla_crz_Z_FULL_FLUSH(StradaValue *args);
+static StradaValue *perla_crz_Z_FINISH(StradaValue *args);
+static StradaValue *perla_crz_Z_BLOCK(StradaValue *args);
+static StradaValue *perla_crz_Z_OK(StradaValue *args);
+static StradaValue *perla_crz_Z_STREAM_END(StradaValue *args);
+static StradaValue *perla_crz_Z_NEED_DICT(StradaValue *args);
+static StradaValue *perla_crz_Z_ERRNO(StradaValue *args);
+static StradaValue *perla_crz_Z_STREAM_ERROR(StradaValue *args);
+static StradaValue *perla_crz_Z_DATA_ERROR(StradaValue *args);
+static StradaValue *perla_crz_Z_MEM_ERROR(StradaValue *args);
+static StradaValue *perla_crz_Z_BUF_ERROR(StradaValue *args);
+static StradaValue *perla_crz_Z_VERSION_ERROR(StradaValue *args);
+static StradaValue *perla_crz_Z_NO_COMPRESSION(StradaValue *args);
+static StradaValue *perla_crz_Z_BEST_SPEED(StradaValue *args);
+static StradaValue *perla_crz_Z_BEST_COMPRESSION(StradaValue *args);
+static StradaValue *perla_crz_Z_DEFAULT_COMPRESSION(StradaValue *args);
+static StradaValue *perla_crz_Z_FILTERED(StradaValue *args);
+static StradaValue *perla_crz_Z_HUFFMAN_ONLY(StradaValue *args);
+static StradaValue *perla_crz_Z_RLE(StradaValue *args);
+static StradaValue *perla_crz_Z_FIXED(StradaValue *args);
+static StradaValue *perla_crz_Z_DEFAULT_STRATEGY(StradaValue *args);
+static StradaValue *perla_crz_Z_DEFLATED(StradaValue *args);
+static StradaValue *perla_crz_MAX_WBITS(StradaValue *args);
+static StradaValue *perla_crz_MAX_MEM_LEVEL(StradaValue *args);
+static StradaValue *perla_crz_Z_NULL(StradaValue *args);
+static StradaValue *perla_crz_zlib_version(StradaValue *args);
+static StradaValue *perla_crz_crc32(StradaValue *args);
+static StradaValue *perla_crz_adler32(StradaValue *args);
+static StradaValue *perla_tp_gmtime(StradaValue *args);
+static StradaValue *perla_tp_localtime(StradaValue *args);
+static StradaValue *perla_tp_strftime(StradaValue *args);
+static StradaValue *perla_tp_strptime(StradaValue *args);
+static StradaValue *perla_tp_epoch(StradaValue *args);
+static StradaValue *perla_tp_datetime(StradaValue *args);
+static StradaValue *perla_tp_ymd(StradaValue *args);
+static StradaValue *perla_tp_hms(StradaValue *args);
+static StradaValue *perla_tp_month(StradaValue *args);
+static StradaValue *perla_tp_day(StradaValue *args);
+static StradaValue *perla_tp_year(StradaValue *args);
+static StradaValue *perla_tp_mon(StradaValue *args);
+static StradaValue *perla_tp__mon(StradaValue *args);
+static StradaValue *perla_tp_mday(StradaValue *args);
+static StradaValue *perla_tp_hour(StradaValue *args);
+static StradaValue *perla_tp_min(StradaValue *args);
+static StradaValue *perla_tp_sec(StradaValue *args);
+static StradaValue *perla_tp_wday(StradaValue *args);
+static StradaValue *perla_tp__wday(StradaValue *args);
+static StradaValue *perla_tp_yday(StradaValue *args);
+static StradaValue *perla_mi_build_loader_sub(StradaValue *args);
+static StradaValue *perla_mi_pp_str(StradaValue *args);
+/* Native Module::Runtime API (defined near perla_require_module). */
+static StradaValue *perla_mr_require_module(StradaValue *args);
+static StradaValue *perla_mr_use_module(StradaValue *args);
+static StradaValue *perla_mr_use_package_optimistically(StradaValue *args);
+StradaValue *perla_mr_is_module_name(StradaValue *args);  /* existing native (global) */
+static StradaValue *perla_mr_check_module_name(StradaValue *args);
+static StradaValue *perla_mr_module_notional_filename(StradaValue *args);
 static StradaValue *perla_exporter_export(StradaValue *args);
 static StradaValue *perla_exporter_export_to_level(StradaValue *args);
 static StradaValue *perla_exporter_export_ok_tags(StradaValue *args);
@@ -188,9 +251,13 @@ PERLA_SSLEAY_CONST_FWD(RECEIVED_SHUTDOWN);
 #undef PERLA_SSLEAY_CONST_FWD
 static StradaValue *perla_class_data_lookup(const char *pkg, const char *name);
 static StradaValue *perla_storable_dclone(StradaValue *args);
+static StradaValue *perla_clone_clone(StradaValue *args);
+static StradaValue *perla_mime_b64_encode(StradaValue *args);
+static StradaValue *perla_mime_b64_decode(StradaValue *args);
 static StradaValue *perla_utf8_decode(StradaValue *args);
 static StradaValue *perla_utf8_encode(StradaValue *args);
 static StradaValue *perla_utf8_is_utf8(StradaValue *args);
+static StradaValue *perla_utf8_identity_cp(StradaValue *args);
 static StradaValue *perla_encode_encode(StradaValue *args);
 static StradaValue *perla_encode_decode(StradaValue *args);
 static StradaValue *perla_encode_is_utf8(StradaValue *args);
@@ -401,6 +468,7 @@ static StradaValue *perla_list_util_uniq(StradaValue *args);
 static StradaValue *perla_list_util_uniqint(StradaValue *args);
 static StradaValue *perla_list_util_shuffle(StradaValue *args);
 static StradaValue *perla_b_perlstring(StradaValue *args);
+static StradaValue *perla_b_main_cv(StradaValue *args);
 static StradaValue *perla_specio_install_t_sub(StradaValue *args);
 static StradaValue *perla_specio_t_stub(StradaValue *args);
 static StradaValue *perla_pvc_validation_for(StradaValue *args);
@@ -1188,6 +1256,16 @@ void perla_init(void) {
         atexit(perla_cleanup);
     }
 
+    /* Steer JSON.pm to its pure-Perl backend. JSON.pm's XS path requires
+     * JSON::XS (which perla's XSLoader lie-success makes "work"), then
+     * defines its JSON::Backend::XS glue by eval'ing its own __DATA__
+     * section — but a perla-compiled module has no DATA handle, so the
+     * glue never materializes and JSON.pm's init dies on
+     * JSON::Backend::XS->init. The PP backend (JSON::Backend::PP +
+     * JSON::PP) is pure Perl and fully functional under perla. Honor an
+     * explicit user override (no-overwrite setenv). */
+    setenv("PERL_JSON_BACKEND", "JSON::PP", 0);
+
     /* Seed both rand() and drand48() so first-call rand returns a non-
      * deterministic value. perla's codegen for `rand()` now uses
      * drand48() (to match perl's Perl_drand48 sequence bit-for-bit
@@ -1274,62 +1352,62 @@ void perla_init(void) {
                    strada_cpointer_new((void*)perla_mime_extract_only_addrs));
     perla_code_set_protected("MIME::Lite", "my_extract_full_addrs",
                    strada_cpointer_new((void*)perla_mime_extract_full_addrs));
-    perla_code_set("Package::Stash", "new",
+    perla_code_set_protected("Package::Stash", "new",
                    strada_new_str("perla_package_stash_new"));
-    perla_code_set("Package::Stash", "name",
+    perla_code_set_protected("Package::Stash", "name",
                    strada_new_str("perla_package_stash_name"));
-    perla_code_set("Package::Stash", "add_symbol",
+    perla_code_set_protected("Package::Stash", "add_symbol",
                    strada_new_str("perla_package_stash_add_symbol"));
-    perla_code_set("Package::Stash", "has_symbol",
+    perla_code_set_protected("Package::Stash", "has_symbol",
                    strada_new_str("perla_package_stash_has_symbol"));
-    perla_code_set("Package::Stash", "get_symbol",
+    perla_code_set_protected("Package::Stash", "get_symbol",
                    strada_new_str("perla_package_stash_get_symbol"));
-    perla_code_set("Package::Stash", "list_all_symbols",
+    perla_code_set_protected("Package::Stash", "list_all_symbols",
                    strada_new_str("perla_package_stash_list_all_symbols"));
-    perla_code_set("Package::Stash", "namespace",
+    perla_code_set_protected("Package::Stash", "namespace",
                    strada_new_str("perla_package_stash_namespace"));
-    perla_code_set("Package::Stash", "get_or_add_symbol",
+    perla_code_set_protected("Package::Stash", "get_or_add_symbol",
                    strada_new_str("perla_package_stash_get_or_add_symbol"));
-    perla_code_set("Package::Stash", "remove_symbol",
+    perla_code_set_protected("Package::Stash", "remove_symbol",
                    strada_new_str("perla_package_stash_remove_symbol"));
     /* Also register under Package::Stash::XS (same implementation) */
-    perla_code_set("Package::Stash::XS", "new",
+    perla_code_set_protected("Package::Stash::XS", "new",
                    strada_new_str("perla_package_stash_new"));
-    perla_code_set("Package::Stash::XS", "name",
+    perla_code_set_protected("Package::Stash::XS", "name",
                    strada_new_str("perla_package_stash_name"));
-    perla_code_set("Package::Stash::XS", "add_symbol",
+    perla_code_set_protected("Package::Stash::XS", "add_symbol",
                    strada_new_str("perla_package_stash_add_symbol"));
-    perla_code_set("Package::Stash::XS", "has_symbol",
+    perla_code_set_protected("Package::Stash::XS", "has_symbol",
                    strada_new_str("perla_package_stash_has_symbol"));
-    perla_code_set("Package::Stash::XS", "get_symbol",
+    perla_code_set_protected("Package::Stash::XS", "get_symbol",
                    strada_new_str("perla_package_stash_get_symbol"));
-    perla_code_set("Package::Stash::XS", "list_all_symbols",
+    perla_code_set_protected("Package::Stash::XS", "list_all_symbols",
                    strada_new_str("perla_package_stash_list_all_symbols"));
-    perla_code_set("Package::Stash::XS", "namespace",
+    perla_code_set_protected("Package::Stash::XS", "namespace",
                    strada_new_str("perla_package_stash_namespace"));
-    perla_code_set("Package::Stash::XS", "get_or_add_symbol",
+    perla_code_set_protected("Package::Stash::XS", "get_or_add_symbol",
                    strada_new_str("perla_package_stash_get_or_add_symbol"));
-    perla_code_set("Package::Stash::XS", "remove_symbol",
+    perla_code_set_protected("Package::Stash::XS", "remove_symbol",
                    strada_new_str("perla_package_stash_remove_symbol"));
     /* Some loaders bless the stash as Package::Stash::PP — register
      * methods there too so dispatch finds them either way. */
-    perla_code_set("Package::Stash::PP", "new",
+    perla_code_set_protected("Package::Stash::PP", "new",
                    strada_new_str("perla_package_stash_new"));
-    perla_code_set("Package::Stash::PP", "name",
+    perla_code_set_protected("Package::Stash::PP", "name",
                    strada_new_str("perla_package_stash_name"));
-    perla_code_set("Package::Stash::PP", "add_symbol",
+    perla_code_set_protected("Package::Stash::PP", "add_symbol",
                    strada_new_str("perla_package_stash_add_symbol"));
-    perla_code_set("Package::Stash::PP", "has_symbol",
+    perla_code_set_protected("Package::Stash::PP", "has_symbol",
                    strada_new_str("perla_package_stash_has_symbol"));
-    perla_code_set("Package::Stash::PP", "get_symbol",
+    perla_code_set_protected("Package::Stash::PP", "get_symbol",
                    strada_new_str("perla_package_stash_get_symbol"));
-    perla_code_set("Package::Stash::PP", "list_all_symbols",
+    perla_code_set_protected("Package::Stash::PP", "list_all_symbols",
                    strada_new_str("perla_package_stash_list_all_symbols"));
-    perla_code_set("Package::Stash::PP", "namespace",
+    perla_code_set_protected("Package::Stash::PP", "namespace",
                    strada_new_str("perla_package_stash_namespace"));
-    perla_code_set("Package::Stash::PP", "get_or_add_symbol",
+    perla_code_set_protected("Package::Stash::PP", "get_or_add_symbol",
                    strada_new_str("perla_package_stash_get_or_add_symbol"));
-    perla_code_set("Package::Stash::PP", "remove_symbol",
+    perla_code_set_protected("Package::Stash::PP", "remove_symbol",
                    strada_new_str("perla_package_stash_remove_symbol"));
 
     /* Data::Dumper OO interface — `Data::Dumper->new(...)->Indent(2)->Dump`
@@ -1779,6 +1857,131 @@ void perla_init(void) {
      * above and copies the slots we set up. _protected so the .pm load
      * doesn't clobber it. */
     perla_code_set_protected("Time::HiRes", "import", strada_cpointer_new((void*)perla_exporter_import));
+    /* Native Module::Runtime (see the perla_mr_* defs near
+     * perla_require_module for the rationale): protected natives +
+     * Exporter-routed import + @EXPORT_OK so `use Module::Runtime
+     * qw(require_module use_module ...)` resolves without ever
+     * compiling the real .pm. */
+    {
+        static const struct { const char *name; StradaValue *(*fn)(StradaValue *); } __mr_tab[] = {
+            { "require_module",              perla_mr_require_module },
+            { "use_module",                  perla_mr_use_module },
+            { "use_package_optimistically",  perla_mr_use_package_optimistically },
+            { "is_module_name",              perla_mr_is_module_name },
+            { "is_valid_module_name",        perla_mr_is_module_name },
+            { "check_module_name",           perla_mr_check_module_name },
+            { "module_notional_filename",    perla_mr_module_notional_filename },
+            { NULL, NULL }
+        };
+        StradaValue *mr_eok = strada_new_array();
+        for (int mi = 0; __mr_tab[mi].name; mi++) {
+            perla_code_set_protected("Module::Runtime", __mr_tab[mi].name,
+                                     strada_cpointer_new((void*)__mr_tab[mi].fn));
+            strada_array_push_take(mr_eok->value.av, strada_new_str(__mr_tab[mi].name));
+        }
+        PerlGlob *mr_g = perla_glob_get_or_create(perla_stash_get_or_create("Module::Runtime"), "EXPORT_OK");
+        if (mr_g->slots[PERLA_SLOT_ARRAY]) strada_decref(mr_g->slots[PERLA_SLOT_ARRAY]);
+        mr_g->slots[PERLA_SLOT_ARRAY] = mr_eok;
+        perla_code_set_protected("Module::Runtime", "import", strada_cpointer_new((void*)perla_exporter_import));
+    }
+    /* Specio::_clone — a deep-clone FUNCTION exported via the M::I
+     * loader whose symbol copy lands in a frame-derived (often wrong)
+     * package; consumers' unqualified _clone(...) then cross-package
+     * resolved to Type::Tiny::_clone (a METHOD) and died. Back it with
+     * the native deep clone and a static @EXPORT so plain Exporter
+     * handles the consumers. */
+    {
+        perla_code_set_protected("Specio",     "_clone", strada_cpointer_new((void*)perla_clone_clone));
+        perla_code_set_protected("Specio::PP", "_clone", strada_cpointer_new((void*)perla_clone_clone));
+        perla_code_set_protected("Specio::XS", "_clone", strada_cpointer_new((void*)perla_clone_clone));
+        StradaValue *sp_exp = strada_new_array();
+        strada_array_push_take(sp_exp->value.av, strada_new_str("_clone"));
+        PerlGlob *sp_g = perla_glob_get_or_create(perla_stash_get_or_create("Specio"), "EXPORT");
+        if (!sp_g->slots[PERLA_SLOT_ARRAY]) sp_g->slots[PERLA_SLOT_ARRAY] = sp_exp;
+        else strada_decref(sp_exp);
+    }
+    /* $VERSION for natively-backed modules: `use List::Util 1.33` etc.
+     * perform a UNIVERSAL::VERSION check that dies when the package has
+     * no $VERSION (YAML::Tiny's `use List::Util 1.33` killed config
+     * loading). Values track the bzperl 5.42 toolchain generously. */
+    {
+        static const struct { const char *pkg; const char *ver; } __vers[] = {
+            { "List::Util", "1.6801" }, { "Scalar::Util", "1.6801" },
+            { "Sub::Util", "1.6801" },  { "Time::HiRes", "1.9777" },
+            { "Storable", "3.32" },   { "Module::Runtime", "0.016" },
+            { "Module::Implementation", "0.09" },
+            { "Package::Stash", "0.40" }, { "DBI", "1.647" },
+            { "Encode", "3.21" }, { "Data::Dumper", "2.189" },
+            { NULL, NULL }
+        };
+        for (int vi = 0; __vers[vi].pkg; vi++) {
+            StradaValue *vv = strada_new_str(__vers[vi].ver);
+            perla_scalar_set(__vers[vi].pkg, "VERSION", vv);
+            strada_decref(vv);
+        }
+    }
+    {
+        static const struct { const char *n; StradaValue *(*f)(StradaValue*); } __crz[] = {
+            {"Z_NO_FLUSH", perla_crz_Z_NO_FLUSH}, {"Z_PARTIAL_FLUSH", perla_crz_Z_PARTIAL_FLUSH},
+            {"Z_SYNC_FLUSH", perla_crz_Z_SYNC_FLUSH}, {"Z_FULL_FLUSH", perla_crz_Z_FULL_FLUSH},
+            {"Z_FINISH", perla_crz_Z_FINISH}, {"Z_BLOCK", perla_crz_Z_BLOCK},
+            {"Z_OK", perla_crz_Z_OK}, {"Z_STREAM_END", perla_crz_Z_STREAM_END},
+            {"Z_NEED_DICT", perla_crz_Z_NEED_DICT}, {"Z_ERRNO", perla_crz_Z_ERRNO},
+            {"Z_STREAM_ERROR", perla_crz_Z_STREAM_ERROR}, {"Z_DATA_ERROR", perla_crz_Z_DATA_ERROR},
+            {"Z_MEM_ERROR", perla_crz_Z_MEM_ERROR}, {"Z_BUF_ERROR", perla_crz_Z_BUF_ERROR},
+            {"Z_VERSION_ERROR", perla_crz_Z_VERSION_ERROR},
+            {"Z_NO_COMPRESSION", perla_crz_Z_NO_COMPRESSION}, {"Z_BEST_SPEED", perla_crz_Z_BEST_SPEED},
+            {"Z_BEST_COMPRESSION", perla_crz_Z_BEST_COMPRESSION},
+            {"Z_DEFAULT_COMPRESSION", perla_crz_Z_DEFAULT_COMPRESSION},
+            {"Z_FILTERED", perla_crz_Z_FILTERED}, {"Z_HUFFMAN_ONLY", perla_crz_Z_HUFFMAN_ONLY},
+            {"Z_RLE", perla_crz_Z_RLE}, {"Z_FIXED", perla_crz_Z_FIXED},
+            {"Z_DEFAULT_STRATEGY", perla_crz_Z_DEFAULT_STRATEGY}, {"Z_DEFLATED", perla_crz_Z_DEFLATED},
+            {"MAX_WBITS", perla_crz_MAX_WBITS}, {"MAX_MEM_LEVEL", perla_crz_MAX_MEM_LEVEL},
+            {"Z_NULL", perla_crz_Z_NULL},
+            {"ZLIB_VERSION", perla_crz_zlib_version}, {"zlib_version", perla_crz_zlib_version},
+            {"crc32", perla_crz_crc32}, {"adler32", perla_crz_adler32},
+        };
+        for (size_t __ci = 0; __ci < sizeof(__crz)/sizeof(__crz[0]); __ci++)
+            perla_code_set_protected("Compress::Raw::Zlib", __crz[__ci].n,
+                                     strada_cpointer_new((void*)__crz[__ci].f));
+    }
+    {
+        static const struct { const char *n; StradaValue *(*f)(StradaValue*); } __tp[] = {
+            {"gmtime", perla_tp_gmtime}, {"localtime", perla_tp_localtime},
+            {"new", perla_tp_gmtime},
+            {"strftime", perla_tp_strftime}, {"strptime", perla_tp_strptime},
+            {"epoch", perla_tp_epoch},
+            {"datetime", perla_tp_datetime}, {"ymd", perla_tp_ymd},
+            {"hms", perla_tp_hms}, {"month", perla_tp_month}, {"day", perla_tp_day},
+            {"year", perla_tp_year}, {"mon", perla_tp_mon}, {"_mon", perla_tp__mon},
+            {"mday", perla_tp_mday}, {"hour", perla_tp_hour}, {"min", perla_tp_min},
+            {"sec", perla_tp_sec}, {"wday", perla_tp_wday}, {"_wday", perla_tp__wday},
+            {"yday", perla_tp_yday},
+        };
+        for (size_t __ti = 0; __ti < sizeof(__tp)/sizeof(__tp[0]); __ti++)
+            perla_code_set_protected("Time::Piece", __tp[__ti].n,
+                                     strada_cpointer_new((void*)__tp[__ti].f));
+    }
+    perla_code_set_protected("Moose::Exporter", "setup_import_methods",
+                             strada_cpointer_new((void*)perla_moose_setup_import_methods));
+    perla_code_set_protected("Moose::Exporter", "build_import_methods",
+                             strada_cpointer_new((void*)perla_moose_setup_import_methods));
+    perla_code_set_protected("IO::Handle", "ungetc",
+                             strada_cpointer_new((void*)perla_io_handle_ungetc));
+    /* Module::Load — load()/autoload() are require_module with sugar.
+     * YAML::PP's `load $module` hit "Undefined subroutine" (the .pm's
+     * heredoc-heavy implementation doesn't compile usefully). */
+    perla_code_set_protected("Module::Load", "load",
+                             strada_cpointer_new((void*)perla_mr_require_module));
+    perla_code_set_protected("Module::Load", "autoload",
+                             strada_cpointer_new((void*)perla_mr_use_module));
+    perla_code_set_protected("Module::Load", "load_remote",
+                             strada_cpointer_new((void*)perla_mr_require_module));
+    /* Native Module::Implementation (see perla_mi_build_loader_sub). */
+    perla_code_set_protected("Module::Implementation", "build_loader_sub",
+                             strada_cpointer_new((void*)perla_mi_build_loader_sub));
+    perla_code_set_protected("Module::Implementation", "implementation_for",
+                             strada_cpointer_new((void*)perla_mi_pp_str));
     /* Runtime-callable time/sleep/usleep (for `Time::HiRes::time()` etc. and
      * the native-lie path, in addition to codegen's compile-time use_hires
      * fast path). */
@@ -2364,6 +2567,38 @@ void perla_init(void) {
         strada_decref(export_ok);
     }
 
+    /* Clone::clone — pure-XS Clone.pm can't bootstrap under perla; the
+     * native is the same deep clone as Storable::dclone. Seed Exporter
+     * metadata so `use Clone qw(clone)` copies it into the caller. */
+    {
+        perla_code_set("Clone", "clone", strada_cpointer_new((void*)perla_clone_clone));
+        StradaValue *isa = strada_new_array();
+        strada_array_push_take(isa->value.av, strada_new_str("Exporter"));
+        perla_isa_assign("Clone::ISA", isa);
+        strada_decref(isa);
+        StradaValue *export_ok = strada_new_array();
+        strada_array_push_take(export_ok->value.av, strada_new_str("clone"));
+        perla_array_set("Clone", "EXPORT_OK", export_ok);
+        strada_decref(export_ok);
+    }
+
+    /* MIME::Base64 — pure-XS with no PP fallback; natives wrap the
+     * strada runtime's base64 codec (encode adds MIME 76-col line
+     * wrapping). encode_base64/decode_base64 are @EXPORT (default). */
+    {
+        perla_code_set("MIME::Base64", "encode_base64", strada_cpointer_new((void*)perla_mime_b64_encode));
+        perla_code_set("MIME::Base64", "decode_base64", strada_cpointer_new((void*)perla_mime_b64_decode));
+        StradaValue *isa = strada_new_array();
+        strada_array_push_take(isa->value.av, strada_new_str("Exporter"));
+        perla_isa_assign("MIME::Base64::ISA", isa);
+        strada_decref(isa);
+        StradaValue *exp = strada_new_array();
+        strada_array_push_take(exp->value.av, strada_new_str("encode_base64"));
+        strada_array_push_take(exp->value.av, strada_new_str("decode_base64"));
+        perla_array_set("MIME::Base64", "EXPORT", exp);
+        strada_decref(exp);
+    }
+
     /* Clone::clone — XS-only deep copy. Same engine as Storable::dclone
      * (strada_clone, now cycle-aware + coderef-preserving). Specio::XS does
      * `use Clone qw(clone); sub _clone { clone(shift) }`; without a native
@@ -2792,6 +3027,7 @@ void perla_init(void) {
      * (every parameter check elides, so `validation_for` returns the
      * empty hash for every call). */
     perla_code_set("B", "perlstring", strada_cpointer_new((void*)perla_b_perlstring));
+    perla_code_set("B", "main_cv",    strada_cpointer_new((void*)perla_b_main_cv));
     /* XString::perlstring — XS-only fast replacement for B::perlstring.
      * Specio::Helpers aliases `*perlstring = \&XString::perlstring` when
      * `eval { require XString; 1 }` succeeds (it does under perla's
@@ -2882,6 +3118,12 @@ void perla_init(void) {
     perla_code_set("utf8", "decode", strada_cpointer_new((void*)perla_utf8_decode));
     perla_code_set("utf8", "encode", strada_cpointer_new((void*)perla_utf8_encode));
     perla_code_set("utf8", "is_utf8", strada_cpointer_new((void*)perla_utf8_is_utf8));
+    /* utf8::unicode_to_native / native_to_unicode — identity on ASCII
+     * platforms (they only differ on EBCDIC). JSON::backportPP calls
+     * unicode_to_native unconditionally and its init died "Undefined
+     * subroutine" without these. */
+    perla_code_set("utf8", "unicode_to_native", strada_cpointer_new((void*)perla_utf8_identity_cp));
+    perla_code_set("utf8", "native_to_unicode", strada_cpointer_new((void*)perla_utf8_identity_cp));
     /* Encode module — identity stubs (perla strings are already byte
      * sequences, so encode/decode no-op for the common UTF-8 case). */
     perla_code_set("Encode", "encode",        strada_cpointer_new((void*)perla_encode_encode));
@@ -3073,6 +3315,14 @@ void perla_init(void) {
     perla_code_set_protected("Digest::MD5", "md5_hex",     strada_cpointer_new((void*)perla_digest_md5_hex));
     perla_code_set_protected("Digest::MD5", "md5",         strada_cpointer_new((void*)perla_digest_md5));
     perla_code_set_protected("Digest::MD5", "md5_base64",  strada_cpointer_new((void*)perla_digest_md5_base64));
+    /* Digest::SHA.pm bootstraps its XS via `__PACKAGE__->bootstrap`
+     * (DynaLoader-style), which has no resolution under perla and died
+     * its init midway. perla's Digest::SHA natives below cover the API;
+     * make bootstrap a benign no-op so the .pm's init completes. */
+    {
+        extern StradaValue *perla_hash_util_noop(StradaValue *args);
+        perla_code_set_protected("Digest::SHA", "bootstrap", strada_cpointer_new((void*)perla_hash_util_noop));
+    }
     perla_code_set_protected("Digest::SHA", "sha1_hex",    strada_cpointer_new((void*)perla_digest_sha1_hex));
     perla_code_set_protected("Digest::SHA", "sha224_hex",  strada_cpointer_new((void*)perla_digest_sha224_hex));
     perla_code_set_protected("Digest::SHA", "sha256_hex",  strada_cpointer_new((void*)perla_digest_sha256_hex));
@@ -3414,6 +3664,29 @@ static void perla_glob_slot_assign_raw(PerlGlob *glob, int slot, StradaValue *va
  * lookup, in the overwhelmingly-common no-runtime-override steady state. */
 long perla_code_override_gen = 0;
 
+/* ===== perla-owned cleanup stack (see perla_stash.h) ===== */
+static StradaValue *perla_cu_initial[16384];
+StradaValue **perla_cu_stack = perla_cu_initial;
+int perla_cu_count = 0;
+int perla_cu_cap = 16384;
+
+void perla_cu_push_slow(StradaValue *sv) {
+    /* Stack full — double it. The initial block is static; the first
+     * growth copies into the heap, later growths realloc. */
+    int newcap = perla_cu_cap * 2;
+    StradaValue **ns;
+    if (perla_cu_stack == perla_cu_initial) {
+        ns = (StradaValue **)malloc((size_t)newcap * sizeof(StradaValue *));
+        if (ns) memcpy(ns, perla_cu_stack, (size_t)perla_cu_count * sizeof(StradaValue *));
+    } else {
+        ns = (StradaValue **)realloc(perla_cu_stack, (size_t)newcap * sizeof(StradaValue *));
+    }
+    if (!ns) { if (sv) strada_decref(sv); return; }   /* OOM: release now */
+    perla_cu_stack = ns;
+    perla_cu_cap = newcap;
+    perla_cu_stack[perla_cu_count++] = sv;
+}
+
 void perla_glob_store(PerlGlob *glob, int slot, StradaValue *val) {
     if (!glob || slot < 0 || slot >= PERLA_SLOT_COUNT) return;
     if (slot == PERLA_SLOT_CODE) perla_code_override_gen++;
@@ -3603,8 +3876,35 @@ static StradaValue **perla_find_local_by_array_slot(StradaValue **stash_slot) {
     return NULL;
 }
 
+/* Lvalue stash-slot accessors for COLLIDED `our` names — names declared
+ * by 2+ packages in one generated TU (e.g. @EXPORT_OK across many inlined
+ * Exporter users). A single per-name C static drifts to whichever package
+ * registered it last (Module::Runtime's import read another module's
+ * @EXPORT_OK and died "not exported"); codegen instead emits
+ * (*perla_our_slot_array("Pkg","NAME")) so every access — read or write —
+ * resolves the owning package's glob slot directly. The slot is
+ * initialized on first access so dereferencing callers never see NULL. */
+StradaValue **perla_our_slot_array(const char *pkg, const char *name) {
+    PerlGlob *g = perla_glob_get_or_create(perla_stash_get_or_create(pkg), name);
+    if (!g->slots[PERLA_SLOT_ARRAY]) g->slots[PERLA_SLOT_ARRAY] = strada_new_array();
+    return &g->slots[PERLA_SLOT_ARRAY];
+}
+
+StradaValue **perla_our_slot_hash(const char *pkg, const char *name) {
+    PerlGlob *g = perla_glob_get_or_create(perla_stash_get_or_create(pkg), name);
+    if (!g->slots[PERLA_SLOT_HASH]) g->slots[PERLA_SLOT_HASH] = strada_new_hash();
+    return &g->slots[PERLA_SLOT_HASH];
+}
+
 void perla_register_our_local_array(const char *pkg, const char *name, StradaValue **local) {
     if (!pkg || !name || !local) return;
+    /* Slot-accessor registration: when codegen routes a collided name
+     * through perla_our_slot_array, the "local" IS the stash slot —
+     * registering it would create a self-referential sync entry. Skip. */
+    {
+        PerlGlob *g = perla_glob_get_or_create(perla_stash_get_or_create(pkg), name);
+        if (local == &g->slots[PERLA_SLOT_ARRAY]) return;
+    }
     if (perla_find_our_local_array(pkg, name)) return;
     if (g_our_locals_array_count >= g_our_locals_array_cap) {
         g_our_locals_array_cap = g_our_locals_array_cap ? g_our_locals_array_cap * 2 : 16;
@@ -3819,23 +4119,42 @@ StradaValue *perla_code_get_walking(const char *name) {
             return v;
         }
     }
-    /* Fall back to reverse stash walk. */
-    for (int i = g_stash_count - 1; i >= 0; i--) {
-        PerlStash *s = g_stashes[i];
-        if (!s) continue;
-        if (strcmp(s->name, "main") == 0) continue;
-        for (int j = 0; j < s->count; j++) {
-            if (s->keys[j] && strcmp(s->keys[j], name) == 0) {
-                PerlGlob *g = s->entries[j];
-                if (g) {
-                    StradaValue *v = g->slots[PERLA_SLOT_CODE];
+    /* Fall back to a stash walk — but ONLY when the name is UNAMBIGUOUS
+     * (defined by exactly one package). The old first-match-wins walk
+     * silently bound calls to unrelated same-named subs: Specio::OO's
+     * is_Str landed on Types::Standard's, its _clone on Type::Tiny's
+     * METHOD (walls 16/17), Mo's $M.import on CGI::import. With 400+
+     * packages loaded, popular names (import, new, is_Str, _clone) are
+     * russian roulette. Ambiguity now returns NULL so the caller dies
+     * with a proper "Undefined subroutine" instead of running the wrong
+     * code. */
+    {
+        StradaValue *only = NULL;
+        const char *only_pkg = NULL;
+        int matches = 0;
+        for (int i = g_stash_count - 1; i >= 0; i--) {
+            PerlStash *s = g_stashes[i];
+            if (!s) continue;
+            if (strcmp(s->name, "main") == 0) continue;
+            for (int j = 0; j < s->count; j++) {
+                if (s->keys[j] && strcmp(s->keys[j], name) == 0) {
+                    PerlGlob *g = s->entries[j];
+                    StradaValue *v = g ? g->slots[PERLA_SLOT_CODE] : NULL;
                     if (v) {
-                        perla_last_code_get_pkg = s->name;
-                        return v;
+                        matches++;
+                        if (!only) { only = v; only_pkg = s->name; }
+                        break;
                     }
                 }
             }
+            if (matches > 1) break;
         }
+        if (matches == 1) {
+            perla_last_code_get_pkg = only_pkg;
+            return only;
+        }
+        if (matches > 1 && perla_debug_mode())
+            fprintf(stderr, "[walk] ambiguous unqualified sub '%s' (%d+ packages) — refusing\n", name, matches);
     }
     return NULL;
 }
@@ -5000,7 +5319,10 @@ PerlGlob *perla_method_resolve(const char *pkg, const char *method) {
                 strada_hash_delete(g_INC_hash->value.hv, parent);
             }
             StradaValue *pname = strada_new_str(parent);
+            extern int g_perla_require_soft;
+            g_perla_require_soft++;
             StradaValue *rr = perla_require_module(pname);
+            g_perla_require_soft--;
             if (rr) strada_decref(rr);
             strada_decref(pname);
         }
@@ -5068,6 +5390,10 @@ void perla_isa_reset(const char *pkg) {
 }
 
 void perla_isa_push(const char *pkg, const char *parent) {
+    /* Hierarchy change — invalidate call-site method caches (see
+     * perla_method_dispatch_cached): a new parent can change what a
+     * cached resolution WOULD find without any code-slot store. */
+    perla_code_override_gen++;
     PerlStash *stash = perla_stash_get_or_create(pkg);
     if (!stash->isa) {
         stash->isa = strada_new_array();
@@ -5538,6 +5864,8 @@ static StradaValue *perla_mro_get_linear_isa(StradaValue *args) {
  * codegen for `use mro 'c3'` (and the older `use mro::c3`). */
 void perla_set_mro(const char *pkg, const char *algo) {
     if (!pkg || !algo) return;
+    /* MRO algorithm change reorders resolution — invalidate caches. */
+    perla_code_override_gen++;
     PerlStash *stash = perla_stash_get_or_create(pkg);
     if (!stash) return;
     stash->mro_c3 = (strcmp(algo, "c3") == 0) ? 1 : 0;
@@ -7501,6 +7829,19 @@ StradaValue *perla_bytes_length(StradaValue *args) {
  * generated validator source: `perlstring("name")` -> `"name"`. Without
  * this stub, the compiler builds source with empty `$args{}` placeholders
  * and the validator returns an empty hash for every call. */
+/* B::main_cv — Devel::GlobalDestruction's PP path defines
+ * `in_global_destruction () { ${B::main_cv()} == 0 }`: a scalar-deref of
+ * the returned object compared against 0. perla has no perl global
+ * destruction phase; return a ref to 1 so the deref is nonzero and
+ * in_global_destruction is always false (matching perla's lifetime
+ * model, where DESTROY runs as plain refcount drops). Without this,
+ * any DBIC teardown calling in_global_destruction died with
+ * "Undefined subroutine &B::main_cv". */
+static StradaValue *perla_b_main_cv(StradaValue *args) {
+    (void)args;
+    return strada_ref_create(STRADA_MAKE_TAGGED_INT(1));
+}
+
 static StradaValue *perla_b_perlstring(StradaValue *args) {
     if (!args) return strada_new_str("\"\"");
     StradaArray *av = strada_deref_array(args);
@@ -8757,6 +9098,17 @@ static StradaValue *perla_encode_find_encoding(StradaValue *args) {
  * relies on it to detect already-decoded strings. Without flag-based
  * dispatch, encode_utf8/decode_utf8 round-trip checks return wrong
  * results. Falls back to content scanning for non-STR / tagged-int. */
+/* Identity codepoint mapping: utf8::unicode_to_native and
+ * utf8::native_to_unicode are 1:1 on ASCII platforms. */
+static StradaValue *perla_utf8_identity_cp(StradaValue *args) {
+    if (!args) return strada_new_undef();
+    StradaArray *av = strada_deref_array(args);
+    if (!av || av->size < 1) return strada_new_undef();
+    StradaValue *v = av->elements[av->head + 0];
+    if (v) strada_incref(v);
+    return v ? v : strada_new_undef();
+}
+
 static StradaValue *perla_utf8_is_utf8(StradaValue *args) {
     if (!args) return STRADA_MAKE_TAGGED_INT(0);
     StradaArray *av = strada_deref_array(args);
@@ -9716,6 +10068,81 @@ static StradaValue *perla_storable_dclone(StradaValue *args) {
     return strada_clone(target);
 }
 
+/* Clone::clone — same deep clone as Storable::dclone. Clone.pm is
+ * pure-XS with no PP fallback; its XSLoader bootstrap can never load
+ * under perla, so the native (plus the XSLoader lie-success entry)
+ * keeps `use Clone qw(clone)` consumers working. */
+static StradaValue *perla_clone_clone(StradaValue *args) {
+    return perla_storable_dclone(args);
+}
+
+/* MIME::Base64 — encode_base64($data, $eol="\n") / decode_base64($str).
+ * Pure-XS module with no PP fallback; backed by the strada runtime's
+ * base64 codec. encode matches MIME semantics: 76-char lines, each
+ * (including the last) terminated by $eol; $eol of "" yields one line. */
+static StradaValue *perla_mime_b64_encode(StradaValue *args) {
+    if (!args) return strada_new_str("");
+    StradaArray *av = strada_deref_array(args);
+    if (!av || av->size < 1) return strada_new_str("");
+    StradaValue *raw = strada_base64_encode(av->elements[av->head + 0]);
+    const char *eol = "\n";
+    char *eol_owned = NULL;
+    if (av->size >= 2) {
+        StradaValue *e = av->elements[av->head + 1];
+        if (e && (STRADA_IS_TAGGED_INT(e) || e->type != STRADA_UNDEF)) {
+            eol_owned = strada_to_str(e);
+            eol = eol_owned;
+        }
+    }
+    char *b64 = strada_to_str(raw);
+    size_t blen = strlen(b64), elen = strlen(eol);
+    if (elen == 0) {
+        free(eol_owned);
+        strada_decref(raw);
+        StradaValue *r = strada_new_str(b64);
+        free(b64);
+        return r;
+    }
+    size_t lines = (blen + 75) / 76;
+    char *out = malloc(blen + lines * elen + 1);
+    size_t op = 0;
+    for (size_t i = 0; i < blen; i += 76) {
+        size_t n = blen - i < 76 ? blen - i : 76;
+        memcpy(out + op, b64 + i, n); op += n;
+        memcpy(out + op, eol, elen); op += elen;
+    }
+    out[op] = '\0';
+    free(b64);
+    free(eol_owned);
+    strada_decref(raw);
+    StradaValue *r = strada_new_str(out);
+    free(out);
+    return r;
+}
+
+static StradaValue *perla_mime_b64_decode(StradaValue *args) {
+    if (!args) return strada_new_str("");
+    StradaArray *av = strada_deref_array(args);
+    if (!av || av->size < 1) return strada_new_str("");
+    /* Strip whitespace/newlines first — MIME input is line-wrapped and
+     * the strada decoder expects a bare alphabet. */
+    char *in = strada_to_str(av->elements[av->head + 0]);
+    size_t ilen = strlen(in), op = 0;
+    char *clean = malloc(ilen + 1);
+    for (size_t i = 0; i < ilen; i++) {
+        char c = in[i];
+        if (c == '\n' || c == '\r' || c == ' ' || c == '\t') continue;
+        clean[op++] = c;
+    }
+    clean[op] = '\0';
+    free(in);
+    StradaValue *csv = strada_new_str(clean);
+    free(clean);
+    StradaValue *r = strada_base64_decode(csv);
+    strada_decref(csv);
+    return r;
+}
+
 /* Storable::freeze / Storable::thaw — perla doesn't implement the
  * binary Storable format. Serialize via Data::Dumper text and revive
  * via eval STRING. Sufficient for plain data structures (hash, array,
@@ -9949,17 +10376,35 @@ static StradaValue *perla_exporter_import(StradaValue *args) {
     /* Max possible output: wanted_count tag expansions each up to @EXPORT_OK
      * plus @EXPORT if defaulting. Cap generously. */
     size_t cap = wanted_count + (export_arr ? export_arr->size : 0) + (export_ok_arr ? export_ok_arr->size : 0) + 16;
-    char **names = (char**)calloc(cap, sizeof(char*));
-    char **excludes = (char**)calloc(cap, sizeof(char*));
+    size_t names_cap = cap, excludes_cap = cap;
+    char **names = (char**)calloc(names_cap, sizeof(char*));
+    char **excludes = (char**)calloc(excludes_cap, sizeof(char*));
     size_t name_count = 0;
     size_t exclude_count = 0;
+    /* %EXPORT_TAGS arrays can exceed @EXPORT+@EXPORT_OK (Archive::Zip's
+     * :CONSTANTS tag overflowed the fixed buffer → heap corruption), so
+     * every push goes through a growable macro. */
+#define PERLA_EI_PUSH_NAME(v) do { \
+        if (name_count >= names_cap) { \
+            names_cap = names_cap * 2 + 16; \
+            names = (char**)realloc(names, names_cap * sizeof(char*)); \
+        } \
+        names[name_count++] = (v); \
+    } while (0)
+#define PERLA_EI_PUSH_EXCL(v) do { \
+        if (exclude_count >= excludes_cap) { \
+            excludes_cap = excludes_cap * 2 + 16; \
+            excludes = (char**)realloc(excludes, excludes_cap * sizeof(char*)); \
+        } \
+        excludes[exclude_count++] = (v); \
+    } while (0)
 
     if (wanted_count == 0) {
         /* Default: import @EXPORT */
         if (export_arr) {
             for (size_t i = 0; i < export_arr->size; i++) {
                 char *nm = strada_to_str(export_arr->elements[export_arr->head + i]);
-                if (nm && nm[0]) names[name_count++] = nm;
+                if (nm && nm[0]) PERLA_EI_PUSH_NAME(nm);
                 else free(nm);
             }
         }
@@ -9971,7 +10416,7 @@ static StradaValue *perla_exporter_import(StradaValue *args) {
             if (nm[0] == '!') {
                 /* !NAME — exclude */
                 char *bare = strdup(nm + 1);
-                excludes[exclude_count++] = bare;
+                PERLA_EI_PUSH_EXCL(bare);
                 free(nm);
             } else if (nm[0] == ':') {
                 /* :tag — expand via %EXPORT_TAGS, or :DEFAULT → @EXPORT, or :ALL → @EXPORT_OK */
@@ -9979,7 +10424,7 @@ static StradaValue *perla_exporter_import(StradaValue *args) {
                     if (export_arr) {
                         for (size_t j = 0; j < export_arr->size; j++) {
                             char *n2 = strada_to_str(export_arr->elements[export_arr->head + j]);
-                            if (n2 && n2[0]) names[name_count++] = n2;
+                            if (n2 && n2[0]) PERLA_EI_PUSH_NAME(n2);
                             else free(n2);
                         }
                     }
@@ -9987,14 +10432,14 @@ static StradaValue *perla_exporter_import(StradaValue *args) {
                     if (export_ok_arr) {
                         for (size_t j = 0; j < export_ok_arr->size; j++) {
                             char *n2 = strada_to_str(export_ok_arr->elements[export_ok_arr->head + j]);
-                            if (n2 && n2[0]) names[name_count++] = n2;
+                            if (n2 && n2[0]) PERLA_EI_PUSH_NAME(n2);
                             else free(n2);
                         }
                     }
                     if (export_arr) {
                         for (size_t j = 0; j < export_arr->size; j++) {
                             char *n2 = strada_to_str(export_arr->elements[export_arr->head + j]);
-                            if (n2 && n2[0]) names[name_count++] = n2;
+                            if (n2 && n2[0]) PERLA_EI_PUSH_NAME(n2);
                             else free(n2);
                         }
                     }
@@ -10005,7 +10450,7 @@ static StradaValue *perla_exporter_import(StradaValue *args) {
                         if (tav) {
                             for (size_t j = 0; j < tav->size; j++) {
                                 char *n2 = strada_to_str(tav->elements[tav->head + j]);
-                                if (n2 && n2[0]) names[name_count++] = n2;
+                                if (n2 && n2[0]) PERLA_EI_PUSH_NAME(n2);
                                 else free(n2);
                             }
                         }
@@ -10013,10 +10458,12 @@ static StradaValue *perla_exporter_import(StradaValue *args) {
                 }
                 free(nm);
             } else {
-                names[name_count++] = nm;
+                PERLA_EI_PUSH_NAME(nm);
             }
         }
     }
+#undef PERLA_EI_PUSH_NAME
+#undef PERLA_EI_PUSH_EXCL
 
     /* Copy each requested symbol, respecting excludes. For bare names or
      * &name, copy the sub slot. Sigil prefixes limit to a single slot. */
@@ -10665,7 +11112,10 @@ static StradaValue *perla_ensure_class_loaded(StradaValue *args) {
      * purposes — the caller (load_components / similar) will surface
      * its own error if the class is genuinely missing. */
     StradaValue *mn = strada_new_str(fclass);
+    extern int g_perla_require_soft;
+    g_perla_require_soft++;
     StradaValue *r = perla_require_module(mn);
+    g_perla_require_soft--;
     if (r) strada_decref(r);
     strada_decref(mn);
     free(fclass);
@@ -11634,6 +12084,8 @@ void perla_deref_array_assign(StradaValue *ref, StradaValue *value) {
  * that dynamic `import` subs use (e.g. Drogo::Dispatch). */
 void perla_isa_assign(const char *pkg_isa, StradaValue *parents) {
     if (!pkg_isa) return;
+    /* Hierarchy change — invalidate call-site method caches. */
+    perla_code_override_gen++;
     if (getenv("PERLA_ISA_DEBUG")) {
         fprintf(stderr, "[isa_assign] pkg_isa=%s", pkg_isa);
         if (parents) {
@@ -12375,16 +12827,72 @@ void perla_ensure_mod_init(const char *pkg) {
      * .pm.so (RTLD_GLOBAL) and runs its init. */
     {
         extern StradaValue *perla_require_module(StradaValue *module_sv);
+        extern int g_perla_require_soft;
         StradaValue *m = strada_new_str(pkg);
         perla_lazy_init_depth++;
+        g_perla_require_soft++;
         StradaValue *r = perla_require_module(m);
+        g_perla_require_soft--;
         perla_lazy_init_depth--;
         if (r) strada_decref(r);
         strada_decref(m);
     }
 }
 
+/* ===== Per-call-site monomorphic method cache =====
+ *
+ * `$obj->method(...)` with a static method name dominates OO-heavy code
+ * (the oop benchmark spends most of its time in dispatch: string hash
+ * lookup + MRO walk for every one of 5M calls). Codegen emits per-site
+ * static slots (pkg string, generation, code SV) and routes the call
+ * through perla_method_dispatch_cached: when the invocant's class
+ * matches the site's last class (strcmp) and no code-slot or @ISA
+ * mutation happened since (perla_code_override_gen), the cached code SV
+ * is invoked directly — no stash lookup, no MRO walk, none of the
+ * dispatch preamble.
+ *
+ * Invalidation: perla_glob_store bumps the generation on every CODE
+ * store, and perla_isa_push/perla_isa_assign/perla_set_mro bump it on
+ * hierarchy changes (runtime inject_base would otherwise leave stale
+ * resolutions). The cached code SV is incref'd, so even a stale entry
+ * can never dangle — the gen check just keeps it CORRECT.
+ *
+ * The cache fills inside perla_method_dispatch at its plain
+ * resolution-success points via "pending slot" globals captured at
+ * dispatch entry (cleared immediately so recursive dispatches from the
+ * special-case paths can't fill the wrong site). Single-threaded by
+ * design, like the rest of the perla runtime. */
+static char       **g_msc_pkg  = NULL;
+static long        *g_msc_gen  = NULL;
+static StradaValue **g_msc_code = NULL;
+static const char  *g_msc_key  = NULL;   /* invocant class at wrapper entry */
+
+StradaValue *perla_method_dispatch_cached(StradaValue *obj, const char *method, StradaValue *args,
+                                          char **cs_pkg, long *cs_gen, StradaValue **cs_code) {
+    const char *key = NULL;
+    if (obj && !STRADA_IS_TAGGED_INT(obj)) {
+        key = perla_blessed(obj);
+        if (!key && obj->type == STRADA_STR) key = obj->value.pv;
+    }
+    if (key && *cs_code && *cs_pkg
+        && *cs_gen == perla_code_override_gen
+        && strcmp(key, *cs_pkg) == 0) {
+        return perla_call_code(*cs_code, args);
+    }
+    g_msc_pkg = cs_pkg; g_msc_gen = cs_gen; g_msc_code = cs_code; g_msc_key = key;
+    StradaValue *r = perla_method_dispatch(obj, method, args);
+    g_msc_pkg = NULL; g_msc_gen = NULL; g_msc_code = NULL; g_msc_key = NULL;
+    return r;
+}
+
 StradaValue *perla_method_dispatch(StradaValue *obj, const char *method, StradaValue *args) {
+    /* Capture any pending call-site cache slots and clear the globals at
+     * once: only THIS invocation's plain-resolution success may fill
+     * them; recursive dispatches must see none. */
+    char **msc_pkg = g_msc_pkg; long *msc_gen = g_msc_gen;
+    StradaValue **msc_code = g_msc_code; const char *msc_key = g_msc_key;
+    g_msc_pkg = NULL; g_msc_gen = NULL; g_msc_code = NULL; g_msc_key = NULL;
+    (void)msc_pkg; (void)msc_gen; (void)msc_code; (void)msc_key;
     if (!obj || !method) return strada_new_undef();
     /* Perl: `undef->method` dies with `Can't call method "X" on an undefined
      * value`. Without this, perla silently returned undef, which masked
@@ -12423,7 +12931,11 @@ StradaValue *perla_method_dispatch(StradaValue *obj, const char *method, StradaV
         strada_throw(buf);
         return strada_new_undef();
     }
-    if (getenv("PERLA_DISPATCH_DEBUG")) {
+    /* getenv() scans the environment on every call — at millions of
+     * dispatches per second that's real money. Resolve once. */
+    static int dispatch_debug = -1;
+    if (dispatch_debug < 0) dispatch_debug = getenv("PERLA_DISPATCH_DEBUG") ? 1 : 0;
+    if (dispatch_debug) {
         const char *bp = perla_blessed(obj);
         char *os = strada_to_str(obj);
         fprintf(stderr, "[dispatch] %s->%s (blessed=%s)\n", os, method, bp ? bp : "(none)");
@@ -13198,9 +13710,21 @@ StradaValue *perla_method_dispatch(StradaValue *obj, const char *method, StradaV
             if (getenv("PERLA_UNDEF_METHOD_SILENT")) {
                 return strada_new_undef();
             }
-            char ubuf[256];
-            snprintf(ubuf, sizeof(ubuf),
-                     "Can't call method \"%s\" on unblessed reference", method);
+            char ubuf[640];
+            {
+                /* Append the top call frames — the failing site is often
+                 * frameless (direct-call/eval bodies), so the die text is
+                 * the only reliable diagnostic channel. */
+                int n = snprintf(ubuf, sizeof(ubuf),
+                         "Can't call method \"%s\" on unblessed reference (frames:", method);
+                for (int fi = perla_call_depth - 1; fi >= 0 && fi >= perla_call_depth - 4; fi--) {
+                    n += snprintf(ubuf + n, sizeof(ubuf) - n, " %s::%s",
+                                  perla_call_stack[fi].package ?: "?",
+                                  perla_call_stack[fi].subname ?: "?");
+                    if (n >= (int)sizeof(ubuf) - 8) break;
+                }
+                snprintf(ubuf + n, sizeof(ubuf) - n, ")");
+            }
             strada_throw(ubuf);
             return strada_new_undef();
         }
@@ -13383,6 +13907,17 @@ StradaValue *perla_method_dispatch(StradaValue *obj, const char *method, StradaV
     /* Look up method in class hierarchy */
     PerlGlob *g = perla_method_resolve(pkg, method);
     if (g && g->slots[PERLA_SLOT_CODE]) {
+        /* Plain resolution success — latch the call-site cache (keyed on
+         * the ORIGINAL invocant class captured at wrapper entry, not any
+         * SUPER::/relative rewrite of `pkg`). */
+        if (msc_code && msc_key) {
+            if (*msc_code) strada_decref(*msc_code);
+            *msc_code = g->slots[PERLA_SLOT_CODE];
+            strada_incref(*msc_code);
+            if (*msc_pkg) free(*msc_pkg);
+            *msc_pkg = strdup(msc_key);
+            *msc_gen = perla_code_override_gen;
+        }
         if (getenv("PERLA_METHOD_DEBUG") && strcmp(method, "import") == 0) {
             StradaValue *slot = g->slots[PERLA_SLOT_CODE];
             const char *kind = "?";
@@ -13407,6 +13942,14 @@ StradaValue *perla_method_dispatch(StradaValue *obj, const char *method, StradaV
         perla_ensure_mod_init(pkg);
         PerlGlob *__lz_g = perla_method_resolve(pkg, method);
         if (__lz_g && __lz_g->slots[PERLA_SLOT_CODE]) {
+            if (msc_code && msc_key) {
+                if (*msc_code) strada_decref(*msc_code);
+                *msc_code = __lz_g->slots[PERLA_SLOT_CODE];
+                strada_incref(*msc_code);
+                if (*msc_pkg) free(*msc_pkg);
+                *msc_pkg = strdup(msc_key);
+                *msc_gen = perla_code_override_gen;
+            }
             return perla_call_code(__lz_g->slots[PERLA_SLOT_CODE], args);
         }
     }
@@ -13632,6 +14175,31 @@ StradaValue *perla_method_dispatch(StradaValue *obj, const char *method, StradaV
          * working. Env-gated opt-out (PERLA_METHOD_NOT_FOUND_UNDEF=1)
          * restores the old silent-undef-return for code that depends on
          * it. */
+        /* Diagnostic: when PERLA_DUMP_STASH_ON_MISS names the missing
+         * method, dump the receiver package's installed code symbols so
+         * we can tell "init never ran" (empty stash) from "only this
+         * method failed to install" (readers present, predicate absent). */
+        {
+            const char *want = getenv("PERLA_DUMP_STASH_ON_MISS");
+            if (want && want[0] && strcmp(want, method) == 0) {
+                PerlStash *rs = perla_stash_get(pkg);
+                fprintf(stderr, "[stashdump] miss %s on %s; stash=%p code-syms:",
+                        method, pkg, (void*)rs);
+                if (rs) {
+                    int shown = 0;
+                    for (int __si = 0; __si < rs->count; __si++) {
+                        PerlGlob *gg = rs->entries[__si];
+                        if (gg && gg->slots[PERLA_SLOT_CODE]) {
+                            fprintf(stderr, " %s", rs->keys[__si]);
+                            shown++;
+                        }
+                    }
+                    if (!shown) fprintf(stderr, " (none)");
+                    if (rs->isa) fprintf(stderr, " | has-ISA");
+                }
+                fprintf(stderr, "\n");
+            }
+        }
         char buf[1024];
         const char *caller_file = "-";
         int caller_line = 0;
@@ -14356,6 +14924,70 @@ static const char *perla_shq(const char *s, char *out, size_t outsz) {
     return out;
 }
 
+/* ===== Persistent eval-STRING compile cache =====
+ *
+ * Real-world OO code generates closures via eval STRING at RUNTIME by the
+ * hundreds (Eval::Closure / Sub::Quote drive every Moo and DBIx::Class
+ * accessor through here). Each eval used to fork `perla -M` + gcc
+ * (~5-20s) into a per-process private tmpdir that vanishes at exit — so
+ * every program run re-paid every closure compile, dominating startup by
+ * minutes. Cache the compiled .pm.so under a CONTENT hash (package +
+ * code + capture-key set + pad/TLS mode) in a persistent per-user dir;
+ * identical evals across runs (and processes) dlopen the cached object
+ * directly. Entries older than the perla binary are recompiled (same
+ * staleness rule as .pm.o artifacts). Disable with PERLA_EVAL_NO_CACHE=1;
+ * relocate with PERLA_EVAL_CACHE=<dir>. */
+static uint64_t perla_fnv1a(uint64_t h, const void *data, size_t n) {
+    const unsigned char *p = (const unsigned char *)data;
+    if (!h) h = 1469598103934665603ULL;
+    for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 1099511628211ULL; }
+    return h;
+}
+
+static const char *perla_eval_cache_dir(void) {
+    static char dir[1024];
+    static int initialized = 0;
+    if (initialized) return dir[0] ? dir : NULL;
+    initialized = 1;
+    dir[0] = '\0';
+    const char *env = getenv("PERLA_EVAL_CACHE");
+    if (env && env[0]) {
+        snprintf(dir, sizeof(dir), "%s", env);
+        mkdir(dir, 0700);
+    } else {
+        const char *home = getenv("HOME");
+        if (!home || !home[0]) return NULL;
+        char p[1024];
+        snprintf(p, sizeof(p), "%s/.cache", home);            mkdir(p, 0700);
+        snprintf(p, sizeof(p), "%s/.cache/perla", home);      mkdir(p, 0700);
+        snprintf(p, sizeof(p), "%s/.cache/perla/evals", home); mkdir(p, 0700);
+        snprintf(dir, sizeof(dir), "%s", p);
+    }
+    struct stat st;
+    if (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode)) { dir[0] = '\0'; return NULL; }
+    return dir;
+}
+
+/* Copy src into the cache as dst atomically (tmp file + rename, so a
+ * concurrent reader never dlopens a torn object). Returns 0 on success. */
+static int perla_eval_cache_store(const char *src, const char *dst) {
+    char tmp[1200];
+    snprintf(tmp, sizeof(tmp), "%s.tmp.%d", dst, (int)getpid());
+    FILE *in = fopen(src, "rb");
+    if (!in) return -1;
+    FILE *out = fopen(tmp, "wb");
+    if (!out) { fclose(in); return -1; }
+    char buf[65536];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) { fclose(in); fclose(out); unlink(tmp); return -1; }
+    }
+    fclose(in);
+    if (fclose(out) != 0) { unlink(tmp); return -1; }
+    if (rename(tmp, dst) != 0) { unlink(tmp); return -1; }
+    return 0;
+}
+
 StradaValue *perla_eval_string(StradaValue *code_sv, const char *current_pkg) {
     if (!code_sv || STRADA_IS_TAGGED_INT(code_sv)) {
         return strada_new_undef();
@@ -14370,6 +15002,9 @@ StradaValue *perla_eval_string(StradaValue *code_sv, const char *current_pkg) {
         char preview[80];
         snprintf(preview, sizeof(preview), "%.76s", code);
         fprintf(stderr, "[eval] pkg=%s code=%s%s\n", current_pkg, preview, strlen(code) > 76 ? "..." : "");
+        if (getenv("PERLA_EVAL_DUMP")) {
+            fprintf(stderr, "[eval-full-begin]\n%s\n[eval-full-end]\n", code);
+        }
     }
 
     /* Fast path: `package X; use Y;` or `package X; use Y (@list)` —
@@ -14429,17 +15064,67 @@ StradaValue *perla_eval_string(StradaValue *code_sv, const char *current_pkg) {
         }
     }
 
-    /* Generate unique temp file names */
-    int eval_id = __sync_add_and_fetch(&g_eval_counter, 1);
-    pid_t pid = getpid();
-    char pm_path[256], so_path[256];
+    /* Content-addressed name: identical (pkg, code, capture-key set,
+     * pad/TLS mode) evals share one compiled object across runs. The
+     * capture-key hash is XOR-combined so hash-iteration order doesn't
+     * change the tag; capture VALUES flow through perla_get_eval_caps()
+     * at call time, so value differences don't need distinct objects. */
+    const char *pkg = current_pkg ? current_pkg : "main";
+    uint64_t evh = perla_fnv1a(0, pkg, strlen(pkg));
+    evh = perla_fnv1a(evh, "\xff", 1);
+    evh = perla_fnv1a(evh, code, strlen(code));
+    if (perla_eval_caps_pending) {
+        StradaHash *cap_hv0 = strada_deref_hash(perla_eval_caps_pending);
+        StradaArray *keys0 = cap_hv0 ? strada_hash_keys(cap_hv0) : NULL;
+        uint64_t kx = 0;
+        size_t nk0 = keys0 ? keys0->size : 0;
+        for (size_t i = 0; i < nk0; i++) {
+            StradaValue *kv = keys0->elements[keys0->head + i];
+            char *kn = strada_to_str(kv);
+            if (kn) { kx ^= perla_fnv1a(0, kn, strlen(kn)); free(kn); }
+        }
+        if (keys0) strada_free_array(keys0);
+        evh ^= kx;
+        evh = perla_fnv1a(evh, "C", 1);
+    }
+    {
+        const char *pad0 = getenv("PERLA_REPL_PAD");
+        if (pad0 && pad0[0] == '1') evh = perla_fnv1a(evh, "P", 1);
+    }
+#ifdef STRADA_NO_TLS
+    evh = perla_fnv1a(evh, "T", 1);
+#endif
+    char evtag[32];
+    snprintf(evtag, sizeof(evtag), "h%016llx", (unsigned long long)evh);
+
+    char pm_path[1200], so_path[1200];
     const char *evdir = perla_private_tmpdir();
     if (!evdir) evdir = "/tmp";   /* fallback only if mkdtemp failed */
-    snprintf(pm_path, sizeof(pm_path), "%s/perla_eval_%d_%d.pm", evdir, (int)pid, eval_id);
-    snprintf(so_path, sizeof(so_path), "%s/perla_eval_%d_%d.pm.so", evdir, (int)pid, eval_id);
+    snprintf(pm_path, sizeof(pm_path), "%s/perla_eval_%s.pm", evdir, evtag);
+    snprintf(so_path, sizeof(so_path), "%s/perla_eval_%s.pm.so", evdir, evtag);
+
+    /* Cache lookup: a fresh cached object skips generation + compile. */
+    const char *cdir = getenv("PERLA_EVAL_NO_CACHE") ? NULL : perla_eval_cache_dir();
+    char cache_so[1200];
+    cache_so[0] = '\0';
+    int cache_hit = 0;
+    if (cdir) {
+        snprintf(cache_so, sizeof(cache_so), "%s/perla_eval_%s.pm.so", cdir, evtag);
+        struct stat cst, pst;
+        if (stat(cache_so, &cst) == 0) {
+            if (g_perla_path[0] && stat(g_perla_path, &pst) == 0 && cst.st_mtime < pst.st_mtime) {
+                /* stale vs perla binary — recompile */
+            } else {
+                cache_hit = 1;
+            }
+        }
+    }
+    if (perla_debug_mode() && cache_hit)
+        fprintf(stderr, "[eval] cache HIT %s\n", cache_so);
+    if (cache_hit) goto eval_dlopen;
 
     /* Write the eval code to a temp .pm file */
-    const char *pkg = current_pkg ? current_pkg : "main";
+    {
     FILE *f = fopen(pm_path, "w");
     if (!f) {
         /* Set $@ */
@@ -14456,7 +15141,7 @@ StradaValue *perla_eval_string(StradaValue *code_sv, const char *current_pkg) {
      * dlsym + call it below. When perla_eval_caps_pending is set, also
      * emit a prelude/postlude that shares lexicals with the caller. */
     fprintf(f, "package %s;\n", pkg);
-    fprintf(f, "sub __perla_eval_body_%d_%d {\n", (int)pid, eval_id);
+    fprintf(f, "sub __perla_eval_body_%s {\n", evtag);
     if (perla_eval_caps_pending) {
         StradaHash *cap_hv = strada_deref_hash(perla_eval_caps_pending);
         StradaArray *keys = cap_hv ? strada_hash_keys(cap_hv) : NULL;
@@ -14526,6 +15211,7 @@ StradaValue *perla_eval_string(StradaValue *code_sv, const char *current_pkg) {
     fprintf(f, "}\n");
     fprintf(f, "1;\n");
     fclose(f);
+    }
 
     /* Compile with perla -M */
     /* Check if perla binary exists before trying to fork */
@@ -14606,11 +15292,27 @@ StradaValue *perla_eval_string(StradaValue *code_sv, const char *current_pkg) {
 #else
     const char *eval_no_tls = "";
 #endif
+    /* Eval-string TUs must REFERENCE modules (precompile-deps), never
+     * inline them: an eval body like Class::Accessor::Grouped's
+     * `eval "use Module::Runtime ..."` otherwise embeds a full private
+     * copy of the module in the cached eval .so. That copy's import sub
+     * registers FIRST (and the inc-guard then rightly skips later real
+     * copies), so every later `use Module::Runtime` dispatched into a
+     * stale closure over the eval TU's own file lexicals — surfacing as
+     * `"require_module" is not exported by the Module::Runtime module`
+     * during App init. Referencing artifacts keeps eval TUs tiny and
+     * one canonical module registration alive. */
+    /* PERLA_SHARED=1 alongside: the eval world builds deps as .pm.so
+     * only (SO_ONLY), and without --shared the parser's reference path
+     * wants a .pm.o for static linking — finding neither preference it
+     * fell through to inlining anyway. --shared makes deps reference
+     * the .pm.so via dlopen, which is exactly what a dlopen'd eval TU
+     * wants. */
     if (g_perla_path[0] && g_strada_dir[0]) {
-        snprintf(cmd, sizeof(cmd), "%s%s%sSTRADA_DIR=%s PERLA_BUILD_PM_SO_ONLY=1 %s%s -M %s 2>&1",
+        snprintf(cmd, sizeof(cmd), "%s%s%sSTRADA_DIR=%s PERLA_BUILD_PM_SO_ONLY=1 PERLA_PRECOMPILE_DEPS=1 PERLA_SHARED=1 %s%s -M %s 2>&1",
                  eval_no_tls, eval_pad_env, eval_lib_env, g_strada_dir, eval_cc_env, g_perla_path, pm_path);
     } else if (g_perla_path[0]) {
-        snprintf(cmd, sizeof(cmd), "%s%s%sPERLA_BUILD_PM_SO_ONLY=1 %s%s -M %s 2>&1", eval_no_tls, eval_pad_env, eval_lib_env, eval_cc_env, g_perla_path, pm_path);
+        snprintf(cmd, sizeof(cmd), "%s%s%sPERLA_BUILD_PM_SO_ONLY=1 PERLA_PRECOMPILE_DEPS=1 PERLA_SHARED=1 %s%s -M %s 2>&1", eval_no_tls, eval_pad_env, eval_lib_env, eval_cc_env, g_perla_path, pm_path);
     } else {
         /* Perla not available — return error */
         extern StradaValue *perla_eval_error;
@@ -14676,10 +15378,20 @@ StradaValue *perla_eval_string(StradaValue *code_sv, const char *current_pkg) {
         }
     }
 
-    free(code);
+    /* Persist the freshly built object into the eval cache (atomic
+     * tmp+rename; failures are non-fatal — the local copy still runs). */
+    if (cdir && cache_so[0]) {
+        if (perla_eval_cache_store(so_path, cache_so) == 0) {
+            if (perla_debug_mode()) fprintf(stderr, "[eval] cache STORE %s\n", cache_so);
+        }
+    }
 
-    /* dlopen the .so */
-    void *handle = dlopen(so_path, RTLD_NOW | RTLD_GLOBAL);
+eval_dlopen:
+    free(code);
+    code = NULL;
+
+    /* dlopen the .so (from the cache on a hit, else the local build) */
+    void *handle = dlopen(cache_hit ? cache_so : so_path, RTLD_NOW | RTLD_GLOBAL);
     if (!handle) {
         extern StradaValue *perla_eval_error;
         if (perla_eval_error) strada_decref(perla_eval_error);
@@ -14696,7 +15408,7 @@ StradaValue *perla_eval_string(StradaValue *code_sv, const char *current_pkg) {
     /* Actually, the -M flag derives the name from the file path */
     /* For /tmp/perla_eval_PID_ID.pm, the module name is perla_eval_PID_ID */
     char init_name[256];
-    snprintf(init_name, sizeof(init_name), "perla_mod_init_perla_eval_%d_%d", (int)pid, eval_id);
+    snprintf(init_name, sizeof(init_name), "perla_mod_init_perla_eval_%s", evtag);
 
     void (*init_fn)(void) = (void(*)(void))dlsym(handle, init_name);
     if (perla_debug_mode()) fprintf(stderr, "[eval] init_fn %s %s\n", init_name, init_fn ? "FOUND" : "NOT FOUND");
@@ -14716,7 +15428,7 @@ StradaValue *perla_eval_string(StradaValue *code_sv, const char *current_pkg) {
         else { body_name[bn_pos++] = *pn++; }
     }
     snprintf(body_name + bn_pos, sizeof(body_name) - bn_pos,
-             "___perla_eval_body_%d_%d", (int)pid, eval_id);
+             "___perla_eval_body_%s", evtag);
 
     StradaValue *(*body_fn)(StradaValue*) = (StradaValue*(*)(StradaValue*))dlsym(handle, body_name);
     if (perla_debug_mode()) fprintf(stderr, "[eval] body_fn %s %s\n", body_name, body_fn ? "FOUND" : "NOT FOUND");
@@ -14747,12 +15459,13 @@ StradaValue *perla_eval_string(StradaValue *code_sv, const char *current_pkg) {
     perla_eval_error = strada_new_str("");
     strada_incref(perla_eval_error);
 
-    /* Clean up temp files (keep .so loaded) */
+    /* Clean up temp files (keep .so loaded). On a cache hit nothing was
+     * written locally; the unlinks are harmless no-ops then. */
     if (!getenv("PERLA_EVAL_KEEP")) {
         unlink(pm_path);
-        char o_path[256], deps_path[256];
-        snprintf(o_path, sizeof(o_path), "%s/perla_eval_%d_%d.pm.o", evdir, (int)pid, eval_id);
-        snprintf(deps_path, sizeof(deps_path), "%s/perla_eval_%d_%d.pm.deps", evdir, (int)pid, eval_id);
+        char o_path[1200], deps_path[1200];
+        snprintf(o_path, sizeof(o_path), "%s/perla_eval_%s.pm.o", evdir, evtag);
+        snprintf(deps_path, sizeof(deps_path), "%s/perla_eval_%s.pm.deps", evdir, evtag);
         unlink(o_path);
         unlink(deps_path);
     }
@@ -14879,6 +15592,11 @@ StradaValue *perla_caller(int level) {
      * name; file/line are where THAT sub was invoked from).
      * Old code used depth-2-level which read the CALLER's frame
      * (off by one) — broke `caller(0)[3]` returning the callee. */
+    /* (init) frames — module-body pseudo-frames pushed by TU inits and
+     * inline brackets — are VISIBLE to caller(), mirroring Perl's
+     * require frames. They carry the module's notional file path
+     * (Module/Name.pm) so consumers that validate caller()[1] as a
+     * string (Specio::DeclaredAt) get sane values. */
     int idx = perla_call_depth - 1 - level;
     if (getenv("PERLA_CALLER_TRACE")) {
         const char *sn = (idx >= 0 && idx < perla_call_depth && perla_call_stack[idx].subname)
@@ -14935,6 +15653,22 @@ StradaValue *perla_caller(int level) {
         if (level == 0 && perla_use_caller_pkg && perla_use_caller_pkg[0]) {
             return strada_new_str(perla_use_caller_pkg);
         }
+        /* One-past-the-top clamp: perla pushes frames only for non-direct
+         * dispatches, so chains through direct-called subs (Specio's
+         * declare -> _make_tc -> ... -> new_from_caller) are SHALLOWER
+         * than Perl's. caller(N) that overshoots by exactly one returns
+         * the bottom-most real frame instead of the empty list — callers
+         * like Specio::DeclaredAt get the outermost context (sane
+         * file/line) rather than undefs. Stack walkers that loop until
+         * caller(N) is empty still terminate one level later (idx <= -2
+         * falls through to the empty return below). */
+        if (idx == -1 && perla_call_depth >= 1) {
+            idx = 0;
+            PerlaCallFrame *cf = &perla_call_stack[0];
+            if (!(cf->subname && strcmp(cf->subname, "(main)") == 0)) {
+                goto clamped_frame;
+            }
+        }
         /* Perl: caller(N) returns the empty list in list context (and
          * undef in scalar context) when the call stack isn't N deep.
          * Without checking want_list here, list-context callers got a
@@ -14946,6 +15680,7 @@ StradaValue *perla_caller(int level) {
         }
         return strada_new_undef();
     }
+    clamped_frame: ;
     PerlaCallFrame *f = &perla_call_stack[idx];
     /* Perl: caller() called from the file's top level (outside any sub
      * or eval) returns the empty list. perla pushes a synthetic main
@@ -14971,6 +15706,10 @@ StradaValue *perla_caller(int level) {
     const char *caller_file = f->file ? f->file : "(eval)";
     int caller_line = f->line;
     extern int __perla_want_list;
+    if (getenv("PERLA_CALLER_TRACE")) {
+        fprintf(stderr, "[perla_caller] -> tuple pkg=%s file=%s line=%d want_list=%d\n",
+                caller_pkg, caller_file, caller_line, __perla_want_list);
+    }
     /* Scalar context: return just the caller's package name. */
     if (!__perla_want_list) {
         return strada_new_str(caller_pkg);
@@ -23013,6 +23752,33 @@ static void inc_mark(const char *module, StradaValue *val) {
     }
 }
 
+/* Has this module's top-level code already run in this process? Used by
+ * the codegen's inlined-module re-run guard: a runtime-compiled .pm.so
+ * that inlined module X skips X's init-time statements when X was
+ * already loaded (by the main binary or an earlier .so). Checks %INC
+ * under both the Foo::Bar and Foo/Bar.pm key forms. */
+int perla_inc_loaded(const char *module) {
+    if (!module || !module[0]) return 0;
+    if (!g_INC_hash) return 0;
+    if (strada_hash_exists(g_INC_hash->value.hv, module)) return 1;
+    size_t mlen = strlen(module);
+    char rel[1024];
+    size_t ri = 0;
+    for (size_t i = 0; i < mlen && ri + 4 < sizeof(rel); i++) {
+        if (module[i] == ':' && i + 1 < mlen && module[i + 1] == ':') {
+            rel[ri++] = '/';
+            i++;
+        } else {
+            rel[ri++] = module[i];
+        }
+    }
+    rel[ri] = '\0';
+    if (ri + 3 < sizeof(rel) && (ri < 3 || strcmp(rel + ri - 3, ".pm") != 0)) {
+        strcat(rel, ".pm");
+    }
+    return strada_hash_exists(g_INC_hash->value.hv, rel) ? 1 : 0;
+}
+
 void perla_mark_loaded(const char *module) {
     if (!module || !module[0]) return;
     if (!g_INC_hash) g_INC_hash = strada_new_hash();
@@ -23231,6 +23997,449 @@ StradaValue *perla_throw_exception(StradaValue *args) {
     return strada_new_undef();
 }
 
+/* When nonzero, perla_require_module's not-found path returns undef
+ * instead of dying. Set by HEURISTIC callers (method-dispatch lazy-load,
+ * lazy package init, Componentised helpers) where Perl wouldn't require
+ * at all — a hard die there aborts an innocent caller's init. Explicit
+ * `require Foo;` keeps Perl's die semantics. */
+int g_perla_require_soft = 0;
+
+/* ===== Native Module::Implementation =====
+ * build_loader_sub derives its target package from caller(), which
+ * misattributes whenever the consumer's body runs under another TU's
+ * init frame (Package::Stash inlined into DBIx::Class::_Util's TU made
+ * it try DBIx::Class::_Util::XS, then croak killed the whole init).
+ * The native version: derives the package from the nearest non-M::I
+ * call frame, performs the implementation load IMMEDIATELY (consumers
+ * universally call the returned loader right away), copies symbols,
+ * and on total failure logs + NO-OPS instead of croaking — the natives
+ * behind Package::Stash/List::*Utils make the .pm loader redundant,
+ * and a no-op beats a dead App init. */
+static StradaValue *perla_mi_noop(StradaValue *args) {
+    (void)args;
+    return strada_new_undef();
+}
+
+/* --- native Time::Piece (lenient) ---
+ * Time::Piece is pure-XS; its real .so can't load under perla (perl API
+ * symbols missing) and the bootstrap death killed Amazon::S3's init chain
+ * (via Net::Amazon::Signature::V4) before mk_accessors registration.
+ * Object = blessed { epoch, islocal }. Covers the V4-signer surface:
+ * gmtime/localtime (function or class method), strftime, strptime, epoch,
+ * plus small accessors. Registered protected so a partially-initialized
+ * Time::Piece.pm can't overwrite them with perl subs that need missing XS. */
+extern char *strptime(const char *, const char *, struct tm *);
+
+static StradaValue *perla_tp_make(long epoch, int islocal) {
+    StradaValue *h = strada_new_hash();
+    strada_hash_set(h->value.hv, "epoch", STRADA_MAKE_TAGGED_INT((int64_t)epoch));
+    strada_hash_set(h->value.hv, "islocal", STRADA_MAKE_TAGGED_INT(islocal));
+    return perla_bless(strada_ref_create_take(h), "Time::Piece");
+}
+
+static long perla_tp_arg_epoch(StradaArray *av) {
+    /* args may be (), (epoch), ("Time::Piece"), ("Time::Piece", epoch),
+     * (obj), (obj, epoch) — first numeric wins */
+    for (size_t i = 0; av && i < av->size; i++) {
+        StradaValue *a = strada_array_get(av, i);
+        if (!a) continue;
+        if (STRADA_IS_TAGGED_INT(a)) return (long)strada_to_int(a);
+        if (a->type == STRADA_INT || a->type == STRADA_NUM) return (long)strada_to_int(a);
+        if (a->type == STRADA_STR && a->value.pv
+            && (a->value.pv[0] >= '0' && a->value.pv[0] <= '9')) return atol(a->value.pv);
+    }
+    return (long)time(NULL);
+}
+
+static StradaValue *perla_tp_gmtime(StradaValue *args) {
+    return perla_tp_make(perla_tp_arg_epoch(strada_deref_array(args)), 0);
+}
+static StradaValue *perla_tp_localtime(StradaValue *args) {
+    return perla_tp_make(perla_tp_arg_epoch(strada_deref_array(args)), 1);
+}
+
+static long perla_tp_self_epoch(StradaValue *args, int *islocal) {
+    StradaArray *av = strada_deref_array(args);
+    if (islocal) *islocal = 0;
+    if (av && av->size >= 1) {
+        StradaValue *self = strada_array_get(av, 0);
+        StradaHash *h = (self && !STRADA_IS_TAGGED_INT(self)) ? strada_deref_hash(self) : NULL;
+        if (h) {
+            StradaValue *e = strada_hash_get(h, "epoch");
+            if (e) {
+                if (islocal) {
+                    StradaValue *l = strada_hash_get(h, "islocal");
+                    if (l) *islocal = (int)strada_to_int(l);
+                }
+                return (long)strada_to_int(e);
+            }
+        }
+    }
+    return (long)time(NULL);
+}
+
+static void perla_tp_breakdown(StradaValue *args, struct tm *out) {
+    int islocal = 0;
+    time_t t = (time_t)perla_tp_self_epoch(args, &islocal);
+    if (islocal) localtime_r(&t, out); else gmtime_r(&t, out);
+}
+
+static StradaValue *perla_tp_strftime(StradaValue *args) {
+    StradaArray *av = strada_deref_array(args);
+    struct tm tm; perla_tp_breakdown(args, &tm);
+    const char *fmt = "%a, %d %b %Y %H:%M:%S %Z";
+    if (av && av->size >= 2) {
+        StradaValue *f = strada_array_get(av, 1);
+        if (f && !STRADA_IS_TAGGED_INT(f) && f->type == STRADA_STR && f->value.pv && f->value.pv[0])
+            fmt = f->value.pv;
+    }
+    char buf[512]; buf[0] = 0;
+    strftime(buf, sizeof(buf), fmt, &tm);
+    return strada_new_str(buf);
+}
+
+static StradaValue *perla_tp_epoch(StradaValue *args) {
+    return STRADA_MAKE_TAGGED_INT((int64_t)perla_tp_self_epoch(args, NULL));
+}
+
+static StradaValue *perla_tp_strptime(StradaValue *args) {
+    StradaArray *av = strada_deref_array(args);
+    const char *s = NULL, *f = NULL;
+    if (av) {
+        /* class/obj method: (invocant, str, fmt); function: (str, fmt) */
+        size_t base = (av->size >= 3) ? 1 : 0;
+        if (av->size >= base + 2) {
+            StradaValue *a = strada_array_get(av, base);
+            StradaValue *b = strada_array_get(av, base + 1);
+            if (a && !STRADA_IS_TAGGED_INT(a) && a->type == STRADA_STR && a->value.pv) s = a->value.pv;
+            if (b && !STRADA_IS_TAGGED_INT(b) && b->type == STRADA_STR && b->value.pv) f = b->value.pv;
+        }
+    }
+    struct tm tm; memset(&tm, 0, sizeof(tm)); tm.tm_mday = 1;
+    if (s && f) strptime(s, f, &tm);
+    time_t t = timegm(&tm);
+    return perla_tp_make((long)(t == (time_t)-1 ? 0 : t), 0);
+}
+
+/* string accessors via a fixed strftime format */
+#define PERLA_TP_STRACC(name, fmt_) \
+static StradaValue *perla_tp_##name(StradaValue *args) { \
+    struct tm tm; perla_tp_breakdown(args, &tm); \
+    char buf[64]; buf[0] = 0; strftime(buf, sizeof(buf), fmt_, &tm); \
+    return strada_new_str(buf); }
+PERLA_TP_STRACC(datetime, "%Y-%m-%dT%H:%M:%S")
+PERLA_TP_STRACC(ymd, "%Y-%m-%d")
+PERLA_TP_STRACC(hms, "%H:%M:%S")
+PERLA_TP_STRACC(month, "%b")
+PERLA_TP_STRACC(day, "%a")
+#undef PERLA_TP_STRACC
+
+#define PERLA_TP_INTACC(name, expr) \
+static StradaValue *perla_tp_##name(StradaValue *args) { \
+    struct tm tm; perla_tp_breakdown(args, &tm); \
+    return STRADA_MAKEAGGED_INT_TP(expr); }
+#define STRADA_MAKEAGGED_INT_TP(x) STRADA_MAKE_TAGGED_INT((int64_t)(x))
+PERLA_TP_INTACC(year, tm.tm_year + 1900)
+PERLA_TP_INTACC(mon, tm.tm_mon + 1)
+PERLA_TP_INTACC(_mon, tm.tm_mon)
+PERLA_TP_INTACC(mday, tm.tm_mday)
+PERLA_TP_INTACC(hour, tm.tm_hour)
+PERLA_TP_INTACC(min, tm.tm_min)
+PERLA_TP_INTACC(sec, tm.tm_sec)
+PERLA_TP_INTACC(wday, tm.tm_wday + 1)
+PERLA_TP_INTACC(_wday, tm.tm_wday)
+PERLA_TP_INTACC(yday, tm.tm_yday)
+#undef PERLA_TP_INTACC
+#undef STRADA_MAKEAGGED_INT_TP
+
+/* --- native Compress::Raw::Zlib constants + crc32/adler32 (lenient) ---
+ * The real module is pure-XS (lie-success in perla_xsloader.c so its .pm
+ * init survives). Archive::Zip evaluates Z_* constants at its own init
+ * (via Excel::Writer::XLSX <- Abe::Plugin::Excel), so back the constant
+ * surface natively, plus standalone crc32/adler32 (no -lz dependency).
+ * Deflate/Inflate stream classes are NOT provided — actual compression
+ * calls fail at call time if reached. */
+#define PERLA_CRZ_CONST(name, val) \
+static StradaValue *perla_crz_##name(StradaValue *args) { \
+    (void)args; return STRADA_MAKE_TAGGED_INT((int64_t)(val)); }
+PERLA_CRZ_CONST(Z_NO_FLUSH, 0)
+PERLA_CRZ_CONST(Z_PARTIAL_FLUSH, 1)
+PERLA_CRZ_CONST(Z_SYNC_FLUSH, 2)
+PERLA_CRZ_CONST(Z_FULL_FLUSH, 3)
+PERLA_CRZ_CONST(Z_FINISH, 4)
+PERLA_CRZ_CONST(Z_BLOCK, 5)
+PERLA_CRZ_CONST(Z_OK, 0)
+PERLA_CRZ_CONST(Z_STREAM_END, 1)
+PERLA_CRZ_CONST(Z_NEED_DICT, 2)
+PERLA_CRZ_CONST(Z_ERRNO, -1)
+PERLA_CRZ_CONST(Z_STREAM_ERROR, -2)
+PERLA_CRZ_CONST(Z_DATA_ERROR, -3)
+PERLA_CRZ_CONST(Z_MEM_ERROR, -4)
+PERLA_CRZ_CONST(Z_BUF_ERROR, -5)
+PERLA_CRZ_CONST(Z_VERSION_ERROR, -6)
+PERLA_CRZ_CONST(Z_NO_COMPRESSION, 0)
+PERLA_CRZ_CONST(Z_BEST_SPEED, 1)
+PERLA_CRZ_CONST(Z_BEST_COMPRESSION, 9)
+PERLA_CRZ_CONST(Z_DEFAULT_COMPRESSION, -1)
+PERLA_CRZ_CONST(Z_FILTERED, 1)
+PERLA_CRZ_CONST(Z_HUFFMAN_ONLY, 2)
+PERLA_CRZ_CONST(Z_RLE, 3)
+PERLA_CRZ_CONST(Z_FIXED, 4)
+PERLA_CRZ_CONST(Z_DEFAULT_STRATEGY, 0)
+PERLA_CRZ_CONST(Z_DEFLATED, 8)
+PERLA_CRZ_CONST(MAX_WBITS, 15)
+PERLA_CRZ_CONST(MAX_MEM_LEVEL, 9)
+PERLA_CRZ_CONST(Z_NULL, 0)
+#undef PERLA_CRZ_CONST
+
+static StradaValue *perla_crz_zlib_version(StradaValue *args) {
+    (void)args; return strada_new_str("1.2.11");
+}
+
+static uint32_t perla_crz_crc_table[256];
+static int perla_crz_crc_table_ready = 0;
+static uint32_t perla_crz_crc32_buf(uint32_t crc, const unsigned char *buf, size_t len) {
+    if (!perla_crz_crc_table_ready) {
+        for (uint32_t n = 0; n < 256; n++) {
+            uint32_t c = n;
+            for (int k = 0; k < 8; k++) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+            perla_crz_crc_table[n] = c;
+        }
+        perla_crz_crc_table_ready = 1;
+    }
+    crc ^= 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; i++)
+        crc = perla_crz_crc_table[(crc ^ buf[i]) & 0xFF] ^ (crc >> 8);
+    return crc ^ 0xFFFFFFFFu;
+}
+
+/* crc32($buffer [, $seed]) */
+static StradaValue *perla_crz_crc32(StradaValue *args) {
+    StradaArray *av = strada_deref_array(args);
+    uint32_t crc = 0;
+    const unsigned char *buf = NULL; size_t len = 0;
+    if (av && av->size >= 1) {
+        StradaValue *b = strada_array_get(av, 0);
+        if (b && !STRADA_IS_TAGGED_INT(b) && b->type == STRADA_STR && b->value.pv) {
+            buf = (const unsigned char *)b->value.pv;
+            len = (size_t)strada_str_len(b);
+        }
+        if (av->size >= 2) {
+            StradaValue *sd = strada_array_get(av, 1);
+            if (sd) crc = (uint32_t)strada_to_int(sd);
+        }
+    }
+    return STRADA_MAKE_TAGGED_INT((int64_t)perla_crz_crc32_buf(crc, buf ? buf : (const unsigned char*)"", len));
+}
+
+/* adler32($buffer [, $seed]) */
+static StradaValue *perla_crz_adler32(StradaValue *args) {
+    StradaArray *av = strada_deref_array(args);
+    uint32_t adler = 1;
+    const unsigned char *buf = NULL; size_t len = 0;
+    if (av && av->size >= 1) {
+        StradaValue *b = strada_array_get(av, 0);
+        if (b && !STRADA_IS_TAGGED_INT(b) && b->type == STRADA_STR && b->value.pv) {
+            buf = (const unsigned char *)b->value.pv;
+            len = (size_t)strada_str_len(b);
+        }
+        if (av->size >= 2) {
+            StradaValue *sd = strada_array_get(av, 1);
+            if (sd) adler = (uint32_t)strada_to_int(sd);
+        }
+    }
+    uint32_t a = adler & 0xFFFF, bsum = (adler >> 16) & 0xFFFF;
+    for (size_t i = 0; i < len; i++) { a = (a + buf[i]) % 65521; bsum = (bsum + a) % 65521; }
+    return STRADA_MAKE_TAGGED_INT((int64_t)((bsum << 16) | a));
+}
+
+/* Moose::Exporter::setup_import_methods — Moose is natively backed
+ * (perla_mop_*), so extension modules calling this at init died
+ * method-not-found. Lenient native: give the calling package a plain
+ * Exporter import (its declared as_is functions live in its own stash
+ * and EXPORT arrays) and a no-op unimport. with_meta wrappers degrade
+ * to plain exports. */
+static StradaValue *perla_moose_setup_import_methods(StradaValue *args) {
+    (void)args;
+    const char *pkg = NULL;
+    for (int fi = perla_call_depth - 1; fi >= 0; fi--) {
+        const char *p = perla_call_stack[fi].package;
+        if (p && p[0] && strcmp(p, "Moose::Exporter") != 0) { pkg = p; break; }
+    }
+    if (pkg) {
+        perla_code_set(pkg, "import", strada_cpointer_new((void*)perla_exporter_import));
+        perla_code_set(pkg, "unimport", strada_cpointer_new((void*)perla_mi_noop));
+        if (perla_debug_mode())
+            fprintf(stderr, "[moose-exporter] setup_import_methods for %s (lenient)\n", pkg);
+    }
+    return strada_new_undef();
+}
+
+/* IO::Handle::ungetc as a STASH-VISIBLE native: dispatch already
+ * handles ->ungetc on filehandle objects intrinsically, but capability
+ * probes (`defined &IO::Handle::ungetc`) found no stash slot and died
+ * "IO::Handle::ungetc missing". */
+static StradaValue *perla_io_handle_ungetc(StradaValue *args) {
+    StradaArray *av = strada_deref_array(args);
+    if (!av || av->size < 2) return STRADA_MAKE_TAGGED_INT(-1);
+    StradaValue *fh = av->elements[av->head];
+    if (fh && !STRADA_IS_TAGGED_INT(fh) && fh->type == STRADA_REF && fh->value.rv) fh = fh->value.rv;
+    if (!fh || STRADA_IS_TAGGED_INT(fh) || !fh->value.fh) return STRADA_MAKE_TAGGED_INT(-1);
+    int c = (int)strada_to_int(av->elements[av->head + 1]);
+    int r = ungetc(c, fh->value.fh);
+    return STRADA_MAKE_TAGGED_INT(r == EOF ? -1 : r);
+}
+
+static StradaValue *perla_mi_pp_str(StradaValue *args) {
+    (void)args;
+    return strada_new_str("PP");
+}
+
+static StradaValue *perla_mi_build_loader_sub(StradaValue *args) {
+    StradaArray *av = strada_deref_array(args);
+    StradaValue *impls = NULL, *syms = NULL;
+    if (av) {
+        for (size_t i = 0; i + 1 < av->size; i += 2) {
+            StradaValue *k = av->elements[av->head + i];
+            if (!k || STRADA_IS_TAGGED_INT(k) || k->type != STRADA_STR || !k->value.pv) continue;
+            if (strcmp(k->value.pv, "implementations") == 0) impls = av->elements[av->head + i + 1];
+            else if (strcmp(k->value.pv, "symbols") == 0) syms = av->elements[av->head + i + 1];
+        }
+    }
+    const char *pkg = NULL;
+    for (int fi = perla_call_depth - 1; fi >= 0; fi--) {
+        const char *p = perla_call_stack[fi].package;
+        if (p && p[0] && strcmp(p, "Module::Implementation") != 0) { pkg = p; break; }
+    }
+    if (pkg && impls) {
+        StradaValue *ia_sv = (!STRADA_IS_TAGGED_INT(impls) && impls->type == STRADA_REF)
+                             ? impls->value.rv : impls;
+        StradaArray *ia = ia_sv ? strada_deref_array(ia_sv) : NULL;
+        extern int g_perla_require_soft;
+        for (size_t ii = 0; ia && ii < ia->size; ii++) {
+            StradaValue *iv = ia->elements[ia->head + ii];
+            if (!iv || STRADA_IS_TAGGED_INT(iv) || iv->type != STRADA_STR || !iv->value.pv) continue;
+            char full[600];
+            snprintf(full, sizeof(full), "%s::%s", pkg, iv->value.pv);
+            StradaValue *fsv = strada_new_str(full);
+            g_perla_require_soft++;
+            StradaValue *r = perla_require_module(fsv);
+            g_perla_require_soft--;
+            strada_decref(fsv);
+            int loaded = 0;
+            if (r) {
+                if (!(!STRADA_IS_TAGGED_INT(r) && r->type == STRADA_UNDEF)) loaded = 1;
+                strada_decref(r);
+            }
+            if (!loaded && perla_stash_get(full)) loaded = 1;
+            if (loaded) {
+                StradaValue *sa_sv = (syms && !STRADA_IS_TAGGED_INT(syms)
+                                      && syms->type == STRADA_REF) ? syms->value.rv : syms;
+                StradaArray *sa = sa_sv ? strada_deref_array(sa_sv) : NULL;
+                for (size_t si = 0; sa && si < sa->size; si++) {
+                    StradaValue *sv = sa->elements[sa->head + si];
+                    if (!sv || STRADA_IS_TAGGED_INT(sv) || sv->type != STRADA_STR || !sv->value.pv) continue;
+                    StradaValue *code = perla_code_get(full, sv->value.pv);
+                    if (code) {
+                        strada_incref(code);
+                        perla_code_set(pkg, sv->value.pv, code);
+                    }
+                }
+                if (perla_debug_mode())
+                    fprintf(stderr, "[mi] %s -> %s loaded natively\n", pkg, full);
+                break;
+            }
+            if (perla_debug_mode())
+                fprintf(stderr, "[mi] %s::%s not loadable (lenient, continuing)\n", pkg, iv->value.pv);
+        }
+    }
+    return strada_cpointer_new((void*)perla_mi_noop);
+}
+
+/* ===== Native Module::Runtime =====
+ * M::R is the most load-bearing loader module in modern CPAN (Moo,
+ * Module::Implementation, Class::Load, DBIC all funnel through it) and
+ * its tiny API kept getting shadowed by stale compiled copies inlined
+ * into other TUs/eval .so's (the import closure read a dead private
+ * %export_ok and died '"require_module" is not exported'). Back the
+ * whole API natively + _protected, and short-circuit the .pm require
+ * (native_mods below), so no compiled copy can ever register. */
+static StradaValue *perla_mr_require_module(StradaValue *args) {
+    StradaArray *av = strada_deref_array(args);
+    if (!av || av->size < 1) return strada_new_undef();
+    return perla_require_module(av->elements[av->head]);
+}
+
+static StradaValue *perla_mr_use_module(StradaValue *args) {
+    StradaArray *av = strada_deref_array(args);
+    if (!av || av->size < 1) return strada_new_undef();
+    StradaValue *name = av->elements[av->head];
+    StradaValue *r = perla_require_module(name);
+    if (r) strada_decref(r);
+    /* use_module returns the module name (callers chain ->new etc.) */
+    if (name) strada_incref(name);
+    return name ? name : strada_new_undef();
+}
+
+static StradaValue *perla_mr_use_package_optimistically(StradaValue *args) {
+    StradaArray *av = strada_deref_array(args);
+    if (!av || av->size < 1) return strada_new_undef();
+    StradaValue *name = av->elements[av->head];
+    extern int g_perla_require_soft;
+    g_perla_require_soft++;
+    StradaValue *r = perla_require_module(name);
+    g_perla_require_soft--;
+    if (r) strada_decref(r);
+    if (name) strada_incref(name);
+    return name ? name : strada_new_undef();
+}
+
+static int perla_mr_name_ok(const char *s) {
+    if (!s || !*s) return 0;
+    const char *p = s;
+    while (*p) {
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z')
+              || (*p >= '0' && *p <= '9') || *p == '_')) {
+            if (p[0] == ':' && p[1] == ':' && p[2]) { p += 2; continue; }
+            return 0;
+        }
+        p++;
+    }
+    return 1;
+}
+
+static StradaValue *perla_mr_check_module_name(StradaValue *args) {
+    StradaArray *av = strada_deref_array(args);
+    char *s = (av && av->size >= 1) ? strada_to_str(av->elements[av->head]) : NULL;
+    if (!perla_mr_name_ok(s)) {
+        char msg[600];
+        snprintf(msg, sizeof(msg), "%s is not a module name", s ? s : "(undef)");
+        free(s);
+        strada_die(msg);
+        return strada_new_undef();
+    }
+    free(s);
+    return STRADA_MAKE_TAGGED_INT(1);
+}
+
+static StradaValue *perla_mr_module_notional_filename(StradaValue *args) {
+    StradaArray *av = strada_deref_array(args);
+    if (!av || av->size < 1) return strada_new_undef();
+    char *s = strada_to_str(av->elements[av->head]);
+    if (!s) return strada_new_undef();
+    size_t n = strlen(s);
+    char *out = malloc(n + 8);
+    size_t o = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (s[i] == ':' && s[i+1] == ':') { out[o++] = '/'; i++; }
+        else out[o++] = s[i];
+    }
+    memcpy(out + o, ".pm", 4);
+    StradaValue *r = strada_new_str(out);
+    free(out); free(s);
+    return r;
+}
+
 StradaValue *perla_require_module(StradaValue *module_sv) {
     if (!module_sv || STRADA_IS_TAGGED_INT(module_sv)) return strada_new_undef();
 
@@ -23313,6 +24522,80 @@ StradaValue *perla_require_module(StradaValue *module_sv) {
         strada_decref(mark);
         free(module);
         return STRADA_MAKE_TAGGED_INT(1);
+    }
+
+    /* Native-module short-circuit: perla provides these natively (the
+     * parser likewise refuses to inline them), and compiling the REAL
+     * .pm at runtime is actively harmful: Carp.pm's body eval-STRINGs
+     * (`*LAST_FH = sub () { 0 }`) which wedges the eval pipeline,
+     * Config.pm always dies on its perl-version sanity check, Errno.pm
+     * dies on its architecture guard, warnings.pm pulls Carp. This path
+     * was latent for ages because the runtime-require spawn used a bare
+     * "perla" that usually wasn't on PATH (so the compile silently
+     * no-op'd and the natives survived); fixing the spawn to use the
+     * baked perla path unmasked it — requiring any of these would
+     * recompile the real module over the natives and hang or die. */
+    {
+        static const char *native_mods[] = {
+            "Carp", "Config", "Errno", "warnings", "warnings::register",
+            "strict", "vars", "feature", "utf8", "bytes", "integer",
+            /* Carp::Heavy is a back-compat shim whose only body is a
+             * version check against $Carp::VERSION — which dies against
+             * perla's versionless native Carp ("Version mismatch between
+             * Carp undef ((native)) and Carp::Heavy 1.54"). Everything it
+             * ever provided lives in Carp, which is native. */
+            "Carp::Heavy",
+            /* Encode.pm is XS glue the parser can't compile (its body
+             * calls XS-defined barewords like onBOOT); perla registers
+             * encode/decode/find_encoding/encode_utf8/decode_utf8
+             * natively at init. */
+            "Encode",
+            /* Data::Dumper — perla registers Dumper/new and the OO
+             * method set natively; the real .pm is XS glue (Dumpxs). */
+            "Data::Dumper",
+            /* Moose family — perla backs the metaobject protocol natively
+             * (perla_mop_*, perla_moose_typeconstraints_import). The real
+             * .pms typically aren't even installed here; a runtime require
+             * died "Can't locate Moose/Util/TypeConstraints.pm" and killed
+             * the requiring module's init (Abe::Search::View roles). */
+            "Moose", "Moose::Role", "Moose::Util",
+            "Moose::Util::TypeConstraints",
+            /* Module::Runtime — whole API native (perla_mr_*); compiled
+             * copies inlined into other TUs kept shadowing the import
+             * with dead closures. */
+            "Module::Runtime",
+            /* Package::Stash — native stash-op backing registered in
+             * perla_init. The real .pm's loader (Module::Implementation
+             * picking XS/PP via caller()) misfires when its body runs
+             * under another TU's init frame: caller() said
+             * "DBIx::Class::_Util" and it tried to load
+             * DBIx::Class::_Util::XS. Never load the .pm. */
+            "Package::Stash", "Package::Stash::XS", "Package::Stash::PP",
+            /* Module::Implementation — native build_loader_sub (lenient,
+             * frame-derived package, never croaks). */
+            "Module::Implementation", "Module::Load",
+            /* FileHandle — a thin compat layer whose import loop demands
+             * stash CODE slots for every IO::Handle method (perla backs
+             * them as dispatch intrinsics, so the loop died
+             * "IO::Handle::gets missing"). Methods on FileHandle objects
+             * dispatch through the same fh intrinsics. */
+            "FileHandle",
+            /* DBI — fully native (runtime/perla_dbi.c). A real DBI.pm
+             * installed under ~/perla/lib compiled to a .pm.so whose
+             * init stack-overflowed (infinite recursion) and clobbered
+             * the native method set. Never load the .pm. */
+            "DBI", NULL
+        };
+        for (int ni = 0; native_mods[ni]; ni++) {
+            if (strcmp(module, native_mods[ni]) == 0) {
+                if (perla_debug_mode()) fprintf(stderr, "[require]   short-circuit: native %s\n", module);
+                StradaValue *mark = strada_new_str("(native)");
+                inc_mark(module, mark);
+                strada_decref(mark);
+                free(module);
+                return STRADA_MAKE_TAGGED_INT(1);
+            }
+        }
     }
 
     /* Convert Module::Name to Module/Name.pm */
@@ -23454,11 +24737,52 @@ StradaValue *perla_require_module(StradaValue *module_sv) {
     }
 
     if (!pm_path[0]) {
-        /* Module not found - not an error for optional requires */
+        /* In-file package: a package can be defined inside another
+         * module's .pm with no file of its own (JSON.pm defines
+         * JSON::Backend::XS / JSON::Backend::PP in-file; DBI does the
+         * same for DBD glue). If a stash for the module already has
+         * entries, the code IS loaded — treat the require as satisfied
+         * instead of dying, which aborted the enclosing module's init
+         * midway (JSON.pm's own init died this way, leaving JSON
+         * half-initialized). */
+        PerlStash *have = perla_stash_get(module);
+        if (have && have->count > 0) {
+            if (perla_debug_mode())
+                fprintf(stderr, "[require]   satisfied by in-file package: %s (%d entries)\n",
+                        module, have->count);
+            StradaValue *mark = strada_new_str("(in-file)");
+            inc_mark(module, mark);
+            strada_decref(mark);
+            free(rel_path);
+            free(module);
+            return STRADA_MAKE_TAGGED_INT(1);
+        }
+        /* Soft mode: heuristic callers (method-dispatch lazy-load of an
+         * @ISA parent) must NOT die when the package simply has no .pm —
+         * Perl never requires during dispatch at all. A hard die here
+         * aborted the CALLING module's init: JSON.pm calls
+         * JSON::Backend::XS->init() before the in-file package's subs
+         * have registered (perla registers subs in init-execution order,
+         * not at compile time like perl), dispatch tried to require
+         * "JSON/Backend/XS.pm", and the die killed JSON's init midway. */
+        if (g_perla_require_soft) {
+            if (perla_debug_mode())
+                fprintf(stderr, "[require]   not found (soft — dispatch fallback): %s\n", module);
+            free(rel_path);
+            free(module);
+            return strada_new_undef();
+        }
+        /* Module not found - not an error for optional requires.
+         * Match perl's message shape including the " at FILE line N."
+         * tail: XS-probe fallbacks pattern-match it — Date::Calc does
+         * `die $@ unless ($@ =~ /^Can't locate .*? at /)` and re-died
+         * (killing its init midway) because perla's $@ had no " at ". */
         extern StradaValue *perla_eval_error;
         if (perla_eval_error) strada_decref(perla_eval_error);
         char errmsg[512];
-        snprintf(errmsg, sizeof(errmsg), "Can't locate %s in @INC", rel_path);
+        snprintf(errmsg, sizeof(errmsg),
+                 "Can't locate %s in @INC (you may need to install the %s module) at (require) line 0.",
+                 rel_path, module);
         perla_eval_error = strada_new_str(errmsg);
         strada_incref(perla_eval_error);
         free(rel_path);
@@ -23512,6 +24836,7 @@ StradaValue *perla_require_module(StradaValue *module_sv) {
          * source directory. Without this, runtime `require` of system
          * modules (mro, Carp, overload, Scalar::Util etc.) on Ubuntu's
          * standard system perl directories would silently fail. */
+        int __staged_fresh = 0;
         char build_pm_path[2048];
         strncpy(build_pm_path, pm_path, sizeof(build_pm_path) - 1);
         build_pm_path[sizeof(build_pm_path) - 1] = 0;
@@ -23549,33 +24874,85 @@ StradaValue *perla_require_module(StradaValue *module_sv) {
                     else flat[fp++] = '_';
                 }
                 flat[fp] = 0;
-                /* Stage into the per-process private 0700 dir, not a
-                 * predictable world-writable /tmp path — an attacker can't
-                 * pre-plant a symlink or a malicious .pm/.pm.so there, closing
-                 * the staging symlink-overwrite + dlopen-hijack RCE (audit H3).
-                 * Fall back to the legacy /tmp name only if mkdtemp failed. */
-                const char *__std = perla_private_tmpdir();
-                if (__std)
-                    snprintf(build_pm_path, sizeof(build_pm_path),
-                             "%s/%s%s.pm", __std, __stage_prefix, flat);
-                else
-                    snprintf(build_pm_path, sizeof(build_pm_path),
-                             "/tmp/%s%s.pm", __stage_prefix, flat);
-                /* Copy source .pm to staging path. */
-                FILE *src_f = fopen(pm_path, "r");
-                FILE *dst_f = fopen(build_pm_path, "w");
-                if (src_f && dst_f) {
-                    char copy_buf[4096];
-                    size_t rd;
-                    while ((rd = fread(copy_buf, 1, sizeof(copy_buf), src_f)) > 0) {
-                        fwrite(copy_buf, 1, rd, dst_f);
+                /* Stage into a PERSISTENT user-private 0700 dir
+                 * (~/.cache/perla/stage), not the per-process tmpdir.
+                 * Per-process staging meant every NO_TLS (tcc) run
+                 * recompiled the entire runtime-required tier from
+                 * scratch — the deep Abe::DB chains never finished
+                 * inside one run window, so convergence stalled at the
+                 * same module for 12+ consecutive runs. A user-owned
+                 * 0700 cache dir preserves the audit-H3 property (no
+                 * world-writable predictable path) while letting staged
+                 * artifacts survive across runs with the same staleness
+                 * rules as everything else (vs source AND perla mtimes).
+                 * Falls back to the per-process dir if HOME is unset. */
+                char __stagedir[1200] = "";
+                {
+                    const char *__h = getenv("HOME");
+                    if (__h && __h[0]) {
+                        snprintf(__stagedir, sizeof(__stagedir), "%s/.cache", __h);
+                        mkdir(__stagedir, 0700);
+                        snprintf(__stagedir, sizeof(__stagedir), "%s/.cache/perla", __h);
+                        mkdir(__stagedir, 0700);
+                        snprintf(__stagedir, sizeof(__stagedir), "%s/.cache/perla/stage", __h);
+                        mkdir(__stagedir, 0700);
+                        struct stat __sd_st;
+                        if (stat(__stagedir, &__sd_st) != 0 || !S_ISDIR(__sd_st.st_mode)
+                            || __sd_st.st_uid != getuid())
+                            __stagedir[0] = 0;  /* suspicious — fall back */
                     }
                 }
-                if (src_f) fclose(src_f);
-                if (dst_f) fclose(dst_f);
-                /* Update so_path to staging .pm.so so the dlopen below
-                 * targets the new location. */
-                snprintf(so_path, sizeof(so_path), "%s.so", build_pm_path);
+                if (__stagedir[0]) {
+                    snprintf(build_pm_path, sizeof(build_pm_path),
+                             "%s/%s%s.pm", __stagedir, __stage_prefix, flat);
+                } else {
+                    const char *__std = perla_private_tmpdir();
+                    if (__std)
+                        snprintf(build_pm_path, sizeof(build_pm_path),
+                                 "%s/%s%s.pm", __std, __stage_prefix, flat);
+                    else
+                        snprintf(build_pm_path, sizeof(build_pm_path),
+                                 "/tmp/%s%s.pm", __stage_prefix, flat);
+                }
+                /* Freshness short-circuit: a staged .pm.so newer than BOTH
+                 * the original source and the perla binary is reusable —
+                 * skip the copy + child compile entirely. */
+                {
+                    char __st_so[2200];
+                    snprintf(__st_so, sizeof(__st_so), "%s.so", build_pm_path);
+                    struct stat __so_st, __src_st, __pl_st;
+                    int __fresh = 0;
+                    if (stat(__st_so, &__so_st) == 0 && stat(pm_path, &__src_st) == 0
+                        && __so_st.st_mtime >= __src_st.st_mtime) {
+                        __fresh = 1;
+                        if (g_perla_path[0] && stat(g_perla_path, &__pl_st) == 0
+                            && __so_st.st_mtime < __pl_st.st_mtime)
+                            __fresh = 0;
+                    }
+                    if (__fresh) {
+                        if (perla_debug_mode())
+                            fprintf(stderr, "[require]   staged cache HIT %s\n", __st_so);
+                        snprintf(so_path, sizeof(so_path), "%s", __st_so);
+                        __staged_fresh = 1;
+                    }
+                }
+                if (!__staged_fresh) {
+                    /* Copy source .pm to staging path. */
+                    FILE *src_f = fopen(pm_path, "r");
+                    FILE *dst_f = fopen(build_pm_path, "w");
+                    if (src_f && dst_f) {
+                        char copy_buf[4096];
+                        size_t rd;
+                        while ((rd = fread(copy_buf, 1, sizeof(copy_buf), src_f)) > 0) {
+                            fwrite(copy_buf, 1, rd, dst_f);
+                        }
+                    }
+                    if (src_f) fclose(src_f);
+                    if (dst_f) fclose(dst_f);
+                    /* Update so_path to staging .pm.so so the dlopen below
+                     * targets the new location. */
+                    snprintf(so_path, sizeof(so_path), "%s.so", build_pm_path);
+                }
             }
         }
         /* Build both .pm.o and .pm.so. Runtime require only needs .pm.so
@@ -23616,6 +24993,40 @@ StradaValue *perla_require_module(StradaValue *module_sv) {
 #else
         const char *_no_tls = "";
 #endif
+        /* PERLA_RUNTIME_CC=tcc routes runtime module compiles through tcc
+         * (~10x faster than gcc on the big generated TUs). Opt-in: tcc
+         * has known correctness gaps, so iteration runs use it and
+         * production cache-warming sticks with gcc. */
+        char _rcc[64] = "";
+        {
+            const char *rcc = getenv("PERLA_RUNTIME_CC");
+            if (rcc && rcc[0] && strlen(rcc) < 32 && !strchr(rcc, '\'') && !strchr(rcc, ' '))
+                snprintf(_rcc, sizeof(_rcc), "--cc %s ", rcc);
+        }
+        /* Propagate the runtime's @INC (g_require_paths) to the child as
+         * PERLA_LIB + PERLA5LIB, same as the eval-STRING compile path.
+         * Critical for STAGED builds: the staged .pm sits alone in the
+         * private tmpdir, so without these the child can't resolve
+         * anything the module `use`s (its compile still succeeds, but
+         * every dependency silently falls to "NOT FOUND at compile
+         * time" even when the .pm is right there on the search path). */
+        char req_lib_env[16384] = "";
+        if (g_require_paths && g_require_path_count > 0) {
+            char paths[8192] = "";
+            size_t ppos = 0;
+            for (size_t i = 0; i < g_require_path_count && ppos < sizeof(paths) - 2; i++) {
+                const char *p = g_require_paths[i];
+                if (!p) continue;
+                if (ppos > 0 && ppos < sizeof(paths) - 1) paths[ppos++] = ':';
+                size_t plen = strlen(p);
+                if (ppos + plen >= sizeof(paths) - 2) break;
+                memcpy(paths + ppos, p, plen);
+                ppos += plen;
+            }
+            paths[ppos] = 0;
+            snprintf(req_lib_env, sizeof(req_lib_env),
+                     "PERLA_LIB=%s PERLA5LIB=%s ", paths, paths);
+        }
         char cmd[16384];
         /* Shell-quote every interpolated value: module (from `require $expr`,
          * attacker-controllable) and build_pm_path are the audited vectors;
@@ -23626,20 +25037,32 @@ StradaValue *perla_require_module(StradaValue *module_sv) {
         if (g_perla_path[0] && g_strada_dir[0]) {
             perla_shq(g_strada_dir, _sdq, sizeof(_sdq));
             perla_shq(g_perla_path, _ppq, sizeof(_ppq));
-            snprintf(cmd, sizeof(cmd), "%sSTRADA_DIR=%s PERLA_MODULE_NAME=%s PERLA_BUILD_PM_SO=1 %s%s -M %s 2>&1",
-                     _no_tls, _sdq, _mq, _pp_deps, _ppq, _pq);
+            snprintf(cmd, sizeof(cmd), "%s%sSTRADA_DIR=%s PERLA_MODULE_NAME=%s PERLA_BUILD_PM_SO=1 %s%s %s-M %s 2>&1",
+                     _no_tls, req_lib_env, _sdq, _mq, _pp_deps, _ppq, _rcc, _pq);
+        } else if (g_perla_path[0]) {
+            /* No strada-dir hint, but we DO know which perla built us.
+             * The child self-detects its Strada install; never throw the
+             * known-good perla path away (a bare "perla" only works when
+             * perla happens to be on PATH — for a binary compiled by an
+             * uninstalled in-tree perla, the entire runtime lazy-load
+             * mechanism silently died with "sh: perla: not found"). */
+            perla_shq(g_perla_path, _ppq, sizeof(_ppq));
+            snprintf(cmd, sizeof(cmd), "%s%sPERLA_MODULE_NAME=%s PERLA_BUILD_PM_SO=1 %s%s %s-M %s 2>&1",
+                     _no_tls, req_lib_env, _mq, _pp_deps, _ppq, _rcc, _pq);
         } else {
-            snprintf(cmd, sizeof(cmd), "%sPERLA_MODULE_NAME=%s PERLA_BUILD_PM_SO=1 %sperla -M %s 2>&1",
-                     _no_tls, _mq, _pp_deps, _pq);
+            snprintf(cmd, sizeof(cmd), "%s%sPERLA_MODULE_NAME=%s PERLA_BUILD_PM_SO=1 %s%sperla -M %s 2>&1",
+                     _no_tls, req_lib_env, _mq, _pp_deps, _rcc, _pq);
         }
-        if (perla_debug_mode()) fprintf(stderr, "[require] compiling: %s%s\n", cmd, dir_writable ? "" : " (staged)");
-        FILE *proc = popen(cmd, "r");
-        if (proc) {
-            char buf[1024];
-            while (fgets(buf, sizeof(buf), proc)) {
-                if (perla_debug_mode()) fprintf(stderr, "[require]   %s", buf);
+        if (!__staged_fresh) {
+            if (perla_debug_mode()) fprintf(stderr, "[require] compiling: %s%s\n", cmd, dir_writable ? "" : " (staged)");
+            FILE *proc = popen(cmd, "r");
+            if (proc) {
+                char buf[1024];
+                while (fgets(buf, sizeof(buf), proc)) {
+                    if (perla_debug_mode()) fprintf(stderr, "[require]   %s", buf);
+                }
+                pclose(proc);
             }
-            pclose(proc);
         }
         /* Try to dlopen the .so now */
         handle = dlopen(so_path, RTLD_NOW | RTLD_GLOBAL);
@@ -23678,6 +25101,12 @@ StradaValue *perla_require_module(StradaValue *module_sv) {
                 } else {
                     STRADA_TRY_POP();
                     StradaValue *exc = strada_get_exception();
+                    if (perla_debug_mode()) {
+                        char *__em = exc ? strada_to_str(exc) : NULL;
+                        fprintf(stderr, "[require] init: %s DIED midway: %s\n",
+                                init_name, __em ? __em : "(no message)");
+                        free(__em);
+                    }
                     if (exc) strada_decref(exc);
                 }
             } else {

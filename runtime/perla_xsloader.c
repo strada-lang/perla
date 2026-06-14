@@ -418,6 +418,21 @@ StradaValue *perla_xsloader_load(StradaValue *args) {
                  * program during Class::MOP init. Lie success: the .pm finishes,
                  * calls land on perla's native MOP. */
                 "Moose",
+                /* Time::Piece is pure-XS; perla registers gmtime/localtime/
+                 * strftime/strptime/epoch + accessors natively (protected).
+                 * A fatal XSLoader death during `use Time::Piece` killed
+                 * Amazon::S3's init chain via Net::Amazon::Signature::V4. */
+                "Time::Piece",
+                /* Compress::Raw::Zlib: its .pm wraps XSLoader::load in eval,
+                 * but the `or do` fallback uses indirect-object syntax
+                 * (`bootstrap Compress::Raw::Zlib $XS_VERSION`) which perla
+                 * parses as a call to a sub named "Compress::Raw::Zlib" —
+                 * undefined-sub die at init depth exits the process (via
+                 * Archive::Zip <- Excel::Writer::XLSX <- Abe::Plugin::Excel).
+                 * Lie success so the eval returns 1 and the fallback never
+                 * runs. Actual deflate/crc32 calls are NOT backed natively
+                 * yet — they fail at call time if reached. */
+                "Compress::Raw::Zlib",
                 /* Sub::Name is pure-XS (subname — names anon coderefs). perla
                  * registers subname natively; Moose/Class::MOP::Mixin::
                  * HasMethods name every generated method with it, so a fatal
@@ -426,6 +441,28 @@ StradaValue *perla_xsloader_load(StradaValue *args) {
                 /* mro is a core pure-XS module (method resolution order). perla
                  * registers mro::get_linear_isa/get_mro/set_mro/... natively. */
                 "mro",
+                /* Socket is pure-XS (constants + pack/unpack helpers);
+                 * perla implements sockets natively (IO::Socket::INET,
+                 * sockaddr_in, AF_INET/SOCK_STREAM constants). A fatal
+                 * bootstrap death during `use Socket` killed the
+                 * enclosing module's init (Net::Whois::ARIN). */
+                "Socket",
+                /* Clone is pure-XS (deep clone); perla registers
+                 * Clone::clone natively (strada_clone — same engine as
+                 * Storable::dclone). */
+                "Clone",
+                /* MIME::Base64 is pure-XS with no PP fallback; perla
+                 * registers encode_base64/decode_base64 natively over the
+                 * strada runtime's base64 codec. */
+                "MIME::Base64",
+                /* IO is the XS backbone of IO::Handle/IO::File/IO::Seekable;
+                 * perla implements those classes natively. A fatal XSLoader
+                 * death during `use IO` aborts the ENCLOSING module's init
+                 * midway — File::Temp pulls IO::Seekable, its init died at
+                 * this bootstrap, and the file-scoped @CHARS never
+                 * initialized, so every tempfile template expanded to "".
+                 * Lie success; IO method calls land on perla's natives. */
+                "IO",
                 NULL,
             };
             for (int ni = 0; native_lie_modules[ni]; ni++) {
