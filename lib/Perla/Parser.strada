@@ -2887,13 +2887,43 @@ func _load_module(scalar $p, str $module) scalar {
                         _dbg("  " . $module . ": stale .pm.so (older than source) — ignoring");
                         $so_exists = 0;
                     }
-                    if ($o_exists == 1 && $ah_perla_mtime > 0 && $ah_o_mtime < $ah_perla_mtime) {
-                        _dbg("  " . $module . ": stale .pm.o (older than perla) — ignoring");
-                        $o_exists = 0;
+                    # Codegen-version check — replaces the blanket "older than
+                    # the perla binary" rule. An artifact stays valid as long as
+                    # the codegen + runtime ABI that produced it is unchanged,
+                    # even when perla was rebuilt for a runtime-only fix (whose
+                    # behavior reaches the artifact at link time anyway). The
+                    # build stamps .pm.cgv; __PERLA_CGV is the current version
+                    # (perla.strada publishes the baked-in -D PERLA_CGV). Legacy
+                    # artifacts with no stamp fall back to the mtime rule, so a
+                    # tree warmed before this change migrates on its next build.
+                    my str $cur_cgv = core::getenv("__PERLA_CGV");
+                    my str $stamped_cgv = "";
+                    {
+                        my str $cgvcand = _art_cand($full, ".cgv");
+                        if (core::file_exists($cgvcand) == 1) {
+                            $stamped_cgv = trim(core::slurp($cgvcand));
+                        }
                     }
-                    if ($so_exists == 1 && $ah_perla_mtime > 0 && $ah_so_mtime < $ah_perla_mtime) {
-                        _dbg("  " . $module . ": stale .pm.so (older than perla) — ignoring");
-                        $so_exists = 0;
+                    if (length($stamped_cgv) > 0 && length($cur_cgv) > 0) {
+                        if ($stamped_cgv ne $cur_cgv) {
+                            if ($o_exists == 1) {
+                                _dbg("  " . $module . ": stale .pm.o (codegen " . $stamped_cgv . " != " . $cur_cgv . ") — ignoring");
+                                $o_exists = 0;
+                            }
+                            if ($so_exists == 1) {
+                                _dbg("  " . $module . ": stale .pm.so (codegen version changed) — ignoring");
+                                $so_exists = 0;
+                            }
+                        }
+                    } else {
+                        if ($o_exists == 1 && $ah_perla_mtime > 0 && $ah_o_mtime < $ah_perla_mtime) {
+                            _dbg("  " . $module . ": stale .pm.o (older than perla, no cgv stamp) — ignoring");
+                            $o_exists = 0;
+                        }
+                        if ($so_exists == 1 && $ah_perla_mtime > 0 && $ah_so_mtime < $ah_perla_mtime) {
+                            _dbg("  " . $module . ": stale .pm.so (older than perla, no cgv stamp) — ignoring");
+                            $so_exists = 0;
+                        }
                     }
                 }
                 # Force rebuild if requested (ignores existing artifacts).

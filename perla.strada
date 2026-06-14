@@ -865,6 +865,22 @@ func _objs_are_no_tls(str $objs) int {
     return 0;
 }
 
+# Codegen version baked in at build time (-D PERLA_CGV, a hash of the codegen
+# sources + runtime ABI headers — see Makefile). Artifacts are stamped with
+# this; the Parser's staleness check rebuilds an artifact only when it differs,
+# so a runtime-only perla rebuild doesn't invalidate the whole cache. Returns
+# "dev" for an unstamped build (then artifacts always rebuild — safe).
+func _codegen_version() str {
+    my str $v = "dev";
+    __C__ {
+        #ifdef PERLA_CGV
+        strada_decref(v);
+        v = strada_new_str(PERLA_CGV);
+        #endif
+    }
+    return $v;
+}
+
 # Content key for the link cache: md5 over the generated C, the dep object
 # set, each dep object's mtime, the perla binary's mtime, and the cc/flags.
 # Any change to the program, a dependency artifact, or perla itself yields a
@@ -1675,6 +1691,11 @@ func _run_repl() int {
 func main() int {
     my int $argc = size(@ARGV);
 
+    # Publish the baked-in codegen version so the Parser's artifact-staleness
+    # check (a separate compilation unit that can't see the -D PERLA_CGV
+    # define) can read it via getenv. Child `perla -M` spawns inherit it.
+    core::setenv("__PERLA_CGV", _codegen_version());
+
     if ($argc == 0) {
         # Default REPL is the persistent-process JIT REPL (true cross-line state).
         return _run_jit_repl();
@@ -2359,6 +2380,12 @@ func main() int {
         if (core::file_exists($so_file) == 1) {
             say("Compiled " . $so_file . " (module: " . $mod_name . ", init: " . $init_name . ")");
             $ok = 1;
+        }
+        # Stamp the codegen version next to the artifact (.pm.cgv) so the
+        # staleness check can rebuild only when codegen/ABI actually changed,
+        # not on every perla rebuild. Written only after a successful build.
+        if ($ok == 1) {
+            core::spew($base . ".pm.cgv", _codegen_version());
         }
         if ($ok == 0) {
             say("Error: compilation failed for " . $mod_name);

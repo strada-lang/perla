@@ -217,10 +217,21 @@ lib/Perla/%.o: lib/Perla/%.strada $(STRADAC)
 # so the persistent JIT REPL (`perla --jit-repl`) can dlopen each line's .pm.so
 # into this process and have it resolve perla-runtime + stash symbols here.
 # (strada_runtime.o is already linked by the driver, so it's NOT relisted.)
+# Codegen-version stamp: a short hash of the sources that determine the
+# CONTENT of a generated .pm.o — the codegen/driver .strada and the runtime
+# ABI *headers* the generated C links against — but deliberately NOT the
+# runtime .c implementations, whose behavior changes propagate to existing
+# artifacts at link time. Baked into perla via -D PERLA_CGV; each built
+# artifact records it in a .pm.cgv sidecar; the staleness check rebuilds an
+# artifact only when the stamp differs. So a runtime-only perla rebuild no
+# longer invalidates the whole artifact cache (no multi-minute re-warm).
+PERLA_CGV := $(shell cat perla.strada lib/Perla/*.strada lib/Perla/CodeGen/*.strada runtime/perla_stash.h runtime/perla_dbi.h runtime/perla_xsloader.h 2>/dev/null | md5sum | cut -c1-16)
+
 perla: perla.strada $(PERLA_LIB_MODS) $(PERLA_CODEGEN_MODS) runtime/perla_runtime.a
 	$(STRADA) $(STRADA_OPT) perla.strada -o perla \
 	    runtime/perla_stash.o runtime/perla_dbi.o runtime/perla_moose_xs.o runtime/perla_xsloader.o \
-	    -l readline -l ssl -l crypto -l mysqlclient -l z -l sqlite3 -D HAVE_READLINE
+	    -l readline -l ssl -l crypto -l mysqlclient -l z -l sqlite3 -D HAVE_READLINE \
+	    -D PERLA_CGV='"$(PERLA_CGV)"'
 
 # Test the C runtime
 test-stash: runtime/test_stash.c runtime/perla_stash.c runtime/perla_stash.h $(RUNTIME_OBJ)
