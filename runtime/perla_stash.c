@@ -24524,6 +24524,43 @@ StradaValue *perla_require_module(StradaValue *module_sv) {
         return STRADA_MAKE_TAGGED_INT(1);
     }
 
+    /* Static-link short-circuit: if this module's perla_mod_init_X symbol is
+     * already present in the process (its .pm.o was statically linked into the
+     * program), run THAT and never dlopen the sibling .pm.so. Otherwise we get
+     * TWO copies of the module's code — the linked .pm.o and the dlopen'd
+     * .pm.so — each with its own file-lexical statics. A module init builds its
+     * closure in one copy while the registered sub (resolved by name via the
+     * other copy) reads the still-NULL static from the other. This is what made
+     * Specio::Constraint::Role::Interface::_attrs return undef inside add.pl
+     * (its 14-key attr hash built in the .so copy, read from the linked copy)
+     * so every role consumer lost name/parent/_constraint and _ooify never
+     * installed _has_constraint. The dep-init codegen already prefers the
+     * linked symbol; direct require_module callers (import probes, role
+     * `with`, ensure_class_loaded) did not — so guard here too. The init's own
+     * __perla_init_done makes a re-entrant call a safe no-op. */
+    {
+        char __isym[300];
+        size_t __o = 0;
+        const char *__pfx = "perla_mod_init_";
+        while (*__pfx && __o < sizeof(__isym) - 1) __isym[__o++] = *__pfx++;
+        for (const char *__q = module; *__q && __o < sizeof(__isym) - 1; __q++) {
+            if (__q[0] == ':' && __q[1] == ':') { __isym[__o++] = '_'; __q++; }
+            else __isym[__o++] = *__q;
+        }
+        __isym[__o] = '\0';
+        void (*__linked_init)(void) = (void (*)(void))dlsym(RTLD_DEFAULT, __isym);
+        if (__linked_init) {
+            if (perla_debug_mode())
+                fprintf(stderr, "[require]   short-circuit: statically linked (%s)\n", __isym);
+            __linked_init();
+            StradaValue *mark = strada_new_str("(linked)");
+            inc_mark(module, mark);
+            strada_decref(mark);
+            free(module);
+            return STRADA_MAKE_TAGGED_INT(1);
+        }
+    }
+
     /* Native-module short-circuit: perla provides these natively (the
      * parser likewise refuses to inline them), and compiling the REAL
      * .pm at runtime is actively harmful: Carp.pm's body eval-STRINGs
