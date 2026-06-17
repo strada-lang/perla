@@ -592,29 +592,48 @@ func _fix_codegen_edge_cases(str $code) str {
         if ($link_end2 > $link_pos2) {
             my str $objs_str = trim(substr($result, $link_pos2 + 22, $link_end2 - $link_pos2 - 22));
             if (length($objs_str) > 0) {
-                # Get exported symbols from .o files
+                # Get exported symbols from the .o files into a membership set.
                 my str $nm_out = core::qx("nm -g " . _shq_list($objs_str) . " 2>/dev/null | grep ' T perla_sub_' | awk '{print $3}'");
                 my array @syms = split("\n", trim($nm_out));
+                my hash %want = ();
                 my int $si2 = 0;
                 while ($si2 < size(@syms)) {
                     my str $sym = trim($syms[$si2]);
-                    if (length($sym) > 0) {
-                        # Make the function definition static in the main C
-                        # Pattern: "StradaValue* perla_sub_NAME(" → "static StradaValue* perla_sub_NAME("
-                        my str $def = "StradaValue* " . $sym . "(";
-                        my str $static_def = "static StradaValue* " . $sym . "(";
-                        $result = replace_all($result, $def, $static_def);
-                    }
+                    if (length($sym) > 0) { $want{$sym} = "1"; }
                     $si2++;
                 }
-                # Collapse any "static static" introduced when the same symbol
-                # appeared in two .o files (or was touched twice by replace_all
-                # due to the replacement containing the search string). Loop
-                # because N>2 duplicates produce N statics in a row, and one
-                # replace_all pass only catches one "static static" per site.
-                while (index($result, "static static StradaValue*") >= 0) {
-                    $result = replace_all($result, "static static StradaValue*", "static StradaValue*");
+                # Single scan: prefix each `StradaValue* perla_sub_NAME(` whose
+                # NAME is in the set with `static`, so the main C's copy doesn't
+                # collide with the precompiled .pm.o's exported copy at link
+                # time. This replaces an older loop that ran one whole-code
+                # replace_all PER symbol — O(symbols * code_size), which wedged
+                # for minutes on add.pl's ~120k linked symbols. This pass is
+                # O(code_size): one index walk + a single join (no O(n^2) string
+                # growth), and `static ` is inserted exactly once per matched
+                # site so no "static static" can be produced.
+                my str $anchor = "StradaValue* perla_sub_";
+                my int $pfx = length("StradaValue* ");
+                my int $rlen = length($result);
+                my array @parts = ();
+                my int $last = 0;
+                my int $cur = index($result, $anchor, 0);
+                while ($cur >= 0) {
+                    my int $name_start = $cur + $pfx;
+                    my int $paren = index($result, "(", $name_start);
+                    if ($paren > $name_start) {
+                        my str $name = substr($result, $name_start, $paren - $name_start);
+                        if (exists($want{$name})) {
+                            push(@parts, substr($result, $last, $cur - $last));
+                            push(@parts, "static ");
+                            $last = $cur;
+                        }
+                        $cur = index($result, $anchor, $paren);
+                    } else {
+                        $cur = index($result, $anchor, $cur + $pfx);
+                    }
                 }
+                push(@parts, substr($result, $last, $rlen - $last));
+                $result = join("", @parts);
             }
         }
     }
