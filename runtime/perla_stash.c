@@ -3896,6 +3896,29 @@ StradaValue **perla_our_slot_hash(const char *pkg, const char *name) {
     return &g->slots[PERLA_SLOT_HASH];
 }
 
+/* File-lexical analogue of the above. An inlined module's `my %x`/`my @x` would
+ * otherwise be a per-TU static, populated only in the (one) TU whose init ran
+ * before the perla_inc_loaded guard tripped — but the linker keeps an arbitrary
+ * copy of the module's subs, which may read a DIFFERENT TU's empty static (the
+ * Data::OptList %test_for crash). Store these in one runtime slot under a
+ * synthetic, prefix-isolated stash per module so every copy — statically linked
+ * or in any dlopen'd .pm.so — reads the single instance the guard populates. */
+StradaValue **perla_filelex_slot_array(const char *mod, const char *name) {
+    char pkg[600];
+    snprintf(pkg, sizeof(pkg), "\001filelex\001%s", mod ? mod : "");
+    PerlGlob *g = perla_glob_get_or_create(perla_stash_get_or_create(pkg), name);
+    if (!g->slots[PERLA_SLOT_ARRAY]) g->slots[PERLA_SLOT_ARRAY] = strada_new_array();
+    return &g->slots[PERLA_SLOT_ARRAY];
+}
+
+StradaValue **perla_filelex_slot_hash(const char *mod, const char *name) {
+    char pkg[600];
+    snprintf(pkg, sizeof(pkg), "\001filelex\001%s", mod ? mod : "");
+    PerlGlob *g = perla_glob_get_or_create(perla_stash_get_or_create(pkg), name);
+    if (!g->slots[PERLA_SLOT_HASH]) g->slots[PERLA_SLOT_HASH] = strada_new_hash();
+    return &g->slots[PERLA_SLOT_HASH];
+}
+
 void perla_register_our_local_array(const char *pkg, const char *name, StradaValue **local) {
     if (!pkg || !name || !local) return;
     /* Slot-accessor registration: when codegen routes a collided name

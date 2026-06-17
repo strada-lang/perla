@@ -167,6 +167,14 @@ StradaValue *perla_array_get(const char *pkg, const char *name);
 /* Lvalue stash-slot accessors for collided `our` names (see perla_stash.c). */
 StradaValue **perla_our_slot_array(const char *pkg, const char *name);
 StradaValue **perla_our_slot_hash(const char *pkg, const char *name);
+/* Shared storage for an INLINED module's file-scope `my %x`/`my @x`. When a
+ * module is inlined into N translation units, the linker keeps one copy of each
+ * `perla_sub_*` but the lexical's init runs only once (perla_inc_loaded guard),
+ * so a per-TU static is empty in whichever copy the linker kept. Route every
+ * access (static or in any dlopen'd .pm.so) through one runtime slot keyed by
+ * (module, name) — the file-lexical analogue of perla_our_slot_*. */
+StradaValue **perla_filelex_slot_array(const char *mod, const char *name);
+StradaValue **perla_filelex_slot_hash(const char *mod, const char *name);
 StradaValue *perla_scalar_via_qname(const char *qname);
 void perla_scalar_set_via_qname(const char *qname, StradaValue *val);
 StradaValue *perla_array_via_qname(const char *qname);

@@ -74,6 +74,7 @@ func generate(scalar $ast) str {
     c_var_set_collide($cg{"our_collide"});
     Perla::CodeGen::Collect::collect_file_scope_vars(\%cg, $ast);
     c_var_set_filelex($cg{"filelex_collide"});
+    c_var_set_filelex_ctx($cg{"filelex_ctx"});
     _perla_reset_mangle_collisions();
     _collect_sigil_collisions(\%cg, $ast);
     _perla_snapshot_file_collisions();
@@ -1269,6 +1270,7 @@ func generate_module(scalar $ast, str $mod_name) str {
     c_var_set_collide($cg{"our_collide"});
     Perla::CodeGen::Collect::collect_file_scope_vars(\%cg, $ast);
     c_var_set_filelex($cg{"filelex_collide"});
+    c_var_set_filelex_ctx($cg{"filelex_ctx"});
     _perla_reset_mangle_collisions();
     _collect_sigil_collisions(\%cg, $ast);
     _perla_snapshot_file_collisions();
@@ -8406,6 +8408,12 @@ func c_var_h(str $name) str {
     if ($name eq "INC") {
         return "v_INC__h";
     }
+    # Inlined-module file-scope hash → shared runtime slot (cross-TU
+    # duplicate-symbol fix). See perla_filelex_slot_hash.
+    my str $__im_h = _cvar_cur_imod();
+    if (_is_filelex_in_ctx($name, $__im_h) == 1) {
+        return "(*perla_filelex_slot_hash(\"" . Perla::CodeGen::Escape::escape_c_str($__im_h) . "\", \"" . Perla::CodeGen::Escape::escape_c_str($name) . "\"))";
+    }
     return c_var($name);
 }
 
@@ -8437,6 +8445,37 @@ func c_var_set_filelex(scalar $collide) void {
             $__fi++;
         }
     }
+}
+
+# name -> (hashref of module contexts that declared it as a file-scope `my`).
+# Populated from cg->{"filelex_ctx"} (Collect::_record_filelex_ctx). Used to
+# route an inlined module's file-scope hash/array lexicals through a shared
+# runtime slot (perla_filelex_slot_*) instead of a per-TU static — the
+# cross-TU duplicate-symbol fix.
+my hash %__perla_filelex_ctx = ();
+
+func c_var_set_filelex_ctx(scalar $ctx) void {
+    %__perla_filelex_ctx = ();
+    if (defined($ctx)) {
+        my array @__fcn = keys($ctx);
+        my int $__fci = 0;
+        while ($__fci < scalar(@__fcn)) {
+            my str $__nm = "" . $__fcn[$__fci];
+            $__perla_filelex_ctx{$__nm} = $ctx->{$__nm};
+            $__fci++;
+        }
+    }
+}
+
+# True iff `$name` is a file-scope `my` declared in inlined-module context
+# `$imod` (so its hash/array access should go through the shared runtime slot).
+func _is_filelex_in_ctx(str $name, str $imod) int {
+    if (length($imod) == 0) { return 0; }
+    if (!exists($__perla_filelex_ctx{$name})) { return 0; }
+    my scalar $ctxs = $__perla_filelex_ctx{$name};
+    if (!defined($ctxs)) { return 0; }
+    if (exists($ctxs->{$imod})) { return 1; }
+    return 0;
 }
 
 func c_var_push_imod(str $m) void { push(@__perla_imod_stack, $m); }
@@ -8478,6 +8517,12 @@ func c_var_a(str $name) str {
     }
     if (exists($__perla_mangle_collisions{$name})) {
         return "v_" . safe_ident($name) . "__a";
+    }
+    # Inlined-module file-scope array → shared runtime slot (cross-TU
+    # duplicate-symbol fix). See perla_filelex_slot_array.
+    my str $__im_a = _cvar_cur_imod();
+    if (_is_filelex_in_ctx($name, $__im_a) == 1) {
+        return "(*perla_filelex_slot_array(\"" . Perla::CodeGen::Escape::escape_c_str($__im_a) . "\", \"" . Perla::CodeGen::Escape::escape_c_str($name) . "\"))";
     }
     return c_var($name);
 }
