@@ -24440,6 +24440,63 @@ static StradaValue *perla_mr_module_notional_filename(StradaValue *args) {
     return r;
 }
 
+/* TLS-regime of the running main binary, fixed at compile time. A NO_TLS main
+ * (built -DSTRADA_NO_TLS, e.g. the tcc path or a NO_TLS-artifact gcc link)
+ * exports the shared runtime globals (strada_try_depth, strada_exception_value,
+ * …) as plain globals; a TLS main exports them as __thread. A .pm.so built for
+ * the OTHER regime, dlopen'd here, binds those references to a bogus address
+ * (a TLS offset interpreted as absolute, landing in read-only .rodata) and
+ * faults on the first write — e.g. `strada_try_depth--` at the close of a
+ * try/eval scope during module init. So a cached .pm.so whose regime differs
+ * from this main's must be rejected and recompiled. */
+#ifdef STRADA_NO_TLS
+#define PERLA_MAIN_NO_TLS 1
+#else
+#define PERLA_MAIN_NO_TLS 0
+#endif
+
+/* Regime of a built .pm.so, recorded in a `<so>.tlsmode` sidecar ("notls"/"tls")
+ * by the module-build path. Returns 1=NO_TLS, 0=TLS, -1=unknown. For a legacy
+ * .so with no marker, probe its dynamic relocations for strada_try_depth (a TLS
+ * reloc ⇒ TLS regime) and cache the verdict by writing the marker. */
+static int perla_so_tls_regime(const char *so_path) {
+    char marker[2300];
+    snprintf(marker, sizeof(marker), "%s.tlsmode", so_path);
+    FILE *m = fopen(marker, "r");
+    if (m) {
+        int c = fgetc(m);
+        fclose(m);
+        if (c == 'n') return 1;   /* "notls" */
+        if (c == 't') return 0;   /* "tls"   */
+        return -1;
+    }
+    /* Legacy artifact: probe the ELF and memoize. */
+    char cmd[2400];
+    snprintf(cmd, sizeof(cmd),
+             "readelf -rW '%s' 2>/dev/null | grep -m1 strada_try_depth", so_path);
+    FILE *p = popen(cmd, "r");
+    if (!p) return -1;
+    char line[1024];
+    line[0] = 0;
+    if (!fgets(line, sizeof(line), p)) { pclose(p); return -1; }
+    pclose(p);
+    int regime = -1;
+    if (line[0]) {
+        /* TLS relocs name TPOFF/DTPMOD/DTPOFF/TLSGD/TLSLD; a plain (NO_TLS)
+         * extern reference uses GLOB_DAT. */
+        if (strstr(line, "TPOFF") || strstr(line, "DTPMOD") ||
+            strstr(line, "DTPOFF") || strstr(line, "TLSGD") || strstr(line, "TLSLD"))
+            regime = 0;          /* TLS */
+        else if (strstr(line, "GLOB_DAT"))
+            regime = 1;          /* NO_TLS */
+    }
+    if (regime >= 0) {
+        FILE *w = fopen(marker, "w");
+        if (w) { fputs(regime ? "notls" : "tls", w); fclose(w); }
+    }
+    return regime;
+}
+
 StradaValue *perla_require_module(StradaValue *module_sv) {
     if (!module_sv || STRADA_IS_TAGGED_INT(module_sv)) return strada_new_undef();
 
@@ -24851,6 +24908,22 @@ StradaValue *perla_require_module(StradaValue *module_sv) {
                     if (perla_debug_mode()) {
                         fprintf(stderr, "[require] %s older than perla, recompiling\n", so_path);
                     }
+                }
+            }
+        }
+        /* TLS-regime consistency: a .pm.so built for the other regime would
+         * fault on the shared runtime globals when dlopen'd here (see
+         * perla_so_tls_regime). Reject it so the recompile path below rebuilds
+         * one matching this main. -1 (unknown) is treated as compatible to
+         * avoid spurious rebuilds when readelf is unavailable. */
+        if (!stale) {
+            int so_regime = perla_so_tls_regime(so_path);
+            if (so_regime >= 0 && so_regime != PERLA_MAIN_NO_TLS) {
+                stale = 1;
+                if (perla_debug_mode()) {
+                    fprintf(stderr, "[require] %s TLS-regime mismatch (so=%s main=%s), recompiling\n",
+                            so_path, so_regime ? "notls" : "tls",
+                            PERLA_MAIN_NO_TLS ? "notls" : "tls");
                 }
             }
         }
