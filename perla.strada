@@ -2380,19 +2380,6 @@ func main() int {
             if (length($gcc_out_so) > 0) {
                 say(STDERR, $gcc_out_so);
             }
-            # Stamp the .pm.so with its TLS regime so the runtime require path
-            # (perla_so_tls_regime in perla_stash.c) can reject a .pm.so built
-            # for the other regime — a NO_TLS .so dlopen'd into a TLS main (or
-            # vice versa) faults writing the shared runtime globals. NO_TLS iff
-            # the .so compile saw -DSTRADA_NO_TLS (via $inc_flags from
-            # PERLA_MODULE_NO_TLS, or $so_extra under tcc).
-            if (core::file_exists($so_file) == 1) {
-                my str $tlsmode = "tls";
-                if (index($inc_flags, "STRADA_NO_TLS") >= 0 || index($so_extra, "STRADA_NO_TLS") >= 0) {
-                    $tlsmode = "notls";
-                }
-                core::spew($so_file . ".tlsmode", $tlsmode);
-            }
         }
 
         # Clean up C file (kept under --keep or PERLA_DEBUG for post-

@@ -24455,25 +24455,37 @@ static StradaValue *perla_mr_module_notional_filename(StradaValue *args) {
 #define PERLA_MAIN_NO_TLS 0
 #endif
 
-/* Regime of a built .pm.so, recorded in a `<so>.tlsmode` sidecar ("notls"/"tls")
- * by the module-build path. Returns 1=NO_TLS, 0=TLS, -1=unknown. For a legacy
- * .so with no marker, probe its dynamic relocations for strada_try_depth (a TLS
- * reloc ⇒ TLS regime) and cache the verdict by writing the marker. */
+/* Regime of a built .pm.so: 1=NO_TLS, 0=TLS, -1=unknown. The .so's own dynamic
+ * relocations for strada_try_depth are the GROUND TRUTH — a TLS reloc
+ * (DTPMOD/DTPOFF/TPOFF/TLSGD/TLSLD) ⇒ TLS, a plain GLOB_DAT ⇒ NO_TLS. The
+ * verdict is cached in a `<so>.tlsmode` sidecar keyed on the .so's mtime+size,
+ * so a steady-state warm load pays only a stat + tiny read, and the cache
+ * self-invalidates whenever the .so is rebuilt (a marker can never desync from
+ * the file it describes — relying on a plain regime tag let a stale marker
+ * mis-classify a rebuilt .so and load it into the wrong-regime main). */
 static int perla_so_tls_regime(const char *so_path) {
+    struct stat sst;
+    if (stat(so_path, &sst) != 0) return -1;
     char marker[2300];
     snprintf(marker, sizeof(marker), "%s.tlsmode", so_path);
+    /* Fast path: cached verdict still valid for this exact .so (mtime+size). */
     FILE *m = fopen(marker, "r");
     if (m) {
-        int c = fgetc(m);
+        char rc = 0;
+        long mt = 0, sz = 0;
+        int n = fscanf(m, " %c %ld %ld", &rc, &mt, &sz);
         fclose(m);
-        if (c == 'n') return 1;   /* "notls" */
-        if (c == 't') return 0;   /* "tls"   */
-        return -1;
+        if (n == 3 && mt == (long)sst.st_mtime && sz == (long)sst.st_size) {
+            if (rc == 'n') return 1;
+            if (rc == 't') return 0;
+        }
     }
-    /* Legacy artifact: probe the ELF and memoize. */
+    /* Probe the ELF (shell-quote the path, M2) and refresh the cache. */
+    char soq[2300];
+    perla_shq(so_path, soq, sizeof(soq));
     char cmd[2400];
     snprintf(cmd, sizeof(cmd),
-             "readelf -rW '%s' 2>/dev/null | grep -m1 strada_try_depth", so_path);
+             "readelf -rW %s 2>/dev/null | grep -m1 strada_try_depth", soq);
     FILE *p = popen(cmd, "r");
     if (!p) return -1;
     char line[1024];
@@ -24482,8 +24494,6 @@ static int perla_so_tls_regime(const char *so_path) {
     pclose(p);
     int regime = -1;
     if (line[0]) {
-        /* TLS relocs name TPOFF/DTPMOD/DTPOFF/TLSGD/TLSLD; a plain (NO_TLS)
-         * extern reference uses GLOB_DAT. */
         if (strstr(line, "TPOFF") || strstr(line, "DTPMOD") ||
             strstr(line, "DTPOFF") || strstr(line, "TLSGD") || strstr(line, "TLSLD"))
             regime = 0;          /* TLS */
@@ -24492,7 +24502,11 @@ static int perla_so_tls_regime(const char *so_path) {
     }
     if (regime >= 0) {
         FILE *w = fopen(marker, "w");
-        if (w) { fputs(regime ? "notls" : "tls", w); fclose(w); }
+        if (w) {
+            fprintf(w, "%c %ld %ld\n", regime ? 'n' : 't',
+                    (long)sst.st_mtime, (long)sst.st_size);
+            fclose(w);
+        }
     }
     return regime;
 }
