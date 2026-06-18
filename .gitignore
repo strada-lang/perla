@@ -17,6 +17,10 @@ CLAUDE.md
 *.a
 *.so
 
+# Strada export-metadata sidecars (no longer emitted by current strada -M,
+# which embeds the metadata in .rodata; keep stale ones out of the repo)
+*.smeta
+
 # Generated C / XS intermediates
 *.c.xs.c
 *.xs.c
