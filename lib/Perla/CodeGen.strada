@@ -1612,6 +1612,18 @@ func generate_module(scalar $ast, str $mod_name) str {
     }
 
     # Generate top-level statements (module-level code: package, our, has, @ISA, etc.)
+    # Wrap in an %INC run-once guard so a module whose top-level ALREADY ran in
+    # another translation unit does not re-run here. A statically-linked primary
+    # .pm.o previously ran its top-level unconditionally (it only set is_inlined,
+    # never %INC), while INLINED copies guard their top-level on perla_inc_loaded
+    # and mark %INC at pragma_restore — so the primary and the inlined copies
+    # didn't coordinate. For an immutable type library (Types::Standard) that
+    # meant add_type re-ran across copies -> "Type Any already exists in this
+    # library". Guarding the primary's top-level on the same %INC flag (and
+    # marking it at the end) makes every copy run-once, in any order. Sub
+    # registration above stays unconditional — dispatch needs it regardless.
+    my str $__mod_inc = Perla::CodeGen::Escape::escape_c_str($mod_name);
+    emit(\%cg, "    if (!perla_inc_loaded(\"" . $__mod_inc . "\")) {\n");
     my scalar $stmts = $ast->{"stmts"};
     my int $i = 0;
     while ($i < scalar(@{$stmts})) {
@@ -1622,6 +1634,7 @@ func generate_module(scalar $ast, str $mod_name) str {
         }
         $i++;
     }
+    emit(\%cg, "    perla_mark_loaded(\"" . $__mod_inc . "\"); }\n");
 
     # End-of-init sync hook marker. Replaced in post-processing with
     # sync code for each file-scope `v_X` that's NOT declared `our` in
