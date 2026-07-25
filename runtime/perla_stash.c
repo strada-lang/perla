@@ -15144,6 +15144,39 @@ StradaValue *perla_eval_string(StradaValue *code_sv, const char *current_pkg) {
     }
     if (perla_debug_mode() && cache_hit)
         fprintf(stderr, "[eval] cache HIT %s\n", cache_so);
+    /* Negative cache: a fresh .fail sidecar means this exact eval already
+     * FAILED to compile under this perla — replay the recorded $@ without
+     * re-forking `perla -M` + gcc. Real code repeats failing evals every
+     * run (YAML::Mo probes `eval "no Mo::$_"` at import; the parse failure
+     * is expected and ignored by the caller), and without this each run
+     * re-paid the full child-compile cost. Same staleness rule as the .so
+     * cache: entries older than the perla binary are ignored, so a fixed
+     * compiler retries the eval. */
+    char cache_fail[1200];
+    cache_fail[0] = '\0';
+    if (cdir) {
+        snprintf(cache_fail, sizeof(cache_fail), "%s/perla_eval_%s.fail", cdir, evtag);
+        struct stat fst, fpst;
+        if (!cache_hit && stat(cache_fail, &fst) == 0) {
+            if (g_perla_path[0] && stat(g_perla_path, &fpst) == 0 && fst.st_mtime < fpst.st_mtime) {
+                /* stale vs perla binary — retry the compile */
+            } else {
+                char fmsg[4096];
+                size_t fgot = 0;
+                FILE *ff = fopen(cache_fail, "rb");
+                if (ff) { fgot = fread(fmsg, 1, sizeof(fmsg) - 1, ff); fclose(ff); }
+                fmsg[fgot] = '\0';
+                if (perla_debug_mode())
+                    fprintf(stderr, "[eval] fail-cache HIT %s\n", cache_fail);
+                extern StradaValue *perla_eval_error;
+                if (perla_eval_error) strada_decref(perla_eval_error);
+                perla_eval_error = strada_new_str(fgot ? fmsg : "eval: compilation failed");
+                strada_incref(perla_eval_error);
+                free(code);
+                return strada_new_undef();
+            }
+        }
+    }
     if (cache_hit) goto eval_dlopen;
 
     /* Write the eval code to a temp .pm file */
@@ -15395,6 +15428,23 @@ StradaValue *perla_eval_string(StradaValue *code_sv, const char *current_pkg) {
             if (perla_eval_error) strada_decref(perla_eval_error);
             perla_eval_error = strada_new_str(strip[0] ? strip : "eval: compilation failed");
             strada_incref(perla_eval_error);
+            /* Negative-cache the failure so later runs replay $@ instantly
+             * (atomic tmp+rename, best-effort — a store miss just re-pays
+             * the compile next run). */
+            if (cdir && cache_fail[0]) {
+                char ftmp[1240];
+                snprintf(ftmp, sizeof(ftmp), "%s.tmp.%d", cache_fail, (int)getpid());
+                FILE *ff = fopen(ftmp, "wb");
+                if (ff) {
+                    const char *fm = strip[0] ? strip : "eval: compilation failed";
+                    size_t fl = strlen(fm);
+                    int ok = fwrite(fm, 1, fl, ff) == fl;
+                    if (fclose(ff) != 0) ok = 0;
+                    if (!ok || rename(ftmp, cache_fail) != 0) unlink(ftmp);
+                    else if (perla_debug_mode())
+                        fprintf(stderr, "[eval] fail-cache STORE %s\n", cache_fail);
+                }
+            }
             unlink(pm_path);
             free(code);
             return strada_new_undef();
@@ -15408,6 +15458,9 @@ StradaValue *perla_eval_string(StradaValue *code_sv, const char *current_pkg) {
             if (perla_debug_mode()) fprintf(stderr, "[eval] cache STORE %s\n", cache_so);
         }
     }
+    /* A successful compile supersedes any recorded failure (e.g. an older
+     * perla couldn't parse this eval; this one can). */
+    if (cdir && cache_fail[0]) unlink(cache_fail);
 
 eval_dlopen:
     free(code);
