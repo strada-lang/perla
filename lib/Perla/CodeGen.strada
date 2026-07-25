@@ -2616,17 +2616,25 @@ func expr_is_borrowed(scalar $node) int {
     if ($t == Perla::AST::N_DEREF_ARRAY()) { return 1; }
     if ($t == Perla::AST::N_DEREF_HASH()) { return 1; }
     if ($t == Perla::AST::N_DEREF_SCALAR()) { return 1; }
-    # Assignment returns the RHS value as the expression result. If
-    # the RHS is itself borrowed (a sub-local `my` scalar), then the
-    # whole assignment is borrowed. Without this, `sub { my $v = $_[1];
-    # $h{$_[0]} = $v; }` as a closure's implicit-return-last-expr
-    # path skipped the incref of __ret_val — the subsequent sub-local
-    # decref of $v made the caller's received pointer dangle, and the
-    # hash slot's value (which strada_hash_set incref'd from the same
-    # storage) read 0 on subsequent fetches because the underlying
-    # value had been pool-recycled.
-    if ($t == Perla::AST::N_ASSIGN() && defined($node->{"value"})) {
-        return expr_is_borrowed($node->{"value"});
+    # An assignment EXPRESSION's value is owned by its TARGET after the
+    # store — the emission transfers/releases the RHS temp's ownership
+    # into the slot (hv_store increfs; the owned temp is then decref'd),
+    # so what the expression yields is a borrowed view of the stored
+    # value regardless of whether the RHS was borrowed (a `my` scalar)
+    # or owned (a call result). Always borrowed.
+    #
+    # Recursing into the RHS (the previous behavior) got the borrowed-RHS
+    # closure case right (`sub { my $v = $_[1]; $h{$_[0]} = $v; }`) but
+    # returned "owned" for an owned RHS: `$$dmb{'data'}{'now'}{'systz'} =
+    # $self->_zone($currzone);` as Date::Manip::TZ::_set_curr_zone's
+    # implicit-return last expression skipped the incref, the value
+    # propagated up through _init_final to Obj::new whose void-statement
+    # cleanup decref'd it — stealing the hash slot's reference. The slot's
+    # StradaString was pool-recycled by the next hash-key alloc ("systz"),
+    # so the system timezone read back as garbage and Date::Manip fell to
+    # its GMT fallback on every boot.
+    if ($t == Perla::AST::N_ASSIGN()) {
+        return 1;
     }
     # bless($x, "C") returns its first argument unchanged (perla_bless does not
     # incref — same in-place semantics as strada_bless). The bless result's
