@@ -6824,15 +6824,50 @@ func gen_expr(scalar $cg, scalar $node) void {
 
     # Fallback
     # Anonymous sub: sub { ... }
-    if ($type == Perla::AST::N_SUB() && !defined($node->{"name"})) {
-        $cg->{"tmp_count"} = $cg->{"tmp_count"} + 1;
-        my str $anon_name = "__perla_anon_" . $cg->{"tmp_count"};
-        $node->{"name"} = $anon_name;
-        $node->{"package"} = $cg->{"pkg"};
-        my str $fname = sub_cname_q($cg->{"pkg"} . "::" . $anon_name);
+    #
+    # RE-EMISSION: some emitters legitimately generate the same AST
+    # subtree twice into mutually-exclusive runtime branches (the hash
+    # reassignment's tied/untied split, for one). The first pass names
+    # the node (__perla_anon_N) — previously the second pass no longer
+    # matched `!defined name`, fell through to the "TODO: node type 2"
+    # undef fallback, and the closure silently became undef in the
+    # second branch. YAML::Mo's import built its %e feature table
+    # through exactly that shape, so `has`/`extends` installed as empty
+    # globs and every Mo-based class (YAML!) lost its accessors. Allow
+    # re-entry for already-named anon nodes: reuse the recorded
+    # name/package/captures, re-emit only the closure-construction
+    # expression, and skip the anon_subs body registration (the body is
+    # emitted once).
+    my int $__anon_reemit = 0;
+    if ($type == Perla::AST::N_SUB() && defined($node->{"name"})
+        && length("" . $node->{"name"}) > 13
+        && substr("" . $node->{"name"}, 0, 13) eq "__perla_anon_"
+        && defined($node->{"package"})) {
+        $__anon_reemit = 1;
+    }
+    if ($type == Perla::AST::N_SUB() && (!defined($node->{"name"}) || $__anon_reemit == 1)) {
+        my str $anon_name = "";
+        if ($__anon_reemit == 1) {
+            $anon_name = "" . $node->{"name"};
+        } else {
+            $cg->{"tmp_count"} = $cg->{"tmp_count"} + 1;
+            $anon_name = "__perla_anon_" . $cg->{"tmp_count"};
+            $node->{"name"} = $anon_name;
+            $node->{"package"} = $cg->{"pkg"};
+        }
+        my str $fname = sub_cname_q($node->{"package"} . "::" . $anon_name);
 
-        # Scan body for free variables (outer captures)
-        my scalar $captures = Perla::CodeGen::FreeVars::find_free_vars($cg, $node);
+        # Scan body for free variables (outer captures). On re-emission
+        # REUSE the node's recorded capture list (it already includes the
+        # appended state-var pad slots, and its ORDER is what the emitted
+        # body's #define capture mapping was built against).
+        my scalar $captures;
+        if ($__anon_reemit == 1) {
+            if (defined($node->{"captures"})) { $captures = $node->{"captures"}; }
+            else { $captures = []; }
+        } else {
+            $captures = Perla::CodeGen::FreeVars::find_free_vars($cg, $node);
+        }
         # Scan body for `state $X` declarations. Each anon sub instance
         # gets per-closure pad slots for these (mirrors perl's CV pad).
         # State vars are appended to the captures list with a synthetic
@@ -6840,32 +6875,46 @@ func gen_expr(scalar $cg, scalar $node) void {
         # (*captures[K])`) treats them like outer captures — but they
         # don't come from outer scope, they're allocated fresh per
         # closure instance and start NULL.
-        my array @state_vars = Perla::CodeGen::FreeVars::find_state_vars($node);
-        my int $nstate = scalar(@state_vars);
-        # Bypass per-closure state allocation when this anon sub is
-        # being emitted as a SHARED function body (e.g. named sub
-        # promoted via gen_sub_def). The static fallback is correct in
-        # those cases since there's only one body, not many closures.
-        # Detect by absence of $cg->{"anon_subs"} push later (no shape
-        # difference for now; just always allocate for anon).
-        # Mark state vars on the node for body codegen.
-        $node->{"state_vars"} = \@state_vars;
-        # Push state-var names to captures so the body's #define maps
-        # v_NAME to *captures[K]. Use the bare name; collision with a
-        # same-name outer free var is impossible because state vars
-        # are sub-local and scan_declared already marks them as
-        # declared (so they don't appear as free vars).
-        my int $svi = 0;
-        while ($svi < $nstate) {
-            push(@{$captures}, $state_vars[$svi]);
-            $svi = $svi + 1;
+        my int $nstate = 0;
+        if ($__anon_reemit == 1) {
+            # State-var pad slots were already appended to the node's
+            # capture list at first emission; just recover the count for
+            # $state_start below. Re-scanning + re-appending would
+            # duplicate the slots and desync the body's capture mapping.
+            if (defined($node->{"state_vars"})) {
+                $nstate = scalar(@{$node->{"state_vars"}});
+            }
+        } else {
+            my array @state_vars = Perla::CodeGen::FreeVars::find_state_vars($node);
+            $nstate = scalar(@state_vars);
+            # Bypass per-closure state allocation when this anon sub is
+            # being emitted as a SHARED function body (e.g. named sub
+            # promoted via gen_sub_def). The static fallback is correct in
+            # those cases since there's only one body, not many closures.
+            # Detect by absence of $cg->{"anon_subs"} push later (no shape
+            # difference for now; just always allocate for anon).
+            # Mark state vars on the node for body codegen.
+            $node->{"state_vars"} = \@state_vars;
+            # Push state-var names to captures so the body's #define maps
+            # v_NAME to *captures[K]. Use the bare name; collision with a
+            # same-name outer free var is impossible because state vars
+            # are sub-local and scan_declared already marks them as
+            # declared (so they don't appear as free vars).
+            my int $svi = 0;
+            while ($svi < $nstate) {
+                push(@{$captures}, $state_vars[$svi]);
+                $svi = $svi + 1;
+            }
         }
         my int $ncaps = scalar(@{$captures});
 
         if ($ncaps > 0) {
-            # Store capture info on the node for gen_sub_def
-            $node->{"captures"} = $captures;
-            push(@{$cg->{"anon_subs"}}, $node);
+            # Store capture info on the node for gen_sub_def (first
+            # emission only — the body is registered/emitted once).
+            if ($__anon_reemit == 0) {
+                $node->{"captures"} = $captures;
+                push(@{$cg->{"anon_subs"}}, $node);
+            }
             # Build closure struct manually — captures are shared mutable cells
             # Track shared cells: if a variable was already captured in this scope,
             # reuse the same cell (enables two closures to share a mutable variable)
@@ -7167,7 +7216,9 @@ func gen_expr(scalar $cg, scalar $node) void {
             }
             emit($cg, "__csv; })");
         } else {
-            push(@{$cg->{"anon_subs"}}, $node);
+            if ($__anon_reemit == 0) {
+                push(@{$cg->{"anon_subs"}}, $node);
+            }
             # When the anon sub has a declared prototype (`sub ($) {...}`
             # or `sub () {...}`), wrap it as a STRADA_CLOSURE with a
             # zero-capture cl struct so the prototype string can be
