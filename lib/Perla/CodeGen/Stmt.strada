@@ -3889,9 +3889,28 @@ func _gen_if(scalar $cg, scalar $node) void {
     }
     gen_block_stmts($cg, $node->{$body_key});
     $cg->{"sub_local_scalars"} = $__if_t_sls_saved;
+    # Vars in @__if_then_locals get the guarded decref+NULL below —
+    # emitting the hoist decref for them TOO double-decref'd every
+    # if-scoped `my` scalar. Invisible for rc=1 temps (the second decref
+    # hits the freed-poison marker), but a shared value lost someone
+    # else's reference: File::Basename's `if (@_) { my $new_type =
+    # shift; ... }` (called as fileparse_set_fstype($^O) at module init)
+    # released the LAST ref of the process-wide $^O SV — its pooled
+    # buffer got recycled by the 'MacOS' literal in File::HomeDir's
+    # driver chain, so $^O read "MacOS" on Linux, File::HomeDir loaded
+    # the MacOS9 driver, and Date::Manip picked the no-file-methods OS
+    # profile (TZ detection dead, GMT fallback, 5x re-init per boot).
+    my hash %__iftl_covered = ();
+    my int $__iftl_ci = 0;
+    while ($__iftl_ci < scalar(@__if_then_locals)) {
+        $__iftl_covered{Perla::CodeGen::c_var($__if_then_locals[$__iftl_ci])} = 1;
+        $__iftl_ci = $__iftl_ci + 1;
+    }
     my int $__if_hi = 0;
     while ($__if_hi < scalar(@{$__if_this_hoisted})) {
-        Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "strada_decref(" . $__if_this_hoisted->[$__if_hi] . ");\n");
+        if (!defined($__iftl_covered{$__if_this_hoisted->[$__if_hi]})) {
+            Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "strada_decref(" . $__if_this_hoisted->[$__if_hi] . ");\n");
+        }
         $__if_hi = $__if_hi + 1;
     }
     # Emit decref+NULL for collected then-body my-decls at branch end
@@ -4020,9 +4039,21 @@ func _gen_if(scalar $cg, scalar $node) void {
         }
         gen_block_stmts($cg, $node->{"else"});
         $cg->{"sub_local_scalars"} = $__if_e_sls_saved;
+        # Same double-decref guard as the then-branch: vars covered by the
+        # guarded else-locals cleanup below must not also get the hoist
+        # decref (see the then-branch comment for the $^O corruption this
+        # caused).
+        my hash %__ifel_covered = ();
+        my int $__ifel_ci = 0;
+        while ($__ifel_ci < scalar(@__if_else_locals)) {
+            $__ifel_covered{Perla::CodeGen::c_var($__if_else_locals[$__ifel_ci])} = 1;
+            $__ifel_ci = $__ifel_ci + 1;
+        }
         my int $__if_e_hi = 0;
         while ($__if_e_hi < scalar(@{$__if_e_this_hoisted})) {
-            Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "strada_decref(" . $__if_e_this_hoisted->[$__if_e_hi] . ");\n");
+            if (!defined($__ifel_covered{$__if_e_this_hoisted->[$__if_e_hi]})) {
+                Perla::CodeGen::ind($cg); Perla::CodeGen::emit($cg, "strada_decref(" . $__if_e_this_hoisted->[$__if_e_hi] . ");\n");
+            }
             $__if_e_hi = $__if_e_hi + 1;
         }
         # Emit decref+NULL for else-body my-decls.
