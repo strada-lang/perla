@@ -4229,6 +4229,39 @@ __thread const char *perla_pending_package_override = NULL;
  * the rest of the Sub::Util machinery. */
 static const char *perla_subname_lookup(StradaValue *sv);
 
+/* ===== Symbol-name → function-pointer memo =====
+ * Module inits register subs as STRINGS ("perla_sub_Pkg_name"); every
+ * dynamic dispatch through such a slot paid dlsym(RTLD_DEFAULT) — which
+ * walks the symbol table of EVERY loaded object. With a big app's ~500
+ * dlopened .pm.so that dominated dynamic dispatch. Positive resolutions
+ * are stable (RTLD_DEFAULT returns the first match in load order, later
+ * dlopens can't override an existing resolution, and perla never
+ * dlcloses module handles), so memoize them; negative results are never
+ * cached — a later dlopen may legitimately provide the symbol. */
+#define PERLA_FNCACHE_SIZE 2048
+typedef struct { char name[160]; void *fptr; } PerlaFnCacheEnt;
+static PerlaFnCacheEnt perla_fncache[PERLA_FNCACHE_SIZE];
+
+static inline unsigned int perla_fncache_slot(const char *name) {
+    unsigned int h = 5381;
+    for (const char *p = name; *p; p++) h = ((h << 5) + h) ^ (unsigned char)*p;
+    return h & (PERLA_FNCACHE_SIZE - 1);
+}
+
+static inline void *perla_fncache_get(const char *name) {
+    PerlaFnCacheEnt *e = &perla_fncache[perla_fncache_slot(name)];
+    if (e->fptr && strcmp(e->name, name) == 0) return e->fptr;
+    return NULL;
+}
+
+static void perla_fncache_put(const char *name, void *fptr) {
+    if (!name || !fptr) return;
+    if (strlen(name) >= sizeof(((PerlaFnCacheEnt*)0)->name)) return;
+    PerlaFnCacheEnt *e = &perla_fncache[perla_fncache_slot(name)];
+    strcpy(e->name, name);
+    e->fptr = fptr;
+}
+
 StradaValue *perla_call_code(StradaValue *code_val, StradaValue *args) {
     if (!code_val) return strada_new_undef();
     if (STRADA_IS_TAGGED_INT(code_val)) return strada_new_undef();
@@ -4290,6 +4323,15 @@ StradaValue *perla_call_code(StradaValue *code_val, StradaValue *args) {
 
     /* String — check for Moose accessor marker or look up function by name */
     if (code_val->type == STRADA_STR) {
+        /* Memoized fast path — only dlsym-resolved plain symbols ever land
+         * in the cache, so marker strings (__class_data__*, accessor
+         * markers, Pkg::sub fallbacks) can never falsely hit here. */
+        if (code_val->value.pv) {
+            void *__memo_fp = perla_fncache_get(code_val->value.pv);
+            if (__memo_fp) {
+                return ((StradaValue*(*)(StradaValue*))__memo_fp)(args);
+            }
+        }
         char *fn_name = strada_to_str(code_val);
 
         /* Class-data accessor: __class_data__<name> — installed by
@@ -4807,6 +4849,7 @@ StradaValue *perla_call_code(StradaValue *code_val, StradaValue *args) {
          * no-match fallthrough at the end of this block. */
         StradaValue *result = NULL;
         if (fptr) {
+            perla_fncache_put(fn_name, fptr);
             result = ((StradaValue*(*)(StradaValue*))fptr)(args);
             free(fn_name);
             return result;
@@ -12890,6 +12933,66 @@ static long        *g_msc_gen  = NULL;
 static StradaValue **g_msc_code = NULL;
 static const char  *g_msc_key  = NULL;   /* invocant class at wrapper entry */
 
+/* ===== Global (class, method) → code method cache =====
+ *
+ * The per-call-site monomorphic caches only help a site that keeps seeing
+ * the same class; a megamorphic site (Moose accessors dispatched through
+ * shared plumbing) re-paid the full dispatch prelude (iossl check,
+ * next::method strcmps, a strstr scan of the method name, the DBI
+ * class-gate chain) plus perla_method_resolve's MRO walk on every call.
+ * This is perl's stash-method-cache idea flattened into one direct-mapped
+ * table: key (invocant class, method), value the resolved code SV, guarded
+ * by perla_code_override_gen exactly like the site caches (any
+ * perla_code_set bump lazily invalidates every entry; a stale entry's
+ * code pointer is never dereferenced before its gen check).
+ *
+ * Entries are inserted ONLY at the plain-resolution success sites, and
+ * only when the resolving package still equals the original invocant
+ * class (msc_key) and the method name has no "::" — so SUPER::/qualified/
+ * next::method dispatches (whose resolution is caller-relative) and every
+ * special-cased route (DBI intercepts, AUTOLOAD, MOP fastpaths) can never
+ * be short-circuited wrongly: they were never cached. IO::Socket::SSL is
+ * excluded wholesale — its dispatch is per-OBJECT (live SSL state), not
+ * per-class. Unsynchronized like the site caches (single-threaded
+ * dispatch is the perla model today). */
+#define PERLA_MCACHE_SIZE 4096
+typedef struct {
+    char cls[96];
+    char meth[64];
+    StradaValue *code;
+    long gen;
+} PerlaMCacheEnt;
+static PerlaMCacheEnt perla_mcache[PERLA_MCACHE_SIZE];
+
+static inline unsigned int perla_mcache_slot(const char *cls, const char *meth) {
+    unsigned int h = 5381;
+    for (const char *p = cls; *p; p++) h = ((h << 5) + h) ^ (unsigned char)*p;
+    h = ((h << 5) + h) ^ 0xff;
+    for (const char *p = meth; *p; p++) h = ((h << 5) + h) ^ (unsigned char)*p;
+    return h & (PERLA_MCACHE_SIZE - 1);
+}
+
+static inline StradaValue *perla_mcache_get(const char *cls, const char *meth) {
+    PerlaMCacheEnt *e = &perla_mcache[perla_mcache_slot(cls, meth)];
+    if (e->code && e->gen == perla_code_override_gen
+        && strcmp(e->cls, cls) == 0 && strcmp(e->meth, meth) == 0)
+        return e->code;
+    return NULL;
+}
+
+static void perla_mcache_put(const char *cls, const char *meth, StradaValue *code) {
+    if (!cls || !meth || !code) return;
+    if (strlen(cls) >= sizeof(((PerlaMCacheEnt*)0)->cls)) return;
+    if (strlen(meth) >= sizeof(((PerlaMCacheEnt*)0)->meth)) return;
+    if (strstr(meth, "::")) return;
+    if (strcmp(cls, "IO::Socket::SSL") == 0) return;
+    PerlaMCacheEnt *e = &perla_mcache[perla_mcache_slot(cls, meth)];
+    strcpy(e->cls, cls);
+    strcpy(e->meth, meth);
+    e->code = code;
+    e->gen = perla_code_override_gen;
+}
+
 StradaValue *perla_method_dispatch_cached(StradaValue *obj, const char *method, StradaValue *args,
                                           char **cs_pkg, long *cs_gen, StradaValue **cs_code) {
     const char *key = NULL;
@@ -12963,6 +13066,34 @@ StradaValue *perla_method_dispatch(StradaValue *obj, const char *method, StradaV
         char *os = strada_to_str(obj);
         fprintf(stderr, "[dispatch] %s->%s (blessed=%s)\n", os, method, bp ? bp : "(none)");
         free(os);
+    }
+
+    /* Global (class, method) cache probe — a hit skips the whole
+     * special-case prelude below AND perla_method_resolve. Only plain
+     * full-MRO resolutions ever land in this cache (see the insert
+     * sites), so anything special-cased below misses here and takes its
+     * normal route. Warm the per-call-site slots on a hit so the even
+     * cheaper site cache takes over next time. */
+    const char *__mc_orig_cls = NULL;
+    {
+        const char *__mc_cls = perla_blessed(obj);
+        if (!__mc_cls && obj && !STRADA_IS_TAGGED_INT(obj)
+            && obj->type == STRADA_STR) __mc_cls = obj->value.pv;
+        __mc_orig_cls = __mc_cls;
+        if (__mc_cls) {
+            StradaValue *__mc_code = perla_mcache_get(__mc_cls, method);
+            if (__mc_code) {
+                if (msc_code && msc_key) {
+                    if (*msc_code) strada_decref(*msc_code);
+                    *msc_code = __mc_code;
+                    strada_incref(*msc_code);
+                    if (*msc_pkg) free(*msc_pkg);
+                    *msc_pkg = strdup(msc_key);
+                    *msc_gen = perla_code_override_gen;
+                }
+                return perla_call_code(__mc_code, args);
+            }
+        }
     }
 
     /* IO::Socket::SSL (native client) — route I/O methods to the OpenSSL
@@ -13941,6 +14072,18 @@ StradaValue *perla_method_dispatch(StradaValue *obj, const char *method, StradaV
             *msc_pkg = strdup(msc_key);
             *msc_gen = perla_code_override_gen;
         }
+        /* Populate the global (class,method) cache — only when the
+         * resolving pkg is still the ORIGINAL invocant class (no SUPER::/
+         * relative rewrite in between), so the cached mapping is exactly
+         * "plain resolution from this class". Dynamic-name dispatch
+         * ($obj->$m()) enters without site slots, so fall back to the
+         * invocant class captured at the probe. */
+        {
+            const char *__ins_cls = msc_key ? msc_key : __mc_orig_cls;
+            if (__ins_cls && pkg && strcmp(pkg, __ins_cls) == 0) {
+                perla_mcache_put(__ins_cls, method, g->slots[PERLA_SLOT_CODE]);
+            }
+        }
         if (getenv("PERLA_METHOD_DEBUG") && strcmp(method, "import") == 0) {
             StradaValue *slot = g->slots[PERLA_SLOT_CODE];
             const char *kind = "?";
@@ -13972,6 +14115,12 @@ StradaValue *perla_method_dispatch(StradaValue *obj, const char *method, StradaV
                 if (*msc_pkg) free(*msc_pkg);
                 *msc_pkg = strdup(msc_key);
                 *msc_gen = perla_code_override_gen;
+            }
+            {
+                const char *__ins_cls = msc_key ? msc_key : __mc_orig_cls;
+                if (__ins_cls && pkg && strcmp(pkg, __ins_cls) == 0) {
+                    perla_mcache_put(__ins_cls, method, __lz_g->slots[PERLA_SLOT_CODE]);
+                }
             }
             return perla_call_code(__lz_g->slots[PERLA_SLOT_CODE], args);
         }
