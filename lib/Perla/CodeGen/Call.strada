@@ -3443,6 +3443,12 @@ func _gen_call(scalar $cg, scalar $node) void {
             Perla::CodeGen::emit($cg, ", (int64_t)strada_to_num(");
             Perla::CodeGen::gen_expr($cg, $args->[1]);
             Perla::CodeGen::emit($cg, "), INT64_MAX)");
+        } else {
+            # substr with <2 args is a parse artifact (perl rejects it at
+            # compile time). Emitting NOTHING here produced invalid C
+            # (`__tp_v = ;`) that failed the whole TU's gcc — emit undef so
+            # the TU stays compilable and the miscount is visible at runtime.
+            Perla::CodeGen::emit($cg, "strada_new_undef()");
         }
         return;
     }

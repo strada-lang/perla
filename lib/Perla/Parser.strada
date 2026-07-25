@@ -6585,6 +6585,13 @@ func _parse_primary(scalar $p) scalar {
             # Amazon::S3's `pairs %{$headers}` loops (List::Util::pairs),
             # which broke the whole Abe S3/accessor chain.
             $nt eq "DEREF_HASH_START" || $nt eq "DEREF_ARRAY_START" ||
+            # `${ EXPR }` block-form scalar deref as first no-paren arg:
+            # `substr ${$def->[$idx]}, $l` (Mail::Header::delete). Without
+            # DEREF_SCALAR_START here the call parsed as 0-arg and substr's
+            # codegen emitted an EMPTY expression (`__tp_v = ;`) — the
+            # module failed to compile at every runtime require, re-paying
+            # the staged gcc attempt on each boot.
+            $nt eq "DEREF_SCALAR_START" ||
             $nt eq "DEREF_ARRAY_SIGIL" || $nt eq "DEREF_HASH_SIGIL" ||
             $nt eq "KEYS" || $nt eq "VALUES" ||
             $nt eq "SHIFT" || $nt eq "POP" || $nt eq "UNDEF" ||
