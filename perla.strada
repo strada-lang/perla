@@ -910,7 +910,15 @@ func _link_cache_key(str $c_file, str $objs, str $cc_tag) str {
     if (length(trim($objs)) > 0) {
         $cmd = $cmd . "stat -c '%n:%Y' " . $objs . " 2>/dev/null; ";
     }
-    $cmd = $cmd . "stat -c '%Y' \"$(readlink /proc/self/exe)\" 2>/dev/null; } | md5sum 2>/dev/null | cut -d' ' -f1";
+    # perla's own mtime must come from THIS process: `$(readlink
+    # /proc/self/exe)` evaluated inside the child sh stat'ed the SHELL, so
+    # perla rebuilds (new runtime archives, new codegen) never invalidated
+    # cached binaries — stale binaries kept running the OLD runtime.
+    my str $__lck_self = _self_exe();
+    if (length($__lck_self) > 0) {
+        $cmd = $cmd . "stat -c '%Y' " . _shq($__lck_self) . " 2>/dev/null; ";
+    }
+    $cmd = $cmd . "} | md5sum 2>/dev/null | cut -d' ' -f1";
     my str $k = trim(core::qx($cmd));
     # md5 hex is 32 chars; anything else (md5sum missing) → no cache key.
     if (length($k) == 32) { return $k; }
