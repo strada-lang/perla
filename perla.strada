@@ -951,9 +951,11 @@ func _compile_c(str $c_file, str $exe, str $strada_dir, str $cc, str $extra_objs
         my array @obj_list = split(" ", trim($extra_objs));
         my int $oi = 0;
         my hash %owners = ();
+        my str $all_pmo_q = "";
         while ($oi < scalar(@obj_list)) {
             my str $opath = trim($obj_list[$oi]);
             if (length($opath) > 5 && substr($opath, length($opath) - 5, 5) eq ".pm.o") {
+                $all_pmo_q = $all_pmo_q . " " . _shq($opath);
                 my str $export_path = substr($opath, 0, length($opath) - 5) . ".pm.export";
                 if (core::file_exists($export_path) == 1) {
                     my str $exports = core::slurp($export_path);
@@ -970,6 +972,31 @@ func _compile_c(str $c_file, str $exe, str $strada_dir, str $cc, str $extra_objs
             }
             $oi++;
         }
+        # One batched `nm -A` over every .pm.o instead of one spawn per
+        # object: on a ~400-module link the per-object spawns dominated
+        # the pre-link step. -A prefixes each line with the object path,
+        # so the per-object global-symbol lists rebuild from one pass.
+        my hash %obj_globals = ();
+        if (length($all_pmo_q) > 0) {
+            my str $nm_all = core::qx("nm -g -A" . $all_pmo_q . " 2>/dev/null | grep ' T perla_sub_'");
+            my array @nml = split("\n", $nm_all);
+            my int $ni = 0;
+            while ($ni < scalar(@nml)) {
+                my str $nline = $nml[$ni];
+                my int $ci = index($nline, ":");
+                my int $si = rindex($nline, " ");
+                if ($ci > 0 && $si > $ci && $si + 1 < length($nline)) {
+                    my str $nfile = substr($nline, 0, $ci);
+                    my str $nsym = substr($nline, $si + 1, length($nline) - $si - 1);
+                    if (exists($obj_globals{$nfile})) {
+                        $obj_globals{$nfile} = $obj_globals{$nfile} . "\n" . $nsym;
+                    } else {
+                        $obj_globals{$nfile} = $nsym;
+                    }
+                }
+                $ni++;
+            }
+        }
         my int $oi2 = 0;
         my str $new_extra = "";
         while ($oi2 < scalar(@obj_list)) {
@@ -977,7 +1004,8 @@ func _compile_c(str $c_file, str $exe, str $strada_dir, str $cc, str $extra_objs
             if (length($opath2) > 0) {
                 my int $is_pmo2 = (length($opath2) > 5 && substr($opath2, length($opath2) - 5, 5) eq ".pm.o");
                 if ($is_pmo2 == 1) {
-                    my str $globals2 = core::qx("nm -g " . _shq($opath2) . " 2>/dev/null | grep ' T perla_sub_' | awk '{print $3}'");
+                    my str $globals2 = "";
+                    if (exists($obj_globals{$opath2})) { $globals2 = $obj_globals{$opath2}; }
                     my array @gl2 = split("\n", $globals2);
                     my int $gi2 = 0;
                     my str $loc_list = "";
