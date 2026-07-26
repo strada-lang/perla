@@ -312,7 +312,20 @@ func _gen_method_call(scalar $cg, scalar $node) void {
                         $ci = $ci + 1;
                     }
                 }
-                if ($is_ident_shape == 1 && Perla::CodeGen::Call::_resolve_sub($cg, $bn) eq "") {
+                # Value-producing builtins are NOT class names:
+                # `shift->$local_col(@_)` (DBIx::Class::Bootstrap::Simple's
+                # relationship shim) must call shift() and dispatch on the
+                # result — the class-literal path dispatched on the string
+                # "shift" ("Can't locate object method ... via package
+                # 'shift'").
+                my int $is_value_builtin = 0;
+                if ($bn eq "shift" || $bn eq "pop" || $bn eq "wantarray"
+                    || $bn eq "caller" || $bn eq "time" || $bn eq "localtime"
+                    || $bn eq "gmtime") {
+                    $is_value_builtin = 1;
+                }
+                if ($is_ident_shape == 1 && $is_value_builtin == 0
+                    && Perla::CodeGen::Call::_resolve_sub($cg, $bn) eq "") {
                     $dyn_obj_is_bareword_class = 1;
                     $dyn_obj_class_lit = $bn;
                 }

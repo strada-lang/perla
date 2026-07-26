@@ -1647,9 +1647,20 @@ func _gen_call(scalar $cg, scalar $node) void {
                     || $tt == Perla::AST::N_HASH_SLICE()
                     || $tt == Perla::AST::N_MAP()
                     || $tt == Perla::AST::N_GREP()
-                    || $tt == Perla::AST::N_SORT()) {
+                    || $tt == Perla::AST::N_SORT()
+                    || $tt == Perla::AST::N_TERNARY()) {
                     $all_simple = 0;
                     last;
+                }
+                # ||/or/// can yield a LIST (`push @l, $x->{rows} || ()` —
+                # DBIC's @limit_args build); arithmetic binops stay on the
+                # fast path (`push @arr, $i*$i` is the canonical hot loop).
+                if ($tt == Perla::AST::N_BINOP() && defined($args->[$__tspi]->{"op"})) {
+                    my str $__tsop = "" . $args->[$__tspi]->{"op"};
+                    if ($__tsop eq "||" || $__tsop eq "or" || $__tsop eq "//") {
+                        $all_simple = 0;
+                        last;
+                    }
                 }
                 $__tspi = $__tspi + 1;
             }
@@ -1737,9 +1748,21 @@ func _gen_call(scalar $cg, scalar $node) void {
                         my scalar $__tp_el = $__tp_elems->[$__tp_ei];
                         my int $__tp_el_t = $__tp_el->{"type"};
                         # Inner element may itself need list-context for
-                        # array/range/call expansion.
+                        # array/range/call expansion. ||/or/// and ?: can
+                        # yield the empty list `()` (DBIC's
+                        # `push @limit_args, ($attrs->{rows} || ())`) or a
+                        # multi-element list — treat like calls: list
+                        # context + runtime flatten + owned decref.
                         my int $__tp_el_is_call = ($__tp_el_t == Perla::AST::N_CALL()
-                                                  || $__tp_el_t == Perla::AST::N_METHOD()) ? 1 : 0;
+                                                  || $__tp_el_t == Perla::AST::N_METHOD()
+                                                  || $__tp_el_t == Perla::AST::N_TERNARY()) ? 1 : 0;
+                        if ($__tp_el_is_call == 0 && $__tp_el_t == Perla::AST::N_BINOP()
+                            && defined($__tp_el->{"op"})) {
+                            my str $__tp_elop = "" . $__tp_el->{"op"};
+                            if ($__tp_elop eq "||" || $__tp_elop eq "or" || $__tp_elop eq "//") {
+                                $__tp_el_is_call = 1;
+                            }
+                        }
                         if ($__tp_el_t == Perla::AST::N_ARRAY_VAR()
                             || $__tp_el_t == Perla::AST::N_DEREF_ARRAY()
                             || $__tp_el_t == Perla::AST::N_RANGE()
@@ -1774,9 +1797,19 @@ func _gen_call(scalar $cg, scalar $node) void {
                 # `return (a, b, c)` produces an array. Without this,
                 # `push @arr, sub_returning_list()` saw the call in
                 # whatever the outer context was (often scalar) and
-                # the call returned just its last element.
+                # the call returned just its last element. ||/or/// and
+                # ?: get the same treatment — they can yield lists
+                # (`$attrs->{rows} || ()`).
                 my int $__tp_is_call = ($__tp_at == Perla::AST::N_CALL()
-                                       || $__tp_at == Perla::AST::N_METHOD()) ? 1 : 0;
+                                       || $__tp_at == Perla::AST::N_METHOD()
+                                       || $__tp_at == Perla::AST::N_TERNARY()) ? 1 : 0;
+                if ($__tp_is_call == 0 && $__tp_at == Perla::AST::N_BINOP()
+                    && defined($__tp_arg->{"op"})) {
+                    my str $__tp_aop = "" . $__tp_arg->{"op"};
+                    if ($__tp_aop eq "||" || $__tp_aop eq "or" || $__tp_aop eq "//") {
+                        $__tp_is_call = 1;
+                    }
+                }
                 if ($__tp_at == Perla::AST::N_ARRAY_VAR()
                     || $__tp_at == Perla::AST::N_DEREF_ARRAY()
                     || $__tp_at == Perla::AST::N_RANGE()

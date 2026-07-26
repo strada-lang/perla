@@ -2105,7 +2105,14 @@ func main() int {
                 if ($first_slash < 0) { last; }
                 my str $head = substr($mod_name, 0, $first_slash);
                 my int $strip = 0;
-                if ($head eq "site_perl" || $head eq "vendor_perl" || $head eq "auto") { $strip = 1; }
+                # `perl5`/`perl` are install-tree components, not module
+                # namespaces: /opt/bzperl/lib/perl5/Eval/TypeTiny.pm must
+                # derive Eval::TypeTiny, not perl5::Eval::TypeTiny — the
+                # wrong name produced perla_mod_init_perl5_Eval_TypeTiny
+                # and consumers linking perla_mod_init_Eval_TypeTiny failed
+                # with an undefined symbol.
+                if ($head eq "site_perl" || $head eq "vendor_perl" || $head eq "auto"
+                    || $head eq "perl5" || $head eq "perl") { $strip = 1; }
                 elsif (length($head) > 0) {
                     my str $hc = substr($head, 0, 1);
                     if ($hc ge "0" && $hc le "9") { $strip = 1; }

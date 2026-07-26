@@ -3712,6 +3712,48 @@ func gen_interp_c_str(scalar $cg, str $s) void {
                 # appended) so the regex never matched anything. Common
                 # idiom: iterating a list of compiled regexes to apply
                 # serial substitutions.
+                # Multi-segment subscript chains (`$_[0]->{name_sep}`,
+                # `$h{a}{b}`, `$x->[0]{k}`) can't be expressed in the
+                # single-level AE:/HE: encodings — the tail segments
+                # leaked into the pattern as literal text. SQL::Abstract's
+                # `split(/\Q$_[0]->{name_sep}\E/, ...)` then never split,
+                # so quote_names produced `me.col` as ONE quoted
+                # identifier and every DBIC JOIN died "Unknown column".
+                # Lookahead: count chained subscripts; two or more →
+                # emit the whole chain through lex+parse+gen_expr (EX:).
+                {
+                    my int $__cs_j = $i;
+                    my int $__cs_segs = 0;
+                    my int $__cs_ok = 1;
+                    while ($__cs_ok == 1 && $__cs_j < $len) {
+                        my int $__cs_jj = $__cs_j;
+                        if ($__cs_jj + 2 < $len && substr($s, $__cs_jj, 2) eq "->") {
+                            my str $__cs_na = substr($s, $__cs_jj + 2, 1);
+                            if ($__cs_na eq "[" || $__cs_na eq "{") { $__cs_jj = $__cs_jj + 2; }
+                            else { last; }
+                        }
+                        my str $__cs_open = substr($s, $__cs_jj, 1);
+                        if ($__cs_open ne "[" && $__cs_open ne "{") { last; }
+                        my str $__cs_close = ($__cs_open eq "[") ? "]" : "}";
+                        my int $__cs_d = 1;
+                        my int $__cs_k = $__cs_jj + 1;
+                        while ($__cs_k < $len && $__cs_d > 0) {
+                            my str $__cs_c = substr($s, $__cs_k, 1);
+                            if ($__cs_c eq $__cs_open) { $__cs_d = $__cs_d + 1; }
+                            elsif ($__cs_c eq $__cs_close) { $__cs_d = $__cs_d - 1; if ($__cs_d == 0) { last; } }
+                            $__cs_k = $__cs_k + 1;
+                        }
+                        if ($__cs_d != 0) { $__cs_ok = 0; last; }
+                        $__cs_segs = $__cs_segs + 1;
+                        $__cs_j = $__cs_k + 1;
+                    }
+                    if ($__cs_ok == 1 && $__cs_segs >= 2) {
+                        push(@parts, "EX:\$" . $vname . substr($s, $i, $__cs_j - $i));
+                        push(@types, "expr");
+                        $i = $__cs_j;
+                        next;
+                    }
+                }
                 # Recognize the explicit arrow form first so `$arr->[N]`
                 # doesn't get split at `->`.
                 my int $consumed_arrow = 0;
@@ -3814,6 +3856,27 @@ func gen_interp_c_str(scalar $cg, str $s) void {
 #   HE:D:NAME:KEY   $NAME->{KEY} — scalar $NAME as hashref, deref
 func emit_interpc_expr(scalar $cg, str $part) void {
     my str $kind = substr($part, 0, 2);
+    # EX: full subscript-chain expression (`$_[0]->{name_sep}`,
+    # `$h{a}{b}`) — lex+parse the original source text and emit it as a
+    # scalar expression. See the chain lookahead in gen_interp_c_str.
+    if ($kind eq "EX") {
+        my str $__ex_src = substr($part, 3, length($part) - 3);
+        my array @__ex_toks = Perla::Lexer::lex($__ex_src . ";");
+        my scalar $__ex_ast = Perla::Parser::parse(@__ex_toks);
+        my scalar $__ex_node = undef;
+        if (defined($__ex_ast) && defined($__ex_ast->{"stmts"})) {
+            my scalar $__ex_stmts = $__ex_ast->{"stmts"};
+            if (scalar(@{$__ex_stmts}) >= 1) { $__ex_node = $__ex_stmts->[0]; }
+        }
+        if (defined($__ex_node)) {
+            Perla::CodeGen::emit($cg, "({ int __ex_sav_wl = __perla_want_list; __perla_want_list = 0; StradaValue *__ex_v = ");
+            Perla::CodeGen::gen_expr($cg, $__ex_node);
+            Perla::CodeGen::emit($cg, "; __perla_want_list = __ex_sav_wl; __ex_v; })");
+        } else {
+            Perla::CodeGen::emit($cg, "strada_new_str(\"\")");
+        }
+        return;
+    }
     my str $rest = substr($part, 3, length($part) - 3);
     my str $deref = substr($rest, 0, 1);
     my int $sep_after_deref = index($rest, ":");
