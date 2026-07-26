@@ -4181,6 +4181,36 @@ static int perla_pkg_exports_name(const char *pkg, const char *name) {
     return 0;
 }
 
+/* Moose/Moo-family DSL natives that the import shims install into
+ * CONSUMER packages (perla_moose_import & co. write has/extends/with/…
+ * into whatever package said `use Moo`). As bareword VALUES these must
+ * NOT count as compile-time visibility: perl sees `has` in an unrelated
+ * package's list as the string "has" — YAML::Mo's golfed
+ * `%e=(extends,sub{..},has,sub{..})` depends on that — but the
+ * imported-package walk found App::Genpass's Moo-installed `has`
+ * CPOINTER, called it argless, and YAML never got its has/extends
+ * (Load then died "Can't locate object method loader_object"). */
+static StradaValue *perla_moose_native_has(StradaValue *args);
+static StradaValue *perla_moose_native_extends(StradaValue *args);
+static StradaValue *perla_moose_native_with(StradaValue *args);
+static StradaValue *perla_moose_native_before(StradaValue *args);
+static StradaValue *perla_moose_native_after(StradaValue *args);
+static StradaValue *perla_moose_native_around(StradaValue *args);
+static StradaValue *perla_moose_make_immutable(StradaValue *args);
+static StradaValue *perla_moose_meta(StradaValue *args);
+static int perla_is_consumer_dsl_native(StradaValue *v) {
+    if (!v || STRADA_IS_TAGGED_INT(v) || v->type != STRADA_CPOINTER) return 0;
+    void *p = v->value.ptr;
+    return p == (void*)perla_moose_native_has
+        || p == (void*)perla_moose_native_extends
+        || p == (void*)perla_moose_native_with
+        || p == (void*)perla_moose_native_before
+        || p == (void*)perla_moose_native_after
+        || p == (void*)perla_moose_native_around
+        || p == (void*)perla_moose_make_immutable
+        || p == (void*)perla_moose_meta;
+}
+
 StradaValue *perla_code_get_imported(const char *name) {
     if (!name || !name[0]) return NULL;
     for (int i = perla_imported_count - 1; i >= 0; i--) {
@@ -4189,18 +4219,27 @@ StradaValue *perla_code_get_imported(const char *name) {
         /* Init-registered subs (symbol-name STRINGs from perla_code_set,
          * native CPOINTERs) are perla's analogue of compile-time
          * visibility — accept them outright (native module inits often
-         * don't populate @EXPORT). A CLOSURE is runtime-installed code;
-         * accept it ONLY when the package export-lists the name
-         * (Type::Tiny constants like Int are runtime-generated closures
-         * in their exporter's stash, but properly in @EXPORT_OK).
-         * Un-exported closures in used packages are exactly the Mo-style
-         * consumer pollution Perl's compile-time bareword resolution
-         * could never see: the first `use YAML::Mo` installed the
-         * YAML::extends/has closures into the consumer, and every later
-         * Mo import's `%e=(extends,sub{...})` bareword then CALLED them
-         * argument-less, corrupting @ISA and the %e feature table. */
-        if (v->type == STRADA_STR || v->type == STRADA_CPOINTER
-            || perla_pkg_exports_name(perla_imported_packages[i], name)) {
+         * don't populate @EXPORT, e.g. POSIX's INT_MAX). EXCEPT the
+         * Moose-DSL natives installed into consumer packages (see
+         * perla_is_consumer_dsl_native above) — those need an export
+         * listing like any runtime closure. A CLOSURE is
+         * runtime-installed code; accept it ONLY when the package
+         * export-lists the name (Type::Tiny constants like Int are
+         * runtime-generated closures in their exporter's stash, but
+         * properly in @EXPORT_OK). Un-exported closures in used packages
+         * are exactly the Mo-style consumer pollution Perl's
+         * compile-time bareword resolution could never see: the first
+         * `use YAML::Mo` installed the YAML::extends/has closures into
+         * the consumer, and every later Mo import's `%e=(extends,
+         * sub{...})` bareword then CALLED them argument-less, corrupting
+         * @ISA and the %e feature table. */
+        int visible;
+        if (v->type == STRADA_STR) visible = 1;
+        else if (v->type == STRADA_CPOINTER)
+            visible = !perla_is_consumer_dsl_native(v)
+                      || perla_pkg_exports_name(perla_imported_packages[i], name);
+        else visible = perla_pkg_exports_name(perla_imported_packages[i], name);
+        if (visible) {
             perla_last_code_get_pkg = perla_imported_packages[i];
             return v;
         }
@@ -4650,10 +4689,27 @@ StradaValue *perla_call_code(StradaValue *code_val, StradaValue *args) {
                                  * `_inflated_column{$rel} = undef` when no
                                  * prefetch row matched, but in non-prefetch
                                  * scenarios we still need to fetch the
-                                 * related row on demand. */
+                                 * related row on demand.
+                                 * ALSO skip when the cached value is a plain
+                                 * scalar (raw FK): row construction can call
+                                 * the accessor as a SETTER with the raw
+                                 * column value (535), which lands here
+                                 * verbatim — a legit single/filter rel value
+                                 * is always a blessed row REF. Returning the
+                                 * raw FK made `$host->account_id->label` die
+                                 * `Can't locate object method "label" via
+                                 * package "535"`. */
                                 int cached_is_undef = (cached && !STRADA_IS_TAGGED_INT(cached)
                                                        && cached->type == STRADA_UNDEF);
-                                if (cached && !cached_is_undef) {
+                                int cached_is_plain = (cached
+                                                       && (STRADA_IS_TAGGED_INT(cached)
+                                                           || (cached->type != STRADA_REF
+                                                               && cached->type != STRADA_UNDEF)));
+                                if (getenv("PERLA_REL_TRACE"))
+                                    fprintf(stderr, "[rel-get] %s bag=%s cached=%s\n", fn_name, bag_name,
+                                            !cached ? "missing" : cached_is_undef ? "undef"
+                                            : cached_is_plain ? "PLAIN" : "ref");
+                                if (cached && !cached_is_undef && !cached_is_plain) {
                                     strada_incref(cached);
                                     free(fn_name);
                                     return cached;
@@ -5290,7 +5346,17 @@ PerlGlob *perla_method_resolve(const char *pkg, const char *method) {
                 pkg, method, (void*)stash, stash ? stash->count : 0,
                 already_tried, loading_self, is_soft_method);
     }
-    if (!already_tried && !loading_self && !is_soft_method && (!stash || stash->count == 0)) {
+    /* Gate on is_inlined too, not just emptiness: a stash pre-seeded with a
+     * few native overrides (Componentised, InflateColumn etc. carry 5-140
+     * perla_init entries) has count>0 while the module's REAL init never ran
+     * (%INC pre-marked by a consumer's compile-time perla_mark_loaded). The
+     * count==0 gate then skipped the lazy load and method resolution failed
+     * silently mid-boot — DBIC's add_relationship_accessor dispatched
+     * inflate_column into the void, filter relationships never inflated, and
+     * $host->account_id returned the raw FK (535) instead of the Account
+     * row. is_inlined is set exactly when a module init's top-level runs. */
+    if (!already_tried && !loading_self && !is_soft_method
+        && (!stash || stash->count == 0 || !stash->is_inlined)) {
         if (tried_n < 256) {
             snprintf(tried[tried_n], 256, "%s", pkg);
             tried_n++;
@@ -5368,6 +5434,12 @@ PerlGlob *perla_method_resolve(const char *pkg, const char *method) {
         && isa_glob->slots[PERLA_SLOT_ARRAY] != stash->isa) {
         StradaValue *gv = isa_glob->slots[PERLA_SLOT_ARRAY];
         if (gv && !STRADA_IS_TAGGED_INT(gv) && gv->type == STRADA_ARRAY) {
+            if (getenv("PERLA_ISA_TRACE")) {
+                StradaArray *__ol = stash->isa ? strada_deref_array(stash->isa) : NULL;
+                StradaArray *__nl = strada_deref_array(gv);
+                fprintf(stderr, "[isa-sync] pkg=%s old_n=%zu new_n=%zu\n", pkg,
+                        __ol ? __ol->size : 0, __nl ? __nl->size : 0);
+            }
             if (stash->isa) strada_decref(stash->isa);
             stash->isa = gv;
             strada_incref(stash->isa);
@@ -5437,6 +5509,16 @@ PerlGlob *perla_method_resolve(const char *pkg, const char *method) {
         /* C3 linearization failed — fall through to DFS. */
     }
 
+    if (getenv("PERLA_ISA_TRACE")) {
+        fprintf(stderr, "[isa-walk] pkg=%s method=%s isa_n=%zu:", pkg, method, isa->size);
+        for (size_t __ti = 0; __ti < isa->size; __ti++) {
+            StradaValue *__tp = isa->elements[isa->head + __ti];
+            char *__ts = __tp ? strada_to_str(__tp) : NULL;
+            fprintf(stderr, " %s", __ts ? __ts : "(nil)");
+            free(__ts);
+        }
+        fprintf(stderr, "\n");
+    }
     for (size_t i = 0; i < isa->size; i++) {
         /* StradaArray is a ring-buffer-like deque: real elements live at
          * elements[head..head+size-1]. Walking elements[i] (without head)
@@ -5466,9 +5548,25 @@ PerlGlob *perla_method_resolve(const char *pkg, const char *method) {
          * still empty — meaning the %INC flag lies. Clear it so
          * require_module actually loads. */
         PerlStash *pstash = perla_stash_get(parent);
-        if (!pstash || pstash->count == 0) {
+        int __pw_seen = 0;
+        if (!pstash || pstash->count == 0 || !pstash->is_inlined) {
+            /* Once per package per thread (shares the resolve fn's tried[]):
+             * a parent that stays un-inited (in-file package, native stub)
+             * must not pay a full @INC path search on every dispatch walk. */
+            for (int __pwti = 0; __pwti < tried_n; __pwti++) {
+                if (strcmp(tried[__pwti], parent) == 0) { __pw_seen = 1; break; }
+            }
+            if (!__pw_seen && tried_n < 256) {
+                snprintf(tried[tried_n], 256, "%s", parent);
+                tried_n++;
+            }
+        }
+        if ((!pstash || pstash->count == 0 || !pstash->is_inlined) && !__pw_seen) {
             if (g_INC_hash && g_INC_hash->value.hv) {
                 strada_hash_delete(g_INC_hash->value.hv, parent);
+                char __pw_fn[1040];
+                if (inc_filename_key(parent, __pw_fn, sizeof(__pw_fn)))
+                    strada_hash_delete(g_INC_hash->value.hv, __pw_fn);
             }
             StradaValue *pname = strada_new_str(parent);
             extern int g_perla_require_soft;
@@ -5796,6 +5894,12 @@ static void perla_mro_dfs_walk(const char *pkg, StradaArray *out_av, StradaHash 
         && isa_glob->slots[PERLA_SLOT_ARRAY] != stash->isa) {
         StradaValue *gv = isa_glob->slots[PERLA_SLOT_ARRAY];
         if (gv && !STRADA_IS_TAGGED_INT(gv) && gv->type == STRADA_ARRAY) {
+            if (getenv("PERLA_ISA_TRACE")) {
+                StradaArray *__ol = stash->isa ? strada_deref_array(stash->isa) : NULL;
+                StradaArray *__nl = strada_deref_array(gv);
+                fprintf(stderr, "[isa-sync] pkg=%s old_n=%zu new_n=%zu\n", pkg,
+                        __ol ? __ol->size : 0, __nl ? __nl->size : 0);
+            }
             if (stash->isa) strada_decref(stash->isa);
             stash->isa = gv;
             strada_incref(stash->isa);
@@ -5884,6 +5988,12 @@ int perla_mro_c3_linearize(const char *pkg, StradaArray *out_av) {
         && isa_glob->slots[PERLA_SLOT_ARRAY] != stash->isa) {
         StradaValue *gv = isa_glob->slots[PERLA_SLOT_ARRAY];
         if (gv && !STRADA_IS_TAGGED_INT(gv) && gv->type == STRADA_ARRAY) {
+            if (getenv("PERLA_ISA_TRACE")) {
+                StradaArray *__ol = stash->isa ? strada_deref_array(stash->isa) : NULL;
+                StradaArray *__nl = strada_deref_array(gv);
+                fprintf(stderr, "[isa-sync] pkg=%s old_n=%zu new_n=%zu\n", pkg,
+                        __ol ? __ol->size : 0, __nl ? __nl->size : 0);
+            }
             if (stash->isa) strada_decref(stash->isa);
             stash->isa = gv;
             strada_incref(stash->isa);
@@ -8369,6 +8479,9 @@ static StradaValue *perla_dbic_manual_find_related(StradaValue *self, const char
     if (!self || STRADA_IS_TAGGED_INT(self) || !rel_key || !rel_key[0]) {
         return strada_new_undef();
     }
+    if (getenv("PERLA_REL_TRACE"))
+        fprintf(stderr, "[rel-find] rel=%s self=%s\n", rel_key,
+                perla_blessed(self) ? perla_blessed(self) : "(unblessed)");
 
     /* Get $self->result_source */
     StradaValue *rs_args = strada_new_array();
@@ -12332,6 +12445,12 @@ int perla_isa_check(const char *pkg, const char *target) {
         && isa_glob->slots[PERLA_SLOT_ARRAY] != stash->isa) {
         StradaValue *gv = isa_glob->slots[PERLA_SLOT_ARRAY];
         if (gv && !STRADA_IS_TAGGED_INT(gv) && gv->type == STRADA_ARRAY) {
+            if (getenv("PERLA_ISA_TRACE")) {
+                StradaArray *__ol = stash->isa ? strada_deref_array(stash->isa) : NULL;
+                StradaArray *__nl = strada_deref_array(gv);
+                fprintf(stderr, "[isa-sync] pkg=%s old_n=%zu new_n=%zu\n", pkg,
+                        __ol ? __ol->size : 0, __nl ? __nl->size : 0);
+            }
             if (stash->isa) strada_decref(stash->isa);
             stash->isa = gv;
             strada_incref(stash->isa);
@@ -14421,6 +14540,8 @@ StradaValue *perla_method_dispatch(StradaValue *obj, const char *method, StradaV
              || strcmp(method, "many_to_many") == 0
              || strcmp(method, "add_relationship") == 0
              || strcmp(method, "add_relationship_accessor") == 0) {
+        if (getenv("PERLA_SUPPRESS_TRACE"))
+            fprintf(stderr, "[suppress] %s->%s\n", pkg ? pkg : "(nil)", method);
         suppress = 1;
     }
     if (!suppress) {
