@@ -184,6 +184,7 @@ StradaValue *perla_hash_get(const char *pkg, const char *name);
 void perla_hash_set(const char *pkg, const char *name, StradaValue *val);
 StradaValue *perla_code_get(const char *pkg, const char *name);
 StradaValue *perla_code_get_walking(const char *name);
+StradaValue *perla_code_get_imported(const char *name);
 /* Lazy-run a precompiled module's perla_mod_init_<Pkg> on demand (idempotent).
  * Used when a qualified sub/method isn't registered yet because its package's
  * init hasn't run in the cascade before a top-level call into it. */

@@ -4130,6 +4130,45 @@ static StradaValue *perla_lookup_in_stash(const char *pkg, const char *name) {
     return NULL;
 }
 
+/* Bareword-VALUE resolution: only explicitly-`use`d packages are
+ * searched — NO full stash walk. A bareword used as a value
+ * (`%e = (extends, sub {...})`) is a plain string in Perl unless a sub
+ * of that name is visible at compile time (declared in the current
+ * package or imported into it). The full walk bound such barewords to
+ * same-named subs installed into UNRELATED packages at runtime:
+ * YAML::Mo's import built its `%e=(extends,sub{..},has,sub{..})`
+ * feature table fine on the FIRST invocation (nothing named
+ * extends/has existed → string fallback), but the SECOND `use YAML::Mo`
+ * found the first consumer's freshly-installed P1::extends/P1::has via
+ * the walk and CALLED them argument-less — clobbering @P1::ISA with
+ * undef, glob-assigning "P1::" (has's `*{$P.$n}` with $n=undef), and
+ * building a garbage %e so the second consumer got NO has/extends at
+ * all. That is why every Mo-based class loaded after the first one
+ * (YAML::Loader, ::Dumper, ...) lost its accessor machinery. */
+StradaValue *perla_code_get_imported(const char *name) {
+    if (!name || !name[0]) return NULL;
+    for (int i = perla_imported_count - 1; i >= 0; i--) {
+        StradaValue *v = perla_lookup_in_stash(perla_imported_packages[i], name);
+        /* Only init-registered subs count: module inits register code as
+         * symbol-name STRINGS (perla_code_set(..., "perla_sub_X")) or
+         * native CPOINTERs — those are perla's analogue of compile-time
+         * visibility. A CLOSURE in another package's slot was installed
+         * at RUNTIME (Mo-style `*{$P.$_} = sub {...}` into a consumer
+         * package) — Perl's compile-time bareword resolution could never
+         * have seen it, so a bareword VALUE must not bind to it. Without
+         * this filter, `use YAML ()` put YAML in the imported list, the
+         * first Mo import installed the YAML::extends closure there, and
+         * every later Mo consumer's `%e=(extends,sub{...})` list CALLED
+         * it instead of yielding the string "extends". */
+        if (v && !STRADA_IS_TAGGED_INT(v)
+            && (v->type == STRADA_STR || v->type == STRADA_CPOINTER)) {
+            perla_last_code_get_pkg = perla_imported_packages[i];
+            return v;
+        }
+    }
+    return NULL;
+}
+
 StradaValue *perla_code_get_walking(const char *name) {
     if (!name || !name[0]) return NULL;
     /* Try explicitly-imported packages in REVERSE order — later

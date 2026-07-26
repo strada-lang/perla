@@ -6664,9 +6664,19 @@ func _gen_call(scalar $cg, scalar $node) void {
                     }
                     return;
                 }
+                # Imported-only fallback (NOT the full stash walk): a
+                # bareword VALUE is a plain string in Perl unless a sub of
+                # that name is visible in the current package (declared or
+                # imported into it) — the full walk bound these to
+                # same-named subs that Mo-style imports installed into
+                # UNRELATED consumer packages at runtime, and CALLED them
+                # (see perla_code_get_imported's comment for the YAML::Mo
+                # second-import corruption this caused). Imported packages
+                # still resolve so `use POSIX; print INT_MAX` keeps
+                # working.
                 Perla::CodeGen::emit($cg, "({ StradaValue *__bw_fn = perla_code_get(\"" . $try_pkg . "\", \"" . $name . "\"); ");
                 Perla::CodeGen::emit($cg, "if (!__bw_fn) __bw_fn = perla_code_get(\"main\", \"" . $name . "\"); ");
-                Perla::CodeGen::emit($cg, "if (!__bw_fn) __bw_fn = perla_code_get_walking(\"" . $name . "\"); ");
+                Perla::CodeGen::emit($cg, "if (!__bw_fn) __bw_fn = perla_code_get_imported(\"" . $name . "\"); ");
                 Perla::CodeGen::emit($cg, "StradaValue *__bw_v; ");
                 Perla::CodeGen::emit($cg, "if (__bw_fn) { StradaValue *__bw_args = strada_new_array(); __bw_v = perla_call_code(__bw_fn, __bw_args); strada_decref(__bw_args); } ");
                 if ($__bw_strict_subs == 1) {
