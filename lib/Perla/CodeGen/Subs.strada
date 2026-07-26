@@ -331,19 +331,27 @@ func gen_sub_bodies_from_stmts(scalar $cg, scalar $stmts) void {
                 $seen->{$qn} = $cur;
                 my int $total = 0;
                 if (exists($totals->{$qn})) { $total = 0 + $totals->{$qn}; }
+                # Eval-body wrapper subs (and the named subs hoisted out of
+                # them, via the eb walk below) share user-level `my` lexicals
+                # as file-scope statics — perl's named-sub-in-eval capture.
+                # See Collect::_collect_eval_shared_from_stmts.
+                my str $__es_sname = $stmt->{"name"};
+                my int $__es_eb = 0;
+                if (length($__es_sname) > 18 && substr($__es_sname, 0, 18) eq "__perla_eval_body_") {
+                    $__es_eb = 1;
+                }
+                my int $__es_saved = 0;
+                if (defined($cg->{"eval_shared_on"})) { $__es_saved = $cg->{"eval_shared_on"} + 0; }
+                if ($__es_eb == 1) { $cg->{"eval_shared_on"} = 1; }
                 if ($cur == $total) {
                     gen_sub_def($cg, $stmt);
                 }
                 # Also emit any nested named subs (Perl semantics: they
                 # live in the enclosing package, not as closures).
                 if (defined($stmt->{"body"}) && defined($stmt->{"body"}->{"stmts"})) {
-                    my str $sname = $stmt->{"name"};
-                    my int $is_eb = 0;
-                    if (length($sname) > 18 && substr($sname, 0, 18) eq "__perla_eval_body_") {
-                        $is_eb = 1;
-                    }
-                    gen_sub_bodies_from_stmts_eb($cg, $stmt->{"body"}->{"stmts"}, $is_eb);
+                    gen_sub_bodies_from_stmts_eb($cg, $stmt->{"body"}->{"stmts"}, $__es_eb);
                 }
+                if ($__es_eb == 1) { $cg->{"eval_shared_on"} = $__es_saved; }
             }
             if ($stmt->{"type"} == Perla::AST::N_BLOCK() && defined($stmt->{"stmts"})) {
                 gen_sub_bodies_from_stmts($cg, $stmt->{"stmts"});

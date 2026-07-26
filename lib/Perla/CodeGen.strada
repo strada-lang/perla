@@ -2332,6 +2332,15 @@ func _is_file_scope(scalar $cg, str $vname) int {
     if (defined($cg->{"file_scope_vars"}) && $cg->{"in_main"} == 1) {
         return exists($cg->{"file_scope_vars"}->{$vname});
     }
+    # Eval-STRING TU: inside the __perla_eval_body_* wrapper (and the named
+    # subs hoisted out of it), user-level `my` lexicals are shared statics —
+    # perl's named-sub-in-eval capture semantics. See
+    # Collect::_collect_eval_shared_from_stmts.
+    if (defined($cg->{"eval_shared_on"}) && $cg->{"eval_shared_on"} == 1
+        && defined($cg->{"eval_shared_mys"})
+        && exists($cg->{"eval_shared_mys"}->{$vname})) {
+        return 1;
+    }
     return 0;
 }
 

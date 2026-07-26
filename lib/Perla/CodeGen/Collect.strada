@@ -838,10 +838,95 @@ func _record_list_assign_mys(scalar $cg, scalar $elems) void {
     }
 }
 
+# Eval-STRING TUs wrap user code in `sub __perla_eval_body_<tag> { ... }`,
+# so the user's top-level `my` lexicals become wrapper-sub LOCALS — invisible
+# to named subs hoisted out of the eval body. Perl's semantics: a named sub
+# in an eval STRING closes over the eval's lexicals ("will not stay shared"
+# first-instantiation capture). Sub::Quote's NAMED quote_sub depends on it:
+#   { my $orig = ${$_[1]->{'$orig'}}; package X; sub meth { ... goto $orig } }
+# Without sharing, $orig in the compiled `meth` was a never-assigned static
+# → goto undef → silent undef return — DBIx::Class's storage accessor
+# wrappers (cursor_class etc.) all returned undef. Fix: collect user-level
+# `my` names from inside the wrapper (same structural walk as the eb sub
+# hoist) and promote them to file-scope statics shared by the wrapper body
+# and the hoisted subs. Gated at use-sites by $cg->{"eval_shared_on"} so
+# regular sub locals elsewhere in the TU are unaffected. NOTE: shared
+# statics persist across body invocations; declarations WITH initializers
+# re-assign each run (the common case — capture unrolls), so semantics
+# match; a bare `my %h;` at eval top level would retain state across
+# repeated evals of the same string (accepted, rare).
+func _record_eval_shared_my(scalar $cg, scalar $node) void {
+    my scalar $n = $node;
+    while (defined($n) && $n->{"type"} == Perla::AST::N_BINOP() && defined($n->{"left"})) {
+        $n = $n->{"left"};
+    }
+    if (defined($n) && $n->{"type"} == Perla::AST::N_MY()) {
+        my array @__vs = ();
+        if (defined($n->{"vars"})) {
+            my int $vi = 0;
+            while ($vi < scalar(@{$n->{"vars"}})) { push(@__vs, $n->{"vars"}->[$vi]); $vi++; }
+        } elsif (defined($n->{"var"})) {
+            push(@__vs, $n->{"var"});
+        }
+        my int $wi = 0;
+        while ($wi < scalar(@__vs)) {
+            my str $__nm = "" . $__vs[$wi]->{"value"};
+            # Skip perla's own wrapper internals ($__caps, $__perla_eval_rv).
+            if (!(length($__nm) >= 2 && substr($__nm, 0, 2) eq "__")) {
+                $cg->{"file_scope_vars"}->{$__nm} = $__vs[$wi]->{"type"};
+                if (!defined($cg->{"eval_shared_mys"})) { $cg->{"eval_shared_mys"} = {}; }
+                $cg->{"eval_shared_mys"}->{$__nm} = $__vs[$wi]->{"type"};
+                _record_filelex_ctx($cg, $__nm);
+            }
+            $wi++;
+        }
+    }
+}
+
+func _collect_eval_shared_from_stmts(scalar $cg, scalar $stmts) void {
+    if (!defined($stmts)) { return; }
+    my int $i = 0;
+    while ($i < scalar(@{$stmts})) {
+        my scalar $s = $stmts->[$i];
+        if (defined($s)) {
+            if ($s->{"type"} == Perla::AST::N_MY() || $s->{"type"} == Perla::AST::N_BINOP()) {
+                _record_eval_shared_my($cg, $s);
+            }
+            if ($s->{"type"} == Perla::AST::N_BLOCK() && defined($s->{"stmts"})) {
+                _collect_eval_shared_from_stmts($cg, $s->{"stmts"});
+            }
+            if ($s->{"type"} == Perla::AST::N_IF() || $s->{"type"} == Perla::AST::N_UNLESS()) {
+                if (defined($s->{"then"}) && defined($s->{"then"}->{"stmts"})) {
+                    _collect_eval_shared_from_stmts($cg, $s->{"then"}->{"stmts"});
+                }
+                if (defined($s->{"else"}) && defined($s->{"else"}->{"stmts"})) {
+                    _collect_eval_shared_from_stmts($cg, $s->{"else"}->{"stmts"});
+                }
+            }
+            if (($s->{"type"} == Perla::AST::N_MY() || $s->{"type"} == Perla::AST::N_OUR())
+                && defined($s->{"init"})) {
+                my scalar $__esi = $s->{"init"};
+                if (defined($__esi) && $__esi->{"type"} == Perla::AST::N_BLOCK()
+                    && defined($__esi->{"stmts"})) {
+                    _collect_eval_shared_from_stmts($cg, $__esi->{"stmts"});
+                }
+            }
+        }
+        $i++;
+    }
+}
+
 func collect_file_scope_vars_from_stmts(scalar $cg, scalar $stmts) void {
     my int $i = 0;
     while ($i < scalar(@{$stmts})) {
         my scalar $s = $stmts->[$i];
+        if (defined($s) && $s->{"type"} == Perla::AST::N_SUB() && defined($s->{"name"})) {
+            my str $__es_sn = "" . $s->{"name"};
+            if (length($__es_sn) > 18 && substr($__es_sn, 0, 18) eq "__perla_eval_body_"
+                && defined($s->{"body"}) && defined($s->{"body"}->{"stmts"})) {
+                _collect_eval_shared_from_stmts($cg, $s->{"body"}->{"stmts"});
+            }
+        }
         # Track which INLINED MODULE's section we're in (pragma brackets):
         # file-scope `my` lexicals from different inlined modules used to
         # share one C static per name — Specio::OO's `my %TypeChecks`,
