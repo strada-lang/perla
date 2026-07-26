@@ -3403,21 +3403,45 @@ func _load_module(scalar $p, str $module) scalar {
                             _dbg("  " . $module . ": stale .pm.so (@INC path) — ignoring");
                             $oc_so_exists = 0;
                         }
-                        # Also reject artifacts older than the running perla
-                        # binary (parity with the tree path's check). A .pm.o
-                        # compiled against an older runtime header can embed
-                        # inline runtime functions referencing symbols the
-                        # current runtime no longer exports — referencing it
-                        # in PERLA_LINK_OBJECTS fails the link, and the
-                        # driver-side stale-drop then leaves the emitted
-                        # perla_mod_init_X call dangling.
-                        if ($oc_o_exists == 1 && $oi_perla_mtime > 0 && $oi_o_mtime < $oi_perla_mtime) {
-                            _dbg("  " . $module . ": stale .pm.o (@INC path, older than perla) — ignoring");
-                            $oc_o_exists = 0;
+                        # CGV-stamp gate (parity with the tree path's check):
+                        # an artifact whose .pm.cgv matches the current codegen
+                        # version stays valid even when perla was relinked for a
+                        # runtime-only (.c) fix — that fix reaches the artifact
+                        # at link time anyway. Without this escape, EVERY perla
+                        # relink invalidated the whole warm graph by raw mtime,
+                        # cascading into recursive child rebuilds and, for big
+                        # app modules, the inline fallback (40MB+ TUs that took
+                        # gcc past any timeout). A stamped-but-MISMATCHED
+                        # artifact is rejected outright; unstamped falls back to
+                        # the mtime rule.
+                        my str $oi_cur_cgv = core::getenv("__PERLA_CGV");
+                        my str $oi_stamped = "";
+                        {
+                            my str $oi_cgvcand = _art_cand($candidate, ".cgv");
+                            if (core::file_exists($oi_cgvcand) == 1) {
+                                $oi_stamped = trim(core::slurp($oi_cgvcand));
+                            }
                         }
-                        if ($oc_so_exists == 1 && $oi_perla_mtime > 0 && $oi_so_mtime < $oi_perla_mtime) {
-                            _dbg("  " . $module . ": stale .pm.so (@INC path, older than perla) — ignoring");
-                            $oc_so_exists = 0;
+                        if (length($oi_stamped) > 0 && length($oi_cur_cgv) > 0) {
+                            if ($oi_stamped ne $oi_cur_cgv) {
+                                if ($oc_o_exists == 1) {
+                                    _dbg("  " . $module . ": stale .pm.o (@INC path, codegen version changed) — ignoring");
+                                    $oc_o_exists = 0;
+                                }
+                                if ($oc_so_exists == 1) {
+                                    _dbg("  " . $module . ": stale .pm.so (@INC path, codegen version changed) — ignoring");
+                                    $oc_so_exists = 0;
+                                }
+                            }
+                        } else {
+                            if ($oc_o_exists == 1 && $oi_perla_mtime > 0 && $oi_o_mtime < $oi_perla_mtime) {
+                                _dbg("  " . $module . ": stale .pm.o (@INC path, older than perla) — ignoring");
+                                $oc_o_exists = 0;
+                            }
+                            if ($oc_so_exists == 1 && $oi_perla_mtime > 0 && $oi_so_mtime < $oi_perla_mtime) {
+                                _dbg("  " . $module . ": stale .pm.so (@INC path, older than perla) — ignoring");
+                                $oc_so_exists = 0;
+                            }
                         }
                     }
                 }
@@ -3530,20 +3554,40 @@ func _load_module(scalar $p, str $module) scalar {
             _dbg("  " . $module . ": stale .pm.so (mtime " . $so_mtime . " < src " . $src_mtime . ") — ignoring");
             $so_exists = 0;
         }
-        # Also reject artifacts older than the running perla binary —
-        # parity with the tree-path and @INC-path checks. A .pm.o built
-        # against an older runtime header can reference symbols the
-        # current runtime no longer exports; referencing it in
-        # PERLA_LINK_OBJECTS leaves a dangling perla_mod_init_X after the
-        # driver-side stale-drop (seen with ~/perla/lib/DBI.pm.o after
-        # every perla rebuild).
-        if ($o_exists == 1 && $fp_perla_mtime > 0 && $o_mtime < $fp_perla_mtime) {
-            _dbg("  " . $module . ": stale .pm.o (older than perla) — ignoring");
-            $o_exists = 0;
+        # CGV-stamp gate (parity with the tree-path check): a matching
+        # .pm.cgv keeps the artifact valid across runtime-only perla
+        # relinks; a mismatched stamp rejects it outright; only unstamped
+        # artifacts fall back to the raw perla-mtime rule. Without this
+        # escape every relink invalidated the whole warm graph, and big
+        # app modules fell to the inline path (40MB+ TUs, gcc timeouts).
+        my str $fp_cur_cgv = core::getenv("__PERLA_CGV");
+        my str $fp_stamped = "";
+        {
+            my str $fp_cgvcand = _art_cand($found_path, ".cgv");
+            if (core::file_exists($fp_cgvcand) == 1) {
+                $fp_stamped = trim(core::slurp($fp_cgvcand));
+            }
         }
-        if ($so_exists == 1 && $fp_perla_mtime > 0 && $so_mtime < $fp_perla_mtime) {
-            _dbg("  " . $module . ": stale .pm.so (older than perla) — ignoring");
-            $so_exists = 0;
+        if (length($fp_stamped) > 0 && length($fp_cur_cgv) > 0) {
+            if ($fp_stamped ne $fp_cur_cgv) {
+                if ($o_exists == 1) {
+                    _dbg("  " . $module . ": stale .pm.o (codegen version changed) — ignoring");
+                    $o_exists = 0;
+                }
+                if ($so_exists == 1) {
+                    _dbg("  " . $module . ": stale .pm.so (codegen version changed) — ignoring");
+                    $so_exists = 0;
+                }
+            }
+        } else {
+            if ($o_exists == 1 && $fp_perla_mtime > 0 && $o_mtime < $fp_perla_mtime) {
+                _dbg("  " . $module . ": stale .pm.o (older than perla) — ignoring");
+                $o_exists = 0;
+            }
+            if ($so_exists == 1 && $fp_perla_mtime > 0 && $so_mtime < $fp_perla_mtime) {
+                _dbg("  " . $module . ": stale .pm.so (older than perla) — ignoring");
+                $so_exists = 0;
+            }
         }
     }
     if ($o_exists == 1 || $so_exists == 1) {

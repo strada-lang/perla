@@ -2749,6 +2749,19 @@ func main() int {
                     free(__fos);
                 }
                 if ($fo_mtime > 0 && $fo_mtime < $perla_mtime) { $fo_stale = 1; }
+                # CGV-stamp gate (parity with the parser checks): keep the
+                # artifact when its .pm.cgv matches the current codegen
+                # version — a runtime-only perla relink doesn't invalidate
+                # it. "X.pm.o" → "X.pm.cgv".
+                if ($fo_stale == 1) {
+                    my str $fo_cgv_path = substr($fo, 0, length($fo) - 1) . "cgv";
+                    if (core::file_exists($fo_cgv_path) == 1) {
+                        my str $fo_stamped = trim(core::slurp($fo_cgv_path));
+                        if (length($fo_stamped) > 0 && $fo_stamped eq _codegen_version()) {
+                            $fo_stale = 0;
+                        }
+                    }
+                }
             }
             if ($fo_stale == 1) {
                 say(STDERR, "[perla] dropping stale " . $fo . " (older than perla; runtime require rebuilds on demand)");
