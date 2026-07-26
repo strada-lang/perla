@@ -2702,12 +2702,25 @@ void perla_init(void) {
     /* Time::Local::timelocal / timegm — used widely for date arithmetic
      * (Time::Local is in core perl). Without these, `use Time::Local;
      * timegm(...)` returned undef because perla had no .pm shim. */
-    perla_code_set("Time::Local", "timelocal", strada_cpointer_new((void*)perla_time_local_timelocal));
-    perla_code_set("Time::Local", "timegm",    strada_cpointer_new((void*)perla_time_local_timegm));
+    /* PROTECTED: perla_init pre-marks %INC{"Time/Local.pm"} below, so any
+     * real Time::Local TU that later enters the process (linked .pm.o,
+     * dlopen'd .pm.so, or an inlined copy in a consumer TU) skips its
+     * guarded top-level — its file-lexical @MonthDays never populates —
+     * while its unconditional sub registration would overwrite these
+     * natives with empty-statics copies. That clobber made timegm croak
+     * "Day '2' out of range 1.." (empty upper bound) during
+     * Set::Infinite::Arithmetic's init in add.pl. Protection makes the
+     * natives immune regardless of what gets loaded. */
+    perla_code_set_protected("Time::Local", "timelocal", strada_cpointer_new((void*)perla_time_local_timelocal));
+    perla_code_set_protected("Time::Local", "timegm",    strada_cpointer_new((void*)perla_time_local_timegm));
     /* Modern aliases (Time::Local 1.30+): timelocal_modern / timegm_modern
      * treat year as the 4-digit calendar year. */
-    perla_code_set("Time::Local", "timelocal_modern", strada_cpointer_new((void*)perla_time_local_timelocal));
-    perla_code_set("Time::Local", "timegm_modern",    strada_cpointer_new((void*)perla_time_local_timegm));
+    perla_code_set_protected("Time::Local", "timelocal_modern", strada_cpointer_new((void*)perla_time_local_timelocal));
+    perla_code_set_protected("Time::Local", "timegm_modern",    strada_cpointer_new((void*)perla_time_local_timegm));
+    /* _nocheck variants (listed in @EXPORT_OK below): same impls — the
+     * natives don't range-check anyway. */
+    perla_code_set_protected("Time::Local", "timelocal_nocheck", strada_cpointer_new((void*)perla_time_local_timelocal));
+    perla_code_set_protected("Time::Local", "timegm_nocheck",    strada_cpointer_new((void*)perla_time_local_timegm));
     /* Mark Time/Local.pm as loaded so `use Time::Local` short-circuits. */
     if (!g_INC_hash) g_INC_hash = strada_new_hash();
     if (g_INC_hash && g_INC_hash->value.hv) {
@@ -4145,23 +4158,49 @@ static StradaValue *perla_lookup_in_stash(const char *pkg, const char *name) {
  * building a garbage %e so the second consumer got NO has/extends at
  * all. That is why every Mo-based class loaded after the first one
  * (YAML::Loader, ::Dumper, ...) lost its accessor machinery. */
+/* Does `pkg` list `name` in its @EXPORT or @EXPORT_OK? Approximates
+ * "this bareword could legitimately have been imported from pkg". */
+static int perla_pkg_exports_name(const char *pkg, const char *name) {
+    PerlStash *s = perla_stash_get(pkg);
+    if (!s) return 0;
+    static const char *lists[2] = { "EXPORT", "EXPORT_OK" };
+    for (int li = 0; li < 2; li++) {
+        PerlGlob *g = perla_glob_get(s, lists[li]);
+        if (!g) continue;
+        StradaValue *av = g->slots[PERLA_SLOT_ARRAY];
+        if (!av || STRADA_IS_TAGGED_INT(av) || av->type != STRADA_ARRAY) continue;
+        StradaArray *arr = strada_deref_array(av);
+        if (!arr) continue;
+        for (size_t i = 0; i < arr->size; i++) {
+            StradaValue *e = arr->elements[arr->head + i];
+            if (e && !STRADA_IS_TAGGED_INT(e) && e->type == STRADA_STR
+                && e->value.pv && strcmp(e->value.pv, name) == 0)
+                return 1;
+        }
+    }
+    return 0;
+}
+
 StradaValue *perla_code_get_imported(const char *name) {
     if (!name || !name[0]) return NULL;
     for (int i = perla_imported_count - 1; i >= 0; i--) {
         StradaValue *v = perla_lookup_in_stash(perla_imported_packages[i], name);
-        /* Only init-registered subs count: module inits register code as
-         * symbol-name STRINGS (perla_code_set(..., "perla_sub_X")) or
-         * native CPOINTERs — those are perla's analogue of compile-time
-         * visibility. A CLOSURE in another package's slot was installed
-         * at RUNTIME (Mo-style `*{$P.$_} = sub {...}` into a consumer
-         * package) — Perl's compile-time bareword resolution could never
-         * have seen it, so a bareword VALUE must not bind to it. Without
-         * this filter, `use YAML ()` put YAML in the imported list, the
-         * first Mo import installed the YAML::extends closure there, and
-         * every later Mo consumer's `%e=(extends,sub{...})` list CALLED
-         * it instead of yielding the string "extends". */
-        if (v && !STRADA_IS_TAGGED_INT(v)
-            && (v->type == STRADA_STR || v->type == STRADA_CPOINTER)) {
+        if (!v || STRADA_IS_TAGGED_INT(v)) continue;
+        /* Init-registered subs (symbol-name STRINGs from perla_code_set,
+         * native CPOINTERs) are perla's analogue of compile-time
+         * visibility — accept them outright (native module inits often
+         * don't populate @EXPORT). A CLOSURE is runtime-installed code;
+         * accept it ONLY when the package export-lists the name
+         * (Type::Tiny constants like Int are runtime-generated closures
+         * in their exporter's stash, but properly in @EXPORT_OK).
+         * Un-exported closures in used packages are exactly the Mo-style
+         * consumer pollution Perl's compile-time bareword resolution
+         * could never see: the first `use YAML::Mo` installed the
+         * YAML::extends/has closures into the consumer, and every later
+         * Mo import's `%e=(extends,sub{...})` bareword then CALLED them
+         * argument-less, corrupting @ISA and the %e feature table. */
+        if (v->type == STRADA_STR || v->type == STRADA_CPOINTER
+            || perla_pkg_exports_name(perla_imported_packages[i], name)) {
             perla_last_code_get_pkg = perla_imported_packages[i];
             return v;
         }
@@ -5176,6 +5215,8 @@ void perla_restore(int mark) {
 
 /* ===== Method Resolution ===== */
 
+static const char *inc_filename_key(const char *module, char *buf, size_t bufsz);
+
 /* Depth-first search through @ISA */
 PerlGlob *perla_method_resolve(const char *pkg, const char *method) {
     if (!pkg || !method) return NULL;
@@ -5261,9 +5302,15 @@ PerlGlob *perla_method_resolve(const char *pkg, const char *method) {
         if (!perla_try_load_precompiled(pkg)) {
             /* No precompiled artifact — do a full require (which may
              * fork perla -M). This path is more expensive but handles
-             * modules that were never auto-built at compile time. */
+             * modules that were never auto-built at compile time.
+             * Clear BOTH %INC key forms — require's short-circuit now
+             * checks both, and a leftover Foo/Bar.pm entry would skip
+             * the re-load this path exists to force. */
             if (g_INC_hash && g_INC_hash->value.hv) {
                 strada_hash_delete(g_INC_hash->value.hv, pkg);
+                char __lz_fn[1040];
+                if (inc_filename_key(pkg, __lz_fn, sizeof(__lz_fn)))
+                    strada_hash_delete(g_INC_hash->value.hv, __lz_fn);
             }
             perla_try_require(pkg);
         }
@@ -24003,6 +24050,9 @@ static const char *inc_filename_key(const char *module, char *buf, size_t bufsz)
  * code that checks either lookup finds the entry. Value is shared
  * between the two keys via incref. */
 static void inc_mark(const char *module, StradaValue *val) {
+    if (getenv("PERLA_INC_TRACE"))
+        fprintf(stderr, "[inc_mark] %s fn=%p hash=%p\n", module,
+                (void*)&inc_mark, (void*)g_INC_hash);
     if (!g_INC_hash) g_INC_hash = strada_new_hash();
     if (!strada_hash_exists(g_INC_hash->value.hv, module)) {
         strada_hash_set(g_INC_hash->value.hv, module, val);
@@ -24021,7 +24071,7 @@ static void inc_mark(const char *module, StradaValue *val) {
  * that inlined module X skips X's init-time statements when X was
  * already loaded (by the main binary or an earlier .so). Checks %INC
  * under both the Foo::Bar and Foo/Bar.pm key forms. */
-int perla_inc_loaded(const char *module) {
+static int perla_inc_loaded_impl(const char *module) {
     if (!module || !module[0]) return 0;
     if (!g_INC_hash) return 0;
     if (strada_hash_exists(g_INC_hash->value.hv, module)) return 1;
@@ -24043,8 +24093,20 @@ int perla_inc_loaded(const char *module) {
     return strada_hash_exists(g_INC_hash->value.hv, rel) ? 1 : 0;
 }
 
+int perla_inc_loaded(const char *module) {
+    int r = perla_inc_loaded_impl(module);
+    if (getenv("PERLA_INC_TRACE"))
+        fprintf(stderr, "[inc_loaded] %s -> %d fn=%p hash=%p\n",
+                module ? module : "(null)", r,
+                (void*)&perla_inc_loaded, (void*)g_INC_hash);
+    return r;
+}
+
 void perla_mark_loaded(const char *module) {
     if (!module || !module[0]) return;
+    if (getenv("PERLA_INC_TRACE"))
+        fprintf(stderr, "[mark_loaded] %s fn=%p hash=%p\n", module,
+                (void*)&perla_mark_loaded, (void*)g_INC_hash);
     if (!g_INC_hash) g_INC_hash = strada_new_hash();
     if (strada_hash_exists(g_INC_hash->value.hv, module)) return;
     strada_hash_set(g_INC_hash->value.hv, module, STRADA_MAKE_TAGGED_INT(1));
@@ -24096,6 +24158,8 @@ void perla_mark_loaded(const char *module) {
  * method-dispatch lazy-load path where triggering a full recursive
  * perla -M compile for a missing module is too expensive (minutes for
  * Locale::SubCountry::Codes and similar large modules). */
+static int perla_so_artifact_stale(const char *so_path);
+
 int perla_try_load_precompiled(const char *module) {
     if (!module || !module[0]) return 0;
     if (!g_INC_hash) g_INC_hash = strada_new_hash();
@@ -24137,6 +24201,14 @@ int perla_try_load_precompiled(const char *module) {
         }
     }
     if (!so_path[0]) return 0;
+    /* Same gates as perla_require_module's dlopen path: a stale-CGV, stale-
+     * mtime, or wrong-TLS-regime .so must not enter the process. This path
+     * used to dlopen unconditionally — a stale mega-TU (DateTime::Event::
+     * Random with an inlined copy of half of DateTime) loaded here poisoned
+     * global symbol resolution for every later module. Treat stale as "no
+     * precompiled artifact": the caller falls through to the full require,
+     * whose recompile path rebuilds it. */
+    if (perla_so_artifact_stale(so_path)) return 0;
     /* dlopen the .so */
     void *handle = dlopen(so_path, RTLD_NOW | RTLD_GLOBAL);
     if (!handle) {
@@ -24775,6 +24847,82 @@ static int perla_so_tls_regime(const char *so_path) {
     return regime;
 }
 
+/* Current codegen version (CGV) for artifact gating. Programs run via the
+ * perla driver inherit __PERLA_CGV in the environment (the driver publishes
+ * its baked -D PERLA_CGV before compiling/exec'ing). A program TU may also
+ * define perla_program_cgv (strong) to carry the version standalone; this
+ * weak NULL covers programs that don't. Returns NULL when unknown — gates
+ * then fall back to the mtime rule. */
+__attribute__((weak)) const char *perla_program_cgv = NULL;
+static const char *perla_current_cgv(void) {
+    if (perla_program_cgv && perla_program_cgv[0]) return perla_program_cgv;
+    const char *e = getenv("__PERLA_CGV");
+    return (e && e[0]) ? e : NULL;
+}
+
+/* Staleness verdict for a precompiled .pm.so about to be dlopen'd. 1 = stale
+ * (reject; caller falls through to the recompile path), 0 = load it.
+ *
+ * The sibling `<X>.pm.cgv` stamp (written by perla -M) is authoritative when
+ * both it and the current CGV are known: a matching stamp ACCEPTS the .so even
+ * if it's older than the perla binary (runtime-only relinks must not
+ * invalidate the warm graph), a mismatched stamp REJECTS it even if newer
+ * (an artifact from a different codegen is never safe — a stale mega-TU with
+ * inlined dependency copies dlopen'd this way is how Time::Local's file-
+ * lexical @MonthDays came up empty: its exported timegm resolved into a TU
+ * whose init never ran). Without a stamp, fall back to mtime-vs-perla.
+ * The TLS-regime probe applies in all cases (wrong-regime .so faults on
+ * load; see perla_so_tls_regime). */
+static int perla_so_artifact_stale(const char *so_path) {
+    int stale = 0;
+    const char *cur = perla_current_cgv();
+    char stamped[64];
+    stamped[0] = 0;
+    {
+        char cgv_path[2300];
+        size_t sl = strlen(so_path);
+        if (sl > 3 && strcmp(so_path + sl - 3, ".so") == 0 && sl < sizeof(cgv_path) - 8) {
+            snprintf(cgv_path, sizeof(cgv_path), "%.*s.cgv", (int)(sl - 3), so_path);
+            FILE *cf = fopen(cgv_path, "r");
+            if (cf) {
+                if (fgets(stamped, sizeof(stamped), cf)) {
+                    size_t n = strlen(stamped);
+                    while (n && (stamped[n-1] == '\n' || stamped[n-1] == '\r'
+                                 || stamped[n-1] == ' ')) stamped[--n] = 0;
+                }
+                fclose(cf);
+            }
+        }
+    }
+    if (cur && stamped[0]) {
+        if (strcmp(cur, stamped) != 0) {
+            stale = 1;
+            if (perla_debug_mode())
+                fprintf(stderr, "[require] %s codegen version changed (%s != %s), recompiling\n",
+                        so_path, stamped, cur);
+        }
+    } else if (g_perla_path[0]) {
+        struct stat so_st, perla_st;
+        if (stat(so_path, &so_st) == 0 && stat(g_perla_path, &perla_st) == 0
+            && so_st.st_mtime < perla_st.st_mtime) {
+            stale = 1;
+            if (perla_debug_mode())
+                fprintf(stderr, "[require] %s older than perla, recompiling\n", so_path);
+        }
+    }
+    if (!stale) {
+        int so_regime = perla_so_tls_regime(so_path);
+        if (so_regime >= 0 && so_regime != PERLA_MAIN_NO_TLS) {
+            stale = 1;
+            if (perla_debug_mode())
+                fprintf(stderr, "[require] %s TLS-regime mismatch (so=%s main=%s), recompiling\n",
+                        so_path, so_regime ? "notls" : "tls",
+                        PERLA_MAIN_NO_TLS ? "notls" : "tls");
+        }
+    }
+    return stale;
+}
+
 StradaValue *perla_require_module(StradaValue *module_sv) {
     if (!module_sv || STRADA_IS_TAGGED_INT(module_sv)) return strada_new_undef();
 
@@ -24836,9 +24984,13 @@ StradaValue *perla_require_module(StradaValue *module_sv) {
 
     if (perla_debug_mode()) fprintf(stderr, "[require] %s\n", module);
 
-    /* Check if already loaded */
+    /* Check if already loaded. Both key forms (Foo::Bar and Foo/Bar.pm) —
+     * perla_init's native stubs mark only the filename form, and the
+     * module-form-only check here let `require Time::Local` re-load the
+     * real .pm over the natives (whose init then skipped its guarded
+     * top-level and registered empty-statics subs). */
     if (!g_INC_hash) g_INC_hash = strada_new_hash();
-    if (strada_hash_exists(g_INC_hash->value.hv, module)) {
+    if (perla_inc_loaded(module)) {
         if (perla_debug_mode()) fprintf(stderr, "[require]   short-circuit: in %%INC\n");
         free(module);
         return STRADA_MAKE_TAGGED_INT(1);
@@ -24956,7 +25108,14 @@ StradaValue *perla_require_module(StradaValue *module_sv) {
              * installed under ~/perla/lib compiled to a .pm.so whose
              * init stack-overflowed (infinite recursion) and clobbered
              * the native method set. Never load the .pm. */
-            "DBI", NULL
+            "DBI",
+            /* Time::Local — timegm/timelocal (+_modern/_nocheck) native.
+             * perla_init pre-marks %INC{"Time/Local.pm"}, so a loaded real
+             * Time::Local TU skips its guarded top-level (empty
+             * @MonthDays statics) while still registering subs — which
+             * used to clobber the natives and croak "Day '…' out of
+             * range 1..". Never load the .pm. */
+            "Time::Local", NULL
         };
         for (int ni = 0; native_mods[ni]; ni++) {
             if (strcmp(module, native_mods[ni]) == 0) {
@@ -25175,36 +25334,9 @@ StradaValue *perla_require_module(StradaValue *module_sv) {
          * perla_stash.c (via perla_runtime.a). When perla's runtime
          * changes — e.g. perla_caller, hash handling, anything in the
          * runtime ABI — an old .pm.so embeds the old code and shows
-         * stale behavior when dlopen'd. Reject .pm.so older than the
-         * running perla binary; fall through to the recompile path. */
-        int stale = 0;
-        if (g_perla_path[0]) {
-            struct stat so_st, perla_st;
-            if (stat(so_path, &so_st) == 0 && stat(g_perla_path, &perla_st) == 0) {
-                if (so_st.st_mtime < perla_st.st_mtime) {
-                    stale = 1;
-                    if (perla_debug_mode()) {
-                        fprintf(stderr, "[require] %s older than perla, recompiling\n", so_path);
-                    }
-                }
-            }
-        }
-        /* TLS-regime consistency: a .pm.so built for the other regime would
-         * fault on the shared runtime globals when dlopen'd here (see
-         * perla_so_tls_regime). Reject it so the recompile path below rebuilds
-         * one matching this main. -1 (unknown) is treated as compatible to
-         * avoid spurious rebuilds when readelf is unavailable. */
-        if (!stale) {
-            int so_regime = perla_so_tls_regime(so_path);
-            if (so_regime >= 0 && so_regime != PERLA_MAIN_NO_TLS) {
-                stale = 1;
-                if (perla_debug_mode()) {
-                    fprintf(stderr, "[require] %s TLS-regime mismatch (so=%s main=%s), recompiling\n",
-                            so_path, so_regime ? "notls" : "tls",
-                            PERLA_MAIN_NO_TLS ? "notls" : "tls");
-                }
-            }
-        }
+         * stale behavior when dlopen'd. CGV stamp + mtime + TLS-regime
+         * gates; fall through to the recompile path when stale. */
+        int stale = perla_so_artifact_stale(so_path);
         if (!stale) {
             if (perla_debug_mode()) fprintf(stderr, "[require] loading precompiled %s\n", so_path);
             handle = dlopen(so_path, RTLD_NOW | RTLD_GLOBAL);
@@ -25302,20 +25434,18 @@ StradaValue *perla_require_module(StradaValue *module_sv) {
                         snprintf(build_pm_path, sizeof(build_pm_path),
                                  "/tmp/%s%s.pm", __stage_prefix, flat);
                 }
-                /* Freshness short-circuit: a staged .pm.so newer than BOTH
-                 * the original source and the perla binary is reusable —
-                 * skip the copy + child compile entirely. */
+                /* Freshness short-circuit: a staged .pm.so newer than the
+                 * original source AND passing the artifact gates (CGV stamp /
+                 * mtime-vs-perla / TLS regime — see perla_so_artifact_stale)
+                 * is reusable — skip the copy + child compile entirely. */
                 {
                     char __st_so[2200];
                     snprintf(__st_so, sizeof(__st_so), "%s.so", build_pm_path);
-                    struct stat __so_st, __src_st, __pl_st;
+                    struct stat __so_st, __src_st;
                     int __fresh = 0;
                     if (stat(__st_so, &__so_st) == 0 && stat(pm_path, &__src_st) == 0
                         && __so_st.st_mtime >= __src_st.st_mtime) {
-                        __fresh = 1;
-                        if (g_perla_path[0] && stat(g_perla_path, &__pl_st) == 0
-                            && __so_st.st_mtime < __pl_st.st_mtime)
-                            __fresh = 0;
+                        __fresh = !perla_so_artifact_stale(__st_so);
                     }
                     if (__fresh) {
                         if (perla_debug_mode())
