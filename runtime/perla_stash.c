@@ -4301,6 +4301,27 @@ StradaValue *perla_code_get_walking(const char *name) {
 
 void perla_code_set(const char *pkg, const char *name, StradaValue *val) {
     PerlGlob *g = ensure_glob(pkg, name);
+    /* PERLA_SLOT_WATCH="Pkg::name" traces every CODE-slot write to one
+     * symbol — used to catch last-writer-wins races between the column
+     * accessor and the relationship accessor for the same name. */
+    {
+        static const char *watch = (const char *)-1;
+        if (watch == (const char *)-1) watch = getenv("PERLA_SLOT_WATCH");
+        if (watch && pkg && name) {
+            char full[256];
+            snprintf(full, sizeof(full), "%s::%s", pkg, name);
+            if (strcmp(full, watch) == 0) {
+                const char *kind = "?";
+                if (val && !STRADA_IS_TAGGED_INT(val)) {
+                    if (val->type == STRADA_STR) kind = val->value.pv ? val->value.pv : "str";
+                    else if (val->type == STRADA_CPOINTER) kind = "(cpointer)";
+                    else if (val->type == STRADA_CLOSURE) kind = "(closure)";
+                }
+                fprintf(stderr, "[slot-set] %s <= %s%s\n", full, kind,
+                        (g->frozen_slots & (1 << PERLA_SLOT_CODE)) ? " [FROZEN-slot]" : "");
+            }
+        }
+    }
     /* Frozen slot — set by perla_code_set_protected for native overrides
      * we want to preserve through user-perl `sub` redefinition. The CPAN
      * source for some modules (Class::Accessor::Grouped, Class::C3, etc.)
@@ -4607,6 +4628,84 @@ StradaValue *perla_call_code(StradaValue *code_val, StradaValue *args) {
             StradaArray *av = args ? strada_deref_array(args) : NULL;
             if (av && av->size >= 1) {
                 StradaValue *self = av->elements[0];
+                /* A 'filter'/'single' RELATIONSHIP of the same name shadows the
+                 * column accessor (DBIC installs the inflated-column accessor
+                 * over it): `$row->account_id` must return the related Account
+                 * row, not the raw FK. perla installs both as marker strings in
+                 * one code slot, so whichever registers last wins — and in
+                 * bizowie's Bootstrap::Simple graph only the column marker ever
+                 * lands, leaving `$host->account_id->label` to die on package
+                 * "535". Resolve by relationship metadata at call time instead
+                 * of depending on registration order: ask the result source
+                 * whether this name is a filter/single rel and, if so, take the
+                 * relationship path. Getter only — a setter on a filter rel is
+                 * a column write in DBIC too. */
+                if (self && !STRADA_IS_TAGGED_INT(self) && av->size == 1
+                    && perla_blessed(self)) {
+                    /* Memoized per (class, column): the verdict is schema
+                     * metadata, fixed once relationships are registered.
+                     * Without this, every plain column read would pay a
+                     * relationship_info dispatch through the source proxy. */
+                    typedef struct { char cls[96]; char col[64]; signed char verdict; long gen; } RelShadowEnt;
+                    static RelShadowEnt rs_memo[1024];
+                    const char *__rs_cls = perla_blessed(self);
+                    unsigned int __rs_h = 5381;
+                    for (const char *p = __rs_cls; *p; p++) __rs_h = ((__rs_h << 5) + __rs_h) ^ (unsigned char)*p;
+                    for (const char *p = col_key; *p; p++) __rs_h = ((__rs_h << 5) + __rs_h) ^ (unsigned char)*p;
+                    RelShadowEnt *__rs_e = &rs_memo[__rs_h & 1023];
+                    int __rs_cacheable = (strlen(__rs_cls) < sizeof(__rs_e->cls)
+                                          && strlen(col_key) < sizeof(__rs_e->col));
+                    if (__rs_cacheable && __rs_e->verdict >= 0
+                        && __rs_e->gen == perla_code_override_gen
+                        && strcmp(__rs_e->cls, __rs_cls) == 0
+                        && strcmp(__rs_e->col, col_key) == 0) {
+                        if (__rs_e->verdict == 1) {
+                            StradaValue *r = perla_dbic_manual_find_related(self, col_key);
+                            free(fn_name);
+                            return r ? r : strada_new_undef();
+                        }
+                        goto column_plain_path;
+                    }
+                    StradaValue *ri_args = strada_new_array();
+                    StradaArray *riav = strada_deref_array(ri_args);
+                    strada_array_push(riav, self);
+                    strada_array_push_take(riav, strada_new_str(col_key));
+                    StradaValue *ri = perla_method_dispatch(self, "relationship_info", ri_args);
+                    strada_decref(ri_args);
+                    int is_rel_acc = 0;
+                    if (ri && !STRADA_IS_TAGGED_INT(ri)) {
+                        StradaValue *rih = (ri->type == STRADA_REF) ? ri->value.rv : ri;
+                        if (rih && !STRADA_IS_TAGGED_INT(rih) && rih->type == STRADA_HASH) {
+                            StradaValue *at = strada_hash_get(rih->value.hv, "attrs");
+                            if (at && !STRADA_IS_TAGGED_INT(at) && at->type == STRADA_REF)
+                                at = at->value.rv;
+                            if (at && !STRADA_IS_TAGGED_INT(at) && at->type == STRADA_HASH) {
+                                StradaValue *acc = strada_hash_get(at->value.hv, "accessor");
+                                if (acc && !STRADA_IS_TAGGED_INT(acc) && acc->type == STRADA_STR
+                                    && acc->value.pv
+                                    && (strcmp(acc->value.pv, "filter") == 0
+                                        || strcmp(acc->value.pv, "single") == 0))
+                                    is_rel_acc = 1;
+                            }
+                        }
+                    }
+                    if (ri) strada_decref(ri);
+                    if (__rs_cacheable) {
+                        snprintf(__rs_e->cls, sizeof(__rs_e->cls), "%s", __rs_cls);
+                        snprintf(__rs_e->col, sizeof(__rs_e->col), "%s", col_key);
+                        __rs_e->verdict = (signed char)is_rel_acc;
+                        __rs_e->gen = perla_code_override_gen;
+                    }
+                    if (is_rel_acc) {
+                        if (getenv("PERLA_REL_TRACE"))
+                            fprintf(stderr, "[rel-shadow] %s->%s routed to relationship\n",
+                                    __rs_cls, col_key);
+                        StradaValue *r = perla_dbic_manual_find_related(self, col_key);
+                        free(fn_name);
+                        return r ? r : strada_new_undef();
+                    }
+                }
+            column_plain_path:
                 if (self && !STRADA_IS_TAGGED_INT(self)) {
                     if (av->size >= 2) {
                         /* Setter: $obj->col($val) → $obj->set_column($col, $val) */
@@ -13266,6 +13365,33 @@ StradaValue *perla_method_dispatch(StradaValue *obj, const char *method, StradaV
      * dispatches per second that's real money. Resolve once. */
     static int dispatch_debug = -1;
     if (dispatch_debug < 0) dispatch_debug = getenv("PERLA_DISPATCH_DEBUG") ? 1 : 0;
+    /* Refcount tripwire (PERLA_RC_TRACE=1): report methods that return with
+     * the INVOCANT's refcount lower than on entry. An over-decref here frees
+     * the object while callers still hold it; the SV slot is then recycled
+     * for an unrelated value while its stale bless meta makes it still look
+     * like the original class. That is how a live DBIC row started
+     * stringifying as its own primary key mid-inflate_result. */
+    static int rc_trace = -1;
+    if (rc_trace < 0) rc_trace = getenv("PERLA_RC_TRACE") ? 1 : 0;
+    static __thread int rc_skip = 0;
+    if (rc_trace && obj && !STRADA_IS_TAGGED_INT(obj)) {
+        if (rc_skip) {
+            /* Re-entry from the wrapper below — run the real body. Nested
+             * dispatches inside it are traced normally (flag already clear). */
+            rc_skip = 0;
+        } else {
+            int __rc_before = obj->refcount;
+            const char *__rc_pkg = perla_blessed(obj);
+            char __rc_pkgbuf[128];
+            snprintf(__rc_pkgbuf, sizeof(__rc_pkgbuf), "%s", __rc_pkg ? __rc_pkg : "(none)");
+            rc_skip = 1;
+            StradaValue *__rc_r = perla_method_dispatch(obj, method, args);
+            if (obj->refcount < __rc_before)
+                fprintf(stderr, "[rc-drop] %s->%s  %d -> %d\n",
+                        __rc_pkgbuf, method, __rc_before, obj->refcount);
+            return __rc_r;
+        }
+    }
     if (dispatch_debug) {
         const char *bp = perla_blessed(obj);
         char *os = strada_to_str(obj);

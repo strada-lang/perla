@@ -6186,7 +6186,23 @@ func _parse_primary(scalar $p) scalar {
         # We narrow to `new` (the canonical case) plus the existing
         # import/unimport handling. `new IDENT(...)` with IDENT being a
         # capitalized class name is the indirect form.
-        if ($name eq "new" && _peek_type($p) eq "IDENT") {
+        # Also accept ANY method name when the following bareword is
+        # package-qualified and parenthesized — `parse CGI::Cookie($str)`,
+        # `header Foo::Bar(...)`. Two barewords in a row is indirect-object
+        # form in Perl (nothing else parses); requiring the "::" and the
+        # `(` keeps ordinary `func BAREWORD` calls untouched. Drogo::Cookie
+        # uses both `new CGI::Cookie(%p)` and `parse CGI::Cookie($c)`; the
+        # latter parsed as `parse(CGI::Cookie($c))` and died "Undefined
+        # subroutine &CGI::Cookie called" during App init's session setup.
+        my int $__io_qualified = 0;
+        if (_peek_type($p) eq "IDENT" && index(_peek_val($p), "::") > 0) {
+            my int $__io_nx = $p->{"pos"} + 1;
+            if ($__io_nx < $p->{"len"}
+                && $p->{"tokens"}->[$__io_nx]->{"type"} eq "LPAREN") {
+                $__io_qualified = 1;
+            }
+        }
+        if (($name eq "new" || $__io_qualified == 1) && _peek_type($p) eq "IDENT") {
             my str $next_val = _peek_val($p);
             # Class name must start with uppercase letter (Perl convention
             # for class names; this filters out `new $var` etc.).
@@ -6207,13 +6223,19 @@ func _parse_primary(scalar $p) scalar {
                 my scalar $obj = Perla::AST::node(Perla::AST::N_STR_LIT());
                 $obj->{"value"} = $class_name;
                 $mnode->{"object"} = $obj;
-                $mnode->{"method"} = "new";
+                $mnode->{"method"} = $name;
                 $mnode->{"args"} = [];
                 if (_peek_type($p) eq "LPAREN") {
                     _advance($p);
                     while (_peek_type($p) ne "RPAREN" && !_at_end($p)) {
                         push(@{$mnode->{"args"}}, _parse_assign($p));
-                        if (_peek_type($p) eq "COMMA") { _advance($p); }
+                        # `=>` separates args exactly like `,` — without
+                        # skipping it, `new Foo(k => 7)` swallowed the
+                        # separator into the next parse and the pairs were
+                        # lost (the object came out with no attributes).
+                        if (_peek_type($p) eq "COMMA" || _peek_type($p) eq "FAT_ARROW") {
+                            _advance($p);
+                        }
                     }
                     _expect($p, "RPAREN");
                 }
